@@ -1,0 +1,10 @@
+﻿pandas>=2.1
+selenium>=4.25
+webdriver-manager>=4.0
+loguru>=0.7
+python-dotenv>=1.0
+rich>=13.8
+beautifulsoup4>=4.12
+python-dateutil>=2.9
+streamlit>=1.38
+altair>=5.2
