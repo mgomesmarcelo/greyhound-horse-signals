@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Gerar sinais para greyhounds combinando fonte/mercado/regra."
     )
-    parser.add_argument("--source", choices=["top3", "forecast", "both"], default="both")
+    parser.add_argument("--source", choices=["top3", "forecast", "betfair_resultado", "both", "all"], default="all")
     parser.add_argument("--market", choices=["win", "place", "both"], default="both")
     parser.add_argument(
         "--rule",
@@ -57,7 +57,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(out_path)
 
-    sources = [args.source] if args.source != "both" else ["top3", "forecast"]
+    if args.source == "both":
+        sources = ["top3", "forecast"]
+    elif args.source == "all":
+        sources = ["top3", "forecast", "betfair_resultado"]
+    else:
+        sources = [args.source]
+
     markets = [args.market] if args.market != "both" else ["win", "place"]
     rules = (
         [args.rule]

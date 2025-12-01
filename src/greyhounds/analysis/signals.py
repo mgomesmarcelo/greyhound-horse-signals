@@ -75,7 +75,12 @@ def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
 
     for csv_path in all_files:
         try:
-            df = pd.read_csv(csv_path, encoding=settings.CSV_ENCODING)
+            df = pd.read_csv(
+                csv_path,
+                encoding=settings.CSV_ENCODING,
+                engine="python",
+                on_bad_lines="skip",
+            )
         except Exception as exc:
             logger.error("Falha ao ler {}: {}", csv_path.name, exc)
             continue
@@ -122,7 +127,12 @@ def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
 
     for csv_path in all_files:
         try:
-            df = pd.read_csv(csv_path, encoding=settings.CSV_ENCODING)
+            df = pd.read_csv(
+                csv_path,
+                encoding=settings.CSV_ENCODING,
+                engine="python",
+                on_bad_lines="skip",
+            )
         except Exception as exc:
             logger.error("Falha ao ler {}: {}", csv_path.name, exc)
             continue
@@ -254,6 +264,43 @@ def load_timeform_forecast_top3() -> List[dict]:
             )
 
     logger.info("Timeform Forecast(Top3) carregado: {} corridas", len(rows))
+    return rows
+
+
+def _build_betfair_direct_rows(
+    bf_win_index: Dict[Tuple[str, str], Dict[str, RunnerBF]]
+) -> List[dict]:
+    rows: List[dict] = []
+    for (track_key, race_iso), runners in bf_win_index.items():
+        if not runners:
+            continue
+        sorted_runners = sorted(
+            (
+                runner
+                for runner in runners.values()
+                if isinstance(runner.selection_name_clean, str) and runner.selection_name_clean
+            ),
+            key=lambda r: float(r.pptradedvol) if pd.notna(r.pptradedvol) else 0.0,
+            reverse=True,
+        )
+        if len(sorted_runners) < 3:
+            continue
+        top_names = [runner.selection_name_clean for runner in sorted_runners[:3]]
+        raw_row = {
+            "track_name": track_key,
+            "race_time_iso": race_iso,
+            "TimeformTop1": top_names[0] if len(top_names) > 0 else "",
+            "TimeformTop2": top_names[1] if len(top_names) > 1 else "",
+            "TimeformTop3": top_names[2] if len(top_names) > 2 else "",
+        }
+        rows.append(
+            {
+                "track_key": track_key,
+                "race_iso": race_iso,
+                "top_names": top_names,
+                "raw": raw_row,
+            }
+        )
     return rows
 
 
@@ -436,6 +483,8 @@ def generate_signals(
 
     if source == "forecast":
         tf_rows = load_timeform_forecast_top3()
+    elif source == "betfair_resultado":
+        tf_rows = _build_betfair_direct_rows(bf_win_index)
     else:
         tf_rows = load_timeform_top3()
 

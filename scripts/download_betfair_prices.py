@@ -203,6 +203,8 @@ def download_files(
     dry_run: bool,
     max_downloads: Optional[int],
 ) -> int:
+    max_retries = 3
+    backoff_factor = 2.0
     if not downloads:
         logger.success(f"[{target.name}] Nenhum arquivo faltante.")
         return 0
@@ -216,12 +218,55 @@ def download_files(
             f"({fdate.isoformat()}) -> {dest}"
         )
         if not dry_run:
-            with session.get(url, stream=True, timeout=180) as resp:
-                resp.raise_for_status()
-                with open(dest, "wb") as fh:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            fh.write(chunk)
+            attempt = 0
+            success = False
+            while attempt < max_retries:
+                attempt += 1
+                try:
+                    with session.get(url, stream=True, timeout=180) as resp:
+                        resp.raise_for_status()
+                        with open(dest, "wb") as fh:
+                            for chunk in resp.iter_content(chunk_size=8192):
+                                if chunk:
+                                    fh.write(chunk)
+                    success = True
+                    break
+                except requests.exceptions.HTTPError as exc:
+                    status_code = exc.response.status_code if exc.response else None
+                    is_server_error = (
+                        status_code is not None and 500 <= status_code < 600
+                    )
+                    if not is_server_error or attempt >= max_retries:
+                        logger.error(
+                            f"[{target.name}] Falha ao baixar {filename}: "
+                            f"{exc}"
+                        )
+                        break
+                    wait_seconds = max(delay_seconds, 0.0) * (backoff_factor ** (attempt - 1))
+                    logger.warning(
+                        f"[{target.name}] Erro HTTP {status_code} ao baixar {filename} "
+                        f"(tentativa {attempt}/{max_retries}). "
+                        f"Tentando novamente em {wait_seconds:.1f}s."
+                    )
+                    time.sleep(wait_seconds)
+                except requests.exceptions.RequestException as exc:
+                    if attempt >= max_retries:
+                        logger.error(
+                            f"[{target.name}] Erro de rede ao baixar {filename}: {exc}"
+                        )
+                        break
+                    wait_seconds = max(delay_seconds, 0.0) * (backoff_factor ** (attempt - 1))
+                    logger.warning(
+                        f"[{target.name}] Erro de rede ao baixar {filename} "
+                        f"(tentativa {attempt}/{max_retries}). "
+                        f"Tentando novamente em {wait_seconds:.1f}s."
+                    )
+                    time.sleep(wait_seconds)
+            if not success:
+                logger.warning(
+                    f"[{target.name}] Download desistido após {max_retries} tentativas: {filename}"
+                )
+                continue
             time.sleep(max(delay_seconds, 0.0))
         completed += 1
         if max_downloads is not None and completed >= max_downloads:

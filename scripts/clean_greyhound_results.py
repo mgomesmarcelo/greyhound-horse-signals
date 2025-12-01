@@ -30,6 +30,34 @@ _BSP_TWO_DEC_REGEX = re.compile(r"^\d+\.\d{2}$")
 _BANNED_REGEX = re.compile(r"\((?:AUS|NZL)\)")
 
 
+def _canonicalize_column(name: str) -> str | None:
+    raw = (name or "").strip().lower()
+    normalized = re.sub(r"[^a-z0-9]+", "", raw)
+    mapping = {
+        "eventid": "event_id",
+        "_eventid": "event_id",
+        "menuhint": "menu_hint",
+        "eventname": "event_name",
+        "eventdt": "event_dt",
+        "selectionid": "selection_id",
+        "selectionname": "selection_name",
+        "winlose": "win_lose",
+        "win_lose": "win_lose",
+        "bsp": "bsp",
+        "pptradedvol": "pptradedvol",
+    }
+    return mapping.get(normalized, None)
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    rename_map: dict[str, str] = {}
+    for col in df.columns:
+        canonical = _canonicalize_column(str(col))
+        if canonical:
+            rename_map[col] = canonical
+    return df.rename(columns=rename_map)
+
+
 def is_already_clean(df: pd.DataFrame) -> bool:
     if df.columns.tolist() != TARGET_COLUMNS:
         return False
@@ -77,9 +105,25 @@ def clean_results_dir(result_dir: Path, force: bool = False) -> int:
     changed = 0
     for csv_path in sorted(result_dir.glob("*.csv")):
         try:
-            df = pd.read_csv(csv_path, encoding=settings.CSV_ENCODING)
+            df = pd.read_csv(
+                csv_path,
+                encoding=settings.CSV_ENCODING,
+                engine="python",
+                on_bad_lines="skip",
+            )
         except Exception as exc:
             logger.error("Falha ao ler {}: {}", csv_path.name, exc)
+            continue
+
+        df = normalize_columns(df)
+
+        missing = [col for col in TARGET_COLUMNS if col not in df.columns]
+        if missing:
+            logger.error(
+                "Pulado {}: colunas ausentes após normalização ({})",
+                csv_path.name,
+                ", ".join(missing),
+            )
             continue
 
         if not force and is_already_clean(df):

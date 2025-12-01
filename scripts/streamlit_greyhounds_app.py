@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(PROJECT_ROOT))
 
 from src.greyhounds.config import settings
-from src.greyhounds.config import RULE_LABELS, RULE_LABELS_INV, ENTRY_TYPE_LABELS
+from src.greyhounds.config import RULE_LABELS, RULE_LABELS_INV, ENTRY_TYPE_LABELS, SOURCE_LABELS, SOURCE_LABELS_INV
 from src.greyhounds.utils.text import normalize_track_name
 
 
@@ -100,7 +100,7 @@ def load_signals(source: str = "top3", market: str = "win", rule: str = "terceir
 
 def main() -> None:
     st.set_page_config(page_title="Sinais LAY/BACK - Galgos", layout="wide")
-    st.title("Sinais LAY/BACK - Timeform Top3 x Betfair Volume")
+    st.title("Sinais LAY/BACK - Estrategias Greyhounds")
 
     # (Sem CSS custom)  Restaurado layout padrao do Streamlit
 
@@ -111,7 +111,16 @@ def main() -> None:
     # seletores de fonte, mercado, regra e tipo de entrada
     col_src, col_mkt, col_rule, col_entry = st.columns([1, 1, 1.5, 1.2])
     with col_src:
-        source = st.selectbox("Fonte Timeform", ["top3", "forecast"], index=0)
+        source_options = ["top3", "forecast", "betfair_resultado"]
+        source_label_options = [SOURCE_LABELS.get(opt, opt) for opt in source_options]
+        selected_source_label = st.selectbox(
+            "Estrategia",
+            source_label_options,
+            index=0,
+            key="source_select_label",
+        )
+        source = SOURCE_LABELS_INV.get(selected_source_label, "top3")
+    source_label = SOURCE_LABELS.get(source, source)
     with col_mkt:
         market = st.selectbox("Mercado", ["win", "place"], index=0)
     with col_rule:
@@ -125,6 +134,8 @@ def main() -> None:
             entry_type = "both"
         else:
             entry_type = "back" if entry_label == ENTRY_TYPE_LABELS["back"] else "lay"
+
+    st.caption(f"Estrategia selecionada: {source_label}")
 
     df = load_signals(source=source, market=market, rule=rule)
     if df.empty:
