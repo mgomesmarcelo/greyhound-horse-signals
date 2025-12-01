@@ -11,6 +11,7 @@ from loguru import logger
 
 from src.greyhounds.config import RULE_LABELS, settings
 from src.greyhounds.utils.text import clean_horse_name, normalize_track_name
+from src.greyhounds.utils.files import write_dataframe_snapshots
 
 _TRAP_PREFIX_RE = re.compile(r"^\s*\d+\.\s*")
 
@@ -68,21 +69,30 @@ class RunnerBF:
     win_lose: int
 
 
+def _iter_result_paths(pattern: str) -> List[Path]:
+    parquet_paths = sorted(settings.PROCESSED_RESULT_DIR.glob(f"{pattern}.parquet"))
+    if parquet_paths:
+        return parquet_paths
+    return sorted(settings.RAW_RESULT_DIR.glob(f"{pattern}.csv"))
+
+
 def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
-    result_dir = settings.DATA_DIR / "Result"
-    all_files = sorted(result_dir.glob("dwbfgreyhoundwin*.csv"))
+    all_files = _iter_result_paths("dwbfgreyhoundwin*")
     index: Dict[Tuple[str, str], Dict[str, RunnerBF]] = {}
 
-    for csv_path in all_files:
+    for path in all_files:
         try:
-            df = pd.read_csv(
-                csv_path,
-                encoding=settings.CSV_ENCODING,
-                engine="python",
-                on_bad_lines="skip",
-            )
+            if path.suffix == ".parquet":
+                df = pd.read_parquet(path)
+            else:
+                df = pd.read_csv(
+                    path,
+                    encoding=settings.CSV_ENCODING,
+                    engine="python",
+                    on_bad_lines="skip",
+                )
         except Exception as exc:
-            logger.error("Falha ao ler {}: {}", csv_path.name, exc)
+            logger.error("Falha ao ler {}: {}", path.name, exc)
             continue
 
         required_cols = ["menu_hint", "event_dt", "selection_name", "pptradedvol", "bsp", "win_lose"]
@@ -121,20 +131,22 @@ def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
 
 
 def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
-    result_dir = settings.DATA_DIR / "Result"
-    all_files = sorted(result_dir.glob("dwbfgreyhoundplace*.csv"))
+    all_files = _iter_result_paths("dwbfgreyhoundplace*")
     index: Dict[Tuple[str, str], Dict[str, RunnerBF]] = {}
 
-    for csv_path in all_files:
+    for path in all_files:
         try:
-            df = pd.read_csv(
-                csv_path,
-                encoding=settings.CSV_ENCODING,
-                engine="python",
-                on_bad_lines="skip",
-            )
+            if path.suffix == ".parquet":
+                df = pd.read_parquet(path)
+            else:
+                df = pd.read_csv(
+                    path,
+                    encoding=settings.CSV_ENCODING,
+                    engine="python",
+                    on_bad_lines="skip",
+                )
         except Exception as exc:
-            logger.error("Falha ao ler {}: {}", csv_path.name, exc)
+            logger.error("Falha ao ler {}: {}", path.name, exc)
             continue
 
         required_cols = ["menu_hint", "event_dt", "selection_name", "pptradedvol", "bsp", "win_lose"]
@@ -173,18 +185,31 @@ def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
 
 
 def load_timeform_top3() -> List[dict]:
-    tf_dir = settings.DATA_DIR / "timeform_top3"
+    tf_dir = settings.PROCESSED_TIMEFORM_TOP3_DIR
+    parquet_paths = sorted(tf_dir.glob("timeform_top3_*.parquet"))
+    if parquet_paths:
+        sources = parquet_paths
+        use_parquet = True
+    else:
+        csv_dir = settings.RAW_TIMEFORM_TOP3_DIR
+        sources = sorted(csv_dir.glob("timeform_top3_*.csv"))
+        use_parquet = False
+
     rows: List[dict] = []
-    for csv_path in sorted(tf_dir.glob("timeform_top3_*.csv")):
+
+    for path in sources:
         try:
-            df = pd.read_csv(
-                csv_path,
-                encoding=settings.CSV_ENCODING,
-                engine="python",
-                on_bad_lines="skip",
-            )
+            if use_parquet:
+                df = pd.read_parquet(path)
+            else:
+                df = pd.read_csv(
+                    path,
+                    encoding=settings.CSV_ENCODING,
+                    engine="python",
+                    on_bad_lines="skip",
+                )
         except Exception as exc:
-            logger.error("Falha ao ler {}: {}", csv_path.name, exc)
+            logger.error("Falha ao ler {}: {}", path.name, exc)
             continue
 
         expected_cols = [
@@ -221,18 +246,30 @@ def load_timeform_top3() -> List[dict]:
 
 
 def load_timeform_forecast_top3() -> List[dict]:
-    tf_dir = settings.DATA_DIR / "TimeformForecast"
+    tf_dir = settings.PROCESSED_TIMEFORM_FORECAST_DIR
+    parquet_paths = sorted(tf_dir.glob("TimeformForecast_*.parquet"))
+    if parquet_paths:
+        sources = parquet_paths
+        use_parquet = True
+    else:
+        csv_dir = settings.RAW_TIMEFORM_FORECAST_DIR
+        sources = sorted(csv_dir.glob("TimeformForecast_*.csv"))
+        use_parquet = False
+
     rows: List[dict] = []
-    for csv_path in sorted(tf_dir.glob("TimeformForecast_*.csv")):
+    for path in sources:
         try:
-            df = pd.read_csv(
-                csv_path,
-                encoding=settings.CSV_ENCODING,
-                engine="python",
-                on_bad_lines="skip",
-            )
+            if use_parquet:
+                df = pd.read_parquet(path)
+            else:
+                df = pd.read_csv(
+                    path,
+                    encoding=settings.CSV_ENCODING,
+                    engine="python",
+                    on_bad_lines="skip",
+                )
         except Exception as exc:
-            logger.error("Falha ao ler {}: {}", csv_path.name, exc)
+            logger.error("Falha ao ler {}: {}", path.name, exc)
             continue
 
         for col in ["track_name", "race_time_iso", "TimeformForecast"]:
@@ -521,9 +558,12 @@ def write_signals_csv(
     market: str = "win",
     rule: str = "terceiro_queda50",
 ) -> Path:
-    out_dir = settings.DATA_DIR / "signals"
-    _ensure_dir(out_dir)
-    out_path = out_dir / f"signals_{source}_{market}_{rule}.csv"
+    raw_dir = settings.RAW_SIGNALS_DIR
+    processed_dir = settings.PROCESSED_SIGNALS_DIR
+    _ensure_dir(raw_dir)
+    _ensure_dir(processed_dir)
+    raw_path = raw_dir / f"signals_{source}_{market}_{rule}.csv"
+    parquet_path = processed_dir / f"signals_{source}_{market}_{rule}.parquet"
 
     df = df.copy()
     df["source"] = source
@@ -577,9 +617,14 @@ def write_signals_csv(
             ["date", "track_name", "race_time_iso", "entry_type"]
         ).reset_index(drop=True)
 
-    df_sorted.to_csv(out_path, index=False, encoding=settings.CSV_ENCODING)
-    logger.info("Gerado: {} ({} linhas)", out_path, len(df_sorted))
-    return out_path
+    write_dataframe_snapshots(df_sorted, raw_path=raw_path, parquet_path=parquet_path)
+    logger.info(
+        "Sinais gerados. CSV bruto: {} | Parquet: {} ({} linhas)",
+        raw_path,
+        parquet_path,
+        len(df_sorted),
+    )
+    return parquet_path
 
 
 __all__ = [

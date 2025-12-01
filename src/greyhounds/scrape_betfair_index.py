@@ -13,6 +13,7 @@ from loguru import logger
 
 from src.core.config import ensure_data_dir
 from src.greyhounds.config import settings
+from src.greyhounds.utils.files import write_dataframe_snapshots
 from src.greyhounds.scrapers.betfair_index import scrape_betfair_index
 
 
@@ -22,18 +23,24 @@ def main() -> None:
 
     today_str = date.today().isoformat()
 
-    base_dir: Path = ensure_data_dir("greyhounds")
-    race_links_dir = base_dir / "race_links"
-    race_links_dir.mkdir(parents=True, exist_ok=True)
+    ensure_data_dir("greyhounds")  # garante base existente
+    raw_dir = settings.RAW_RACE_LINKS_DIR
+    parquet_dir = settings.PROCESSED_RACE_LINKS_DIR
 
     logger.info(
         "Iniciando scrape do indice da Betfair: https://www.betfair.com/exchange/plus/en/greyhound-racing-betting-4339"
     )
     rows = scrape_betfair_index()
 
-    out_path = race_links_dir / f"race_links_{today_str}.csv"
-    pd.DataFrame(rows).to_csv(out_path, index=False)
-    logger.info(f"race_links.csv salvo em: {out_path}")
+    df = pd.DataFrame(rows)
+    raw_path = raw_dir / f"race_links_{today_str}.csv"
+    parquet_path = parquet_dir / f"race_links_{today_str}.parquet"
+    write_dataframe_snapshots(df, raw_path=raw_path, parquet_path=parquet_path)
+    logger.info(
+        "race_links processado. CSV bruto: {} | Parquet: {}",
+        raw_path,
+        parquet_path,
+    )
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from urllib.parse import urljoin
 
 from src.greyhounds.config import settings
+from src.greyhounds.utils.files import write_dataframe_snapshots
 from src.greyhounds.utils.dates import iso_to_hhmm
 from src.greyhounds.utils.selenium_driver import build_chrome_driver
 from src.greyhounds.utils.text import clean_horse_name, normalize_track_name
@@ -225,8 +226,8 @@ def scrape_timeform_for_races(race_rows: Iterable[Dict[str, str]]) -> Iterable[D
         driver.quit()
 
 
-def save_timeform_forecast_csv(rows: Iterable[Dict[str, object]], output_path: Path) -> None:
-    df = pd.DataFrame([
+def _build_timeform_forecast_df(rows: Iterable[Dict[str, object]]) -> pd.DataFrame:
+    data = [
         {
             "track_name": row.get("track_name"),
             "race_time_iso": row.get("race_time_iso"),
@@ -234,14 +235,14 @@ def save_timeform_forecast_csv(rows: Iterable[Dict[str, object]], output_path: P
         }
         for row in rows
         if row.get("TimeformForecast")
-    ])
-    if df.empty:
-        df = pd.DataFrame([], columns=["track_name", "race_time_iso", "TimeformForecast"])
-    df.to_csv(output_path, index=False, encoding=settings.CSV_ENCODING)
+    ]
+    if not data:
+        return pd.DataFrame([], columns=["track_name", "race_time_iso", "TimeformForecast"])
+    return pd.DataFrame(data)
 
 
-def save_timeform_top3_csv(rows: Iterable[Dict[str, object]], output_path: Path) -> None:
-    df = pd.DataFrame([
+def _build_timeform_top3_df(rows: Iterable[Dict[str, object]]) -> pd.DataFrame:
+    data = [
         {
             "track_name": row.get("track_name"),
             "race_time_iso": row.get("race_time_iso"),
@@ -251,7 +252,27 @@ def save_timeform_top3_csv(rows: Iterable[Dict[str, object]], output_path: Path)
         }
         for row in rows
         if row.get("TimeformTop1") or row.get("TimeformTop2") or row.get("TimeformTop3")
-    ])
-    if df.empty:
-        df = pd.DataFrame([], columns=["track_name", "race_time_iso", "TimeformTop1", "TimeformTop2", "TimeformTop3"])
-    df.to_csv(output_path, index=False, encoding=settings.CSV_ENCODING)
+    ]
+    if not data:
+        return pd.DataFrame([], columns=["track_name", "race_time_iso", "TimeformTop1", "TimeformTop2", "TimeformTop3"])
+    return pd.DataFrame(data)
+
+
+def save_timeform_forecast(
+    rows: Iterable[Dict[str, object]],
+    raw_path: Path,
+    parquet_path: Path,
+) -> pd.DataFrame:
+    df = _build_timeform_forecast_df(rows)
+    write_dataframe_snapshots(df, raw_path=raw_path, parquet_path=parquet_path)
+    return df
+
+
+def save_timeform_top3(
+    rows: Iterable[Dict[str, object]],
+    raw_path: Path,
+    parquet_path: Path,
+) -> pd.DataFrame:
+    df = _build_timeform_top3_df(rows)
+    write_dataframe_snapshots(df, raw_path=raw_path, parquet_path=parquet_path)
+    return df

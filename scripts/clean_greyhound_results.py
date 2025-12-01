@@ -150,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.remove()
     logger.add(sys.stderr, level=settings.LOG_LEVEL)
 
-    result_dir = settings.DATA_DIR / "Result"
+    result_dir = settings.RAW_RESULT_DIR
     if not result_dir.exists():
         logger.error("Diretório não encontrado: {}", result_dir)
         return 1

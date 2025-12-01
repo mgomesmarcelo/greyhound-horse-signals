@@ -4,6 +4,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import re
+from typing import List
 from dateutil import parser as date_parser
 import altair as alt
 
@@ -13,6 +14,13 @@ sys.path.append(str(PROJECT_ROOT))
 from src.greyhounds.config import settings
 from src.greyhounds.config import RULE_LABELS, RULE_LABELS_INV, ENTRY_TYPE_LABELS, SOURCE_LABELS, SOURCE_LABELS_INV
 from src.greyhounds.utils.text import normalize_track_name
+
+
+def _iter_result_paths(pattern: str) -> List[Path]:
+    parquet_paths = sorted(settings.PROCESSED_RESULT_DIR.glob(f"{pattern}.parquet"))
+    if parquet_paths:
+        return parquet_paths
+    return sorted(settings.RAW_RESULT_DIR.glob(f"{pattern}.csv"))
 
 
 def _extract_track_from_menu_hint(menu_hint: str) -> str:
@@ -44,11 +52,14 @@ def _extract_category_token(event_name: str) -> str:
 
 
 def _build_category_index() -> dict[tuple[str, str], dict[str, str]]:
-    result_dir = settings.DATA_DIR / "Result"
     mapping: dict[tuple[str, str], dict[str, str]] = {}
-    for csv_path in sorted(result_dir.glob("dwbfgreyhoundwin*.csv")):
+    columns = ["menu_hint", "event_dt", "event_name"]
+    for path in _iter_result_paths("dwbfgreyhoundwin*"):
         try:
-            df_r = pd.read_csv(csv_path, encoding=settings.CSV_ENCODING, usecols=["menu_hint", "event_dt", "event_name"])
+            if path.suffix == ".parquet":
+                df_r = pd.read_parquet(path, columns=columns)
+            else:
+                df_r = pd.read_csv(path, encoding=settings.CSV_ENCODING, usecols=columns, engine="python", on_bad_lines="skip")
         except Exception:
             continue
         df_r = df_r.dropna(subset=["menu_hint", "event_dt", "event_name"], how="any")
@@ -69,11 +80,14 @@ def _build_category_index() -> dict[tuple[str, str], dict[str, str]]:
 
 def _build_num_runners_index() -> dict[tuple[str, str], int]:
     """Conta corredores por corrida a partir dos CSVs WIN (linhas por evento)."""
-    result_dir = settings.DATA_DIR / "Result"
     counts: dict[tuple[str, str], int] = {}
-    for csv_path in sorted(result_dir.glob("dwbfgreyhoundwin*.csv")):
+    columns = ["menu_hint", "event_dt"]
+    for path in _iter_result_paths("dwbfgreyhoundwin*"):
         try:
-            df_r = pd.read_csv(csv_path, encoding=settings.CSV_ENCODING, usecols=["menu_hint", "event_dt"], engine="python")
+            if path.suffix == ".parquet":
+                df_r = pd.read_parquet(path, columns=columns)
+            else:
+                df_r = pd.read_csv(path, encoding=settings.CSV_ENCODING, usecols=columns, engine="python", on_bad_lines="skip")
         except Exception:
             continue
         if df_r.empty:
@@ -88,14 +102,20 @@ def _build_num_runners_index() -> dict[tuple[str, str], int]:
 
 
 def load_signals(source: str = "top3", market: str = "win", rule: str = "terceiro_queda50") -> pd.DataFrame:
-    filename = f"signals_{source}_{market}_{rule}.csv"
-    path = settings.DATA_DIR / "signals" / filename
-    if not path.exists():
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(path, encoding=settings.CSV_ENCODING)
-    except Exception:
-        return pd.DataFrame()
+    parquet_path = settings.PROCESSED_SIGNALS_DIR / f"signals_{source}_{market}_{rule}.parquet"
+    if parquet_path.exists():
+        try:
+            return pd.read_parquet(parquet_path)
+        except Exception:
+            pass
+
+    csv_path = settings.RAW_SIGNALS_DIR / f"signals_{source}_{market}_{rule}.csv"
+    if csv_path.exists():
+        try:
+            return pd.read_csv(csv_path, encoding=settings.CSV_ENCODING, engine="python", on_bad_lines="skip")
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
 
 
 def main() -> None:

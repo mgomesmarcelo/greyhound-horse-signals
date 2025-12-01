@@ -23,6 +23,7 @@
 - `python scripts/generate_greyhound_signals.py --source both --market both --rule both --entry_type both`
 - `python scripts/clean_greyhound_results.py [--force]`
 - `python scripts/run_greyhounds_streamlit.py --port 8501 --address 0.0.0.0`
+- `python scripts/convert_greyhound_history.py [--dataset signals|timeform_top3|timeform_forecast|race_links|betfair_result] [--force]`
 
 #### Fluxo recomendado (daily)
 1. `python -m src.greyhounds.run_daily`
@@ -44,18 +45,27 @@
     - `--max-downloads N`: limita a quantidade de arquivos (útil para testes rápidos).
 
 ## Estrutura de dados (data/)
-`
+```
 data/
-â”œâ”€â”€ horses/
-â”‚   â”œâ”€â”€ betfair_top3/
-â”‚   â””â”€â”€ TimeformForecast/
-â””â”€â”€ greyhounds/
-    â”œâ”€â”€ race_links/
-    â”œâ”€â”€ TimeformForecast/
-    â””â”€â”€ timeform_top3/
-`
+  horses/
+    betfair_top3/
+    TimeformForecast/
+  greyhounds/
+    race_links/
+    Result/
+    TimeformForecast/
+    timeform_top3/
+    processed/
+      race_links/
+      Result/
+      TimeformForecast/
+      timeform_top3/
+      signals/
+```
 
 ## Observacoes
 - O Selenium necessita de Chrome/Chromedriver compatíveis (webdriver-manager cuida disso).
 - Ajuste `settings.LOG_LEVEL` em `src/horses/config.py` ou `src/greyhounds/config.py` para controlar verbosidade.
 - Use `.env` para variáveis sensíveis (lidas via python-dotenv, se necessário).
+- Após raspagens/gerações antigas, execute `python scripts/convert_greyhound_history.py`
+  para sincronizar os Parquets em `data/greyhounds/processed/`.

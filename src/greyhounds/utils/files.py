@@ -2,7 +2,7 @@
 
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 
@@ -98,3 +98,37 @@ def upsert_row_by_keys(csv_path: Path, new_row: Dict[str, object], key_fields: L
         except Exception:
             pass
     pd.DataFrame([new_row]).to_csv(csv_path, index=False, encoding=settings.CSV_ENCODING)
+
+
+def write_dataframe_snapshots(
+    df: pd.DataFrame,
+    raw_path: Path,
+    parquet_path: Path,
+    *,
+    encoding: str | None = None,
+    parquet_compression: Optional[str] = "snappy",
+) -> None:
+    """
+    Persist a dataframe both as CSV (raw snapshot) and Parquet (processed).
+
+    Parameters
+    ----------
+    df:
+        DataFrame a ser salvo.
+    raw_path:
+        Caminho completo para o arquivo CSV bruto.
+    parquet_path:
+        Caminho completo para o arquivo Parquet processado.
+    encoding:
+        Codificação usada no CSV (padrão: settings.CSV_ENCODING).
+    parquet_compression:
+        Compressão aplicada ao Parquet (padrão: snappy).
+    """
+    if encoding is None:
+        encoding = settings.CSV_ENCODING
+
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df.to_csv(raw_path, index=False, encoding=encoding)
+    df.to_parquet(parquet_path, index=False, compression=parquet_compression)
