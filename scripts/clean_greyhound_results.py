@@ -13,6 +13,7 @@ if __package__ in (None, ""):
         sys.path.append(str(project_root))
 
 from src.greyhounds.config import settings
+from src.greyhounds.utils.text import normalize_track_name
 
 TARGET_COLUMNS = [
     "event_id",
@@ -28,6 +29,17 @@ TARGET_COLUMNS = [
 
 _BSP_TWO_DEC_REGEX = re.compile(r"^\d+\.\d{2}$")
 _BANNED_REGEX = re.compile(r"\((?:AUS|NZL)\)")
+BANNED_TRACK_PREFIXES = (
+    "aus ",
+    "australia ",
+    "nz ",
+    "new zealand ",
+)
+BANNED_TRACK_NAMES = {
+    "",
+    "none",
+    "murray bridge",
+}
 
 
 def _canonicalize_column(name: str) -> str | None:
@@ -97,6 +109,16 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     mask_banned = out.astype(str).apply(lambda col: col.str.contains(_BANNED_REGEX, na=False)).any(axis=1)
     if mask_banned.any():
         out = out.loc[~mask_banned].reset_index(drop=True)
+    def _is_banned_track(menu_hint: str) -> bool:
+        text = str(menu_hint or "").strip()
+        lower = text.lower()
+        if any(lower.startswith(prefix) for prefix in BANNED_TRACK_PREFIXES):
+            return True
+        normalized = normalize_track_name(text)
+        return normalized.lower() in BANNED_TRACK_NAMES
+    track_mask = out["menu_hint"].apply(_is_banned_track)
+    if track_mask.any():
+        out = out.loc[~track_mask].reset_index(drop=True)
     out["bsp"] = out["bsp"].map(format_bsp_to_two_decimals)
     return out
 

@@ -25,10 +25,7 @@ def _strip_trap_prefix(name: str) -> str:
 
 
 def _extract_track_from_menu_hint(menu_hint: str) -> str:
-    text = menu_hint or ""
-    match = re.match(r"^([A-Za-z\s]+?)(?:\s*\d|$)", text)
-    base = match.group(1) if match else text
-    return normalize_track_name(base)
+    return normalize_track_name(str(menu_hint or ""))
 
 
 def _to_iso_yyyy_mm_dd_thh_mm(value: str) -> str:

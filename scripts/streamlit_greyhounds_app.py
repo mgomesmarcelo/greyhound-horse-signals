@@ -1,10 +1,12 @@
+import datetime
+import math
 import sys
 from pathlib import Path
+from typing import List, Tuple
 
 import pandas as pd
 import streamlit as st
 import re
-from typing import List
 from dateutil import parser as date_parser
 import altair as alt
 
@@ -21,6 +23,92 @@ def _iter_result_paths(pattern: str) -> List[Path]:
     if parquet_paths:
         return parquet_paths
     return sorted(settings.RAW_RESULT_DIR.glob(f"{pattern}.csv"))
+
+
+def _stat_signature(paths: List[Path]) -> Tuple[Tuple[str, float, str], ...]:
+    signature: List[Tuple[str, float, str]] = []
+    for path in paths:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        signature.append((str(path), stat.st_mtime, path.suffix.lstrip(".").lower()))
+    return tuple(signature)
+
+
+@st.cache_data(show_spinner=False)
+def _read_dataframe_cached(
+    path_str: str,
+    mtime: float,
+    file_type: str,
+    columns: Tuple[str, ...] | None = None,
+) -> pd.DataFrame:
+    del mtime  # usado apenas para chave de cache
+    if file_type == "parquet":
+        if columns is not None:
+            return pd.read_parquet(path_str, columns=list(columns))
+        return pd.read_parquet(path_str)
+
+    read_kwargs: dict = {
+        "encoding": settings.CSV_ENCODING,
+        "engine": "python",
+        "on_bad_lines": "skip",
+    }
+    if columns is not None:
+        read_kwargs["usecols"] = list(columns)
+    return pd.read_csv(path_str, **read_kwargs)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_category_index(
+    files_signature: Tuple[Tuple[str, float, str], ...],
+) -> dict[tuple[str, str], dict[str, str]]:
+    mapping: dict[tuple[str, str], dict[str, str]] = {}
+    columns = ("menu_hint", "event_dt", "event_name")
+    for path_str, mtime, file_type in files_signature:
+        try:
+            df_r = _read_dataframe_cached(path_str, mtime, file_type, columns)
+        except Exception:
+            continue
+        df_r = df_r.dropna(subset=list(columns), how="any")
+        if df_r.empty:
+            continue
+        df_r["track_key"] = df_r["menu_hint"].astype(str).map(_extract_track_from_menu_hint)
+        df_r["race_iso"] = df_r["event_dt"].astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
+        df_r["cat_letter"] = df_r["event_name"].astype(str).map(_extract_category_letter)
+        df_r["cat_token"] = df_r["event_name"].astype(str).map(_extract_category_token)
+        for _, r in df_r.iterrows():
+            key = (str(r["track_key"]), str(r["race_iso"]))
+            if not key[0] or not key[1]:
+                continue
+            if key not in mapping:
+                mapping[key] = {
+                    "letter": str(r.get("cat_letter", "")),
+                    "token": str(r.get("cat_token", "")),
+                }
+    return mapping
+
+
+@st.cache_data(show_spinner=False)
+def _cached_num_runners_index(
+    files_signature: Tuple[Tuple[str, float, str], ...],
+) -> dict[tuple[str, str], int]:
+    counts: dict[tuple[str, str], int] = {}
+    columns = ("menu_hint", "event_dt")
+    for path_str, mtime, file_type in files_signature:
+        try:
+            df_r = _read_dataframe_cached(path_str, mtime, file_type, columns)
+        except Exception:
+            continue
+        if df_r.empty:
+            continue
+        df_r["track_key"] = df_r["menu_hint"].astype(str).map(_extract_track_from_menu_hint)
+        df_r["race_iso"] = df_r["event_dt"].astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
+        grp = df_r.groupby(["track_key", "race_iso"], dropna=False).size()
+        for (tk, ri), n in grp.items():
+            if isinstance(tk, str) and tk and isinstance(ri, str) and ri:
+                counts[(tk, ri)] = int(n)
+    return counts
 
 
 def _extract_track_from_menu_hint(menu_hint: str) -> str:
@@ -52,67 +140,42 @@ def _extract_category_token(event_name: str) -> str:
 
 
 def _build_category_index() -> dict[tuple[str, str], dict[str, str]]:
-    mapping: dict[tuple[str, str], dict[str, str]] = {}
-    columns = ["menu_hint", "event_dt", "event_name"]
-    for path in _iter_result_paths("dwbfgreyhoundwin*"):
-        try:
-            if path.suffix == ".parquet":
-                df_r = pd.read_parquet(path, columns=columns)
-            else:
-                df_r = pd.read_csv(path, encoding=settings.CSV_ENCODING, usecols=columns, engine="python", on_bad_lines="skip")
-        except Exception:
-            continue
-        df_r = df_r.dropna(subset=["menu_hint", "event_dt", "event_name"], how="any")
-        if df_r.empty:
-            continue
-        df_r["track_key"] = df_r["menu_hint"].astype(str).map(_extract_track_from_menu_hint)
-        df_r["race_iso"] = df_r["event_dt"].astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
-        df_r["cat_letter"] = df_r["event_name"].astype(str).map(_extract_category_letter)
-        df_r["cat_token"] = df_r["event_name"].astype(str).map(_extract_category_token)
-        for _, r in df_r.iterrows():
-            key = (str(r["track_key"]), str(r["race_iso"]))
-            if not key[0] or not key[1]:
-                continue
-            if key not in mapping:
-                mapping[key] = {"letter": str(r.get("cat_letter", "")), "token": str(r.get("cat_token", ""))}
-    return mapping
+    paths = _iter_result_paths("dwbfgreyhoundwin*")
+    signature = _stat_signature(paths)
+    return _cached_category_index(signature)
 
 
 def _build_num_runners_index() -> dict[tuple[str, str], int]:
     """Conta corredores por corrida a partir dos CSVs WIN (linhas por evento)."""
-    counts: dict[tuple[str, str], int] = {}
-    columns = ["menu_hint", "event_dt"]
-    for path in _iter_result_paths("dwbfgreyhoundwin*"):
-        try:
-            if path.suffix == ".parquet":
-                df_r = pd.read_parquet(path, columns=columns)
-            else:
-                df_r = pd.read_csv(path, encoding=settings.CSV_ENCODING, usecols=columns, engine="python", on_bad_lines="skip")
-        except Exception:
-            continue
-        if df_r.empty:
-            continue
-        df_r["track_key"] = df_r["menu_hint"].astype(str).map(_extract_track_from_menu_hint)
-        df_r["race_iso"] = df_r["event_dt"].astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
-        grp = df_r.groupby(["track_key", "race_iso"], dropna=False).size()
-        for (tk, ri), n in grp.items():
-            if isinstance(tk, str) and tk and isinstance(ri, str) and ri:
-                counts[(tk, ri)] = int(n)
-    return counts
+    paths = _iter_result_paths("dwbfgreyhoundwin*")
+    signature = _stat_signature(paths)
+    return _cached_num_runners_index(signature)
 
 
 def load_signals(source: str = "top3", market: str = "win", rule: str = "terceiro_queda50") -> pd.DataFrame:
     parquet_path = settings.PROCESSED_SIGNALS_DIR / f"signals_{source}_{market}_{rule}.parquet"
     if parquet_path.exists():
         try:
-            return pd.read_parquet(parquet_path)
+            stat = parquet_path.stat()
+            return _read_dataframe_cached(
+                str(parquet_path),
+                stat.st_mtime,
+                "parquet",
+                None,
+            )
         except Exception:
             pass
 
     csv_path = settings.RAW_SIGNALS_DIR / f"signals_{source}_{market}_{rule}.csv"
     if csv_path.exists():
         try:
-            return pd.read_csv(csv_path, encoding=settings.CSV_ENCODING, engine="python", on_bad_lines="skip")
+            stat = csv_path.stat()
+            return _read_dataframe_cached(
+                str(csv_path),
+                stat.st_mtime,
+                "csv",
+                None,
+            )
         except Exception:
             return pd.DataFrame()
     return pd.DataFrame()
@@ -128,25 +191,66 @@ def main() -> None:
     small_width = 360
     small_height = 180
 
-    # seletores de fonte, mercado, regra e tipo de entrada
-    col_src, col_mkt, col_rule, col_entry = st.columns([1, 1, 1.5, 1.2])
+    # seletores de regra, fonte, mercado e tipo de entrada
+    col_rule, col_src, col_mkt, col_entry = st.columns([1.6, 1.2, 1, 1.2])
+
+    rule_label_pairs = [
+        ("terceiro_queda50", RULE_LABELS["terceiro_queda50"]),
+        ("lider_volume_total", RULE_LABELS["lider_volume_total"]),
+    ]
+    rule_labels = [label for _, label in rule_label_pairs]
+
+    def _reset_rule_dependent_state() -> None:
+        keys_to_clear = [
+            "date_start_input",
+            "date_end_input",
+            "date_range_slider",
+            "dates_range",
+            "dates_ms",
+            "tracks_ms",
+            "num_runners_ms",
+            "cats_ms",
+            "subcats_ms",
+            "sel_num_runners",
+            "sel_cats",
+            "sel_subcats",
+            "bsp_low",
+            "bsp_high",
+            "bsp_slider",
+        ]
+        for key in keys_to_clear:
+            st.session_state.pop(key, None)
+
+    with col_rule:
+        if "rule_select_label" not in st.session_state:
+            st.session_state["rule_select_label"] = rule_labels[0]
+
+        def _on_rule_change() -> None:
+            _reset_rule_dependent_state()
+
+        selected_rule_label = st.selectbox(
+            "Regra de selecao",
+            rule_labels,
+            key="rule_select_label",
+            on_change=_on_rule_change,
+        )
+        rule = RULE_LABELS_INV.get(selected_rule_label, "terceiro_queda50")
+
     with col_src:
         source_options = ["top3", "forecast", "betfair_resultado"]
         source_label_options = [SOURCE_LABELS.get(opt, opt) for opt in source_options]
+        if "source_select_label" not in st.session_state:
+            st.session_state["source_select_label"] = source_label_options[0]
         selected_source_label = st.selectbox(
-            "Estrategia",
+            "Fonte de dados",
             source_label_options,
-            index=0,
             key="source_select_label",
         )
         source = SOURCE_LABELS_INV.get(selected_source_label, "top3")
     source_label = SOURCE_LABELS.get(source, source)
+
     with col_mkt:
         market = st.selectbox("Mercado", ["win", "place"], index=0)
-    with col_rule:
-        rule_labels = [RULE_LABELS["terceiro_queda50"], RULE_LABELS["lider_volume_total"]]
-        selected_rule_label = st.selectbox("Regra de selecao", rule_labels, index=0)
-        rule = RULE_LABELS_INV.get(selected_rule_label, "terceiro_queda50")
     with col_entry:
         entry_opt_labels = ["ambos", ENTRY_TYPE_LABELS["back"], ENTRY_TYPE_LABELS["lay"]]
         entry_label = st.selectbox("Tipo de entrada", entry_opt_labels, index=0)
@@ -155,40 +259,166 @@ def main() -> None:
         else:
             entry_type = "back" if entry_label == ENTRY_TYPE_LABELS["back"] else "lay"
 
-    st.caption(f"Estrategia selecionada: {source_label}")
+    st.caption(f"Regra selecionada: {selected_rule_label} · Fonte de dados: {source_label}")
 
     df = load_signals(source=source, market=market, rule=rule)
     if df.empty:
         st.info("Nenhum sinal encontrado para a selecao. Gere antes com: python scripts/generate_greyhound_signals.py --source {src} --market {mkt} --rule {rule} --entry_type both".format(src=source, mkt=market, rule=rule))
         return
 
+    df_filtered = df.copy()
+
     # Filtros (sem ratio; regra fixa >50%)
     col_f1, col_f2, col_f3 = st.columns(3)
     with col_f1:
-        dates = sorted(df["date"].dropna().unique().tolist())
-        b1, b2, _ = st.columns([1, 1, 2])
-        with b1:
-            st.button(
-                "Todos",
-                key="dates_all",
-                on_click=lambda: st.session_state.update({"dates_ms": dates}),
+        raw_date_values = df["date"].dropna().astype(str).unique().tolist()
+        parsed_dates = []
+        for date_str in raw_date_values:
+            parsed = pd.to_datetime(date_str, errors="coerce")
+            if pd.notna(parsed):
+                parsed_dates.append((date_str, parsed.date()))
+        parsed_dates.sort(key=lambda item: item[1])
+
+        date_start_key = "date_start_input"
+        date_end_key = "date_end_input"
+
+        if parsed_dates:
+            min_date = parsed_dates[0][1]
+            max_date = parsed_dates[-1][1]
+
+            def _normalize_date_value(value: object, fallback: datetime.date) -> datetime.date:
+                if isinstance(value, pd.Timestamp):
+                    return value.to_pydatetime().date()
+                if isinstance(value, datetime.datetime):
+                    return value.date()
+                if isinstance(value, datetime.date):
+                    return value
+                if isinstance(value, str):
+                    parsed_value = pd.to_datetime(value, errors="coerce")
+                    if pd.notna(parsed_value):
+                        return parsed_value.date()
+                return fallback
+
+            stored_start = _normalize_date_value(st.session_state.get(date_start_key, min_date), min_date)
+            stored_end = _normalize_date_value(st.session_state.get(date_end_key, max_date), max_date)
+
+            sanitized_start = max(min_date, min(stored_start, max_date))
+            sanitized_end = max(min_date, min(stored_end, max_date))
+            if sanitized_start > sanitized_end:
+                sanitized_end = sanitized_start
+
+            if st.session_state.get(date_start_key) != sanitized_start:
+                st.session_state[date_start_key] = sanitized_start
+            if st.session_state.get(date_end_key) != sanitized_end:
+                st.session_state[date_end_key] = sanitized_end
+
+            start_col, end_col = st.columns(2)
+            with start_col:
+                start_selected = st.date_input(
+                    "Data inicial",
+                    value=sanitized_start,
+                    min_value=min_date,
+                    max_value=max_date,
+                    key=date_start_key,
+                )
+            with end_col:
+                end_selected = st.date_input(
+                    "Data final",
+                    value=sanitized_end,
+                    min_value=min_date,
+                    max_value=max_date,
+                    key=date_end_key,
+                )
+
+            range_start = min(start_selected, end_selected)
+            range_end = max(start_selected, end_selected)
+
+            slider_key = "date_range_slider"
+            slider_min_dt = datetime.datetime.combine(min_date, datetime.time.min)
+            slider_max_dt = datetime.datetime.combine(max_date, datetime.time.min)
+            default_slider_value = (
+                datetime.datetime.combine(range_start, datetime.time.min),
+                datetime.datetime.combine(range_end, datetime.time.min),
             )
-        with b2:
-            st.button(
-                "Limpar",
-                key="dates_none",
-                on_click=lambda: st.session_state.update({"dates_ms": []}),
+
+            current_slider_value = st.session_state.get(slider_key, default_slider_value)
+            if not isinstance(current_slider_value, (tuple, list)) or len(current_slider_value) != 2:
+                current_slider_value = default_slider_value
+            else:
+                start_norm = current_slider_value[0]
+                end_norm = current_slider_value[1]
+                if isinstance(start_norm, pd.Timestamp):
+                    start_norm = start_norm.to_pydatetime()
+                if isinstance(end_norm, pd.Timestamp):
+                    end_norm = end_norm.to_pydatetime()
+                if isinstance(start_norm, datetime.date) and not isinstance(start_norm, datetime.datetime):
+                    start_norm = datetime.datetime.combine(start_norm, datetime.time.min)
+                if isinstance(end_norm, datetime.date) and not isinstance(end_norm, datetime.datetime):
+                    end_norm = datetime.datetime.combine(end_norm, datetime.time.min)
+                if not isinstance(start_norm, datetime.datetime):
+                    start_norm = default_slider_value[0]
+                if not isinstance(end_norm, datetime.datetime):
+                    end_norm = default_slider_value[1]
+                start_norm = max(slider_min_dt, min(start_norm, slider_max_dt))
+                end_norm = max(slider_min_dt, min(end_norm, slider_max_dt))
+                if start_norm > end_norm:
+                    end_norm = start_norm
+                current_slider_value = (start_norm, end_norm)
+
+            if st.session_state.get(slider_key) != current_slider_value:
+                st.session_state[slider_key] = current_slider_value
+
+            slider_start_dt, slider_end_dt = st.slider(
+                "Intervalo de datas (barra)",
+                min_value=slider_min_dt,
+                max_value=slider_max_dt,
+                value=st.session_state[slider_key],
+                format="YYYY-MM-DD",
+                key=slider_key,
             )
-        default_dates = st.session_state.get("dates_ms", dates)
-        sel_dates = st.multiselect("Datas", dates, default=default_dates, key="dates_ms")
+            slider_start_date = slider_start_dt.date()
+            slider_end_date = slider_end_dt.date()
+
+            slider_changed = (slider_start_date != sanitized_start) or (slider_end_date != sanitized_end)
+
+            if slider_changed:
+                range_start = slider_start_date
+                range_end = slider_end_date
+                final_slider_state = (
+                    datetime.datetime.combine(range_start, datetime.time.min),
+                    datetime.datetime.combine(range_end, datetime.time.min),
+                )
+                if st.session_state.get(slider_key) != final_slider_state:
+                    st.session_state[slider_key] = final_slider_state
+            else:
+                range_start = sanitized_start
+                range_end = sanitized_end
+                desired_slider_state = (
+                    datetime.datetime.combine(range_start, datetime.time.min),
+                    datetime.datetime.combine(range_end, datetime.time.min),
+                )
+                if st.session_state.get(slider_key) != desired_slider_state:
+                    st.session_state[slider_key] = desired_slider_state
+
+            range_start = max(min_date, range_start)
+            range_end = min(max_date, range_end)
+            if range_start > range_end:
+                range_end = range_start
+
+            dates_in_range = [d for d, parsed in parsed_dates if range_start <= parsed <= range_end]
+        else:
+            range_start = range_end = None
+            dates_in_range = sorted(raw_date_values)
+
+        df_filtered = df[df["date"].isin(dates_in_range)].copy() if dates_in_range else df.iloc[0:0].copy()
     with col_f2:
-        tracks = sorted(df["track_name"].dropna().unique().tolist())
+        tracks = sorted(df_filtered["track_name"].dropna().unique().tolist())
         tb1, tb2, _ = st.columns([1, 1, 2])
         with tb1:
             st.button(
                 "Todos",
                 key="tracks_all",
-                on_click=lambda: st.session_state.update({"tracks_ms": tracks}),
+                on_click=lambda: st.session_state.update({"tracks_ms": list(tracks)}),
             )
         with tb2:
             st.button(
@@ -196,21 +426,45 @@ def main() -> None:
                 key="tracks_none",
                 on_click=lambda: st.session_state.update({"tracks_ms": []}),
             )
-        default_tracks = st.session_state.get("tracks_ms", tracks)
-        sel_tracks = st.multiselect("Pistas", tracks, default=default_tracks, key="tracks_ms")
+        existing_tracks = st.session_state.get("tracks_ms")
+        if existing_tracks is None:
+            sanitized_tracks = list(tracks)
+        else:
+            sanitized_tracks = [t for t in existing_tracks if t in tracks]
+            if not sanitized_tracks and existing_tracks:
+                sanitized_tracks = list(tracks)
+        st.session_state["tracks_ms"] = sanitized_tracks
+        sel_tracks = st.multiselect("Pistas", tracks, default=sanitized_tracks, key="tracks_ms")
     with col_f3:
         if entry_type == "lay":
             bsp_col = "lay_target_bsp"
-            base_df_for_bsp = df[df["entry_type"] == "lay"]
+            base_df_for_bsp = df_filtered[df_filtered["entry_type"] == "lay"]
         elif entry_type == "back":
             bsp_col = "back_target_bsp"
-            base_df_for_bsp = df[df["entry_type"] == "back"]
+            base_df_for_bsp = df_filtered[df_filtered["entry_type"] == "back"]
         else:
             # ambos: usa faixa unificada
             bsp_col = None
-            base_df_for_bsp = df
-        bsp_min = float(base_df_for_bsp[["lay_target_bsp","back_target_bsp"]].min().min()) if entry_type == "both" else float(base_df_for_bsp[bsp_col].min()) if not base_df_for_bsp.empty else 1.01
-        bsp_max = float(base_df_for_bsp[["lay_target_bsp","back_target_bsp"]].max().max()) if entry_type == "both" else float(base_df_for_bsp[bsp_col].max()) if not base_df_for_bsp.empty else 100.0
+            base_df_for_bsp = df_filtered
+        if entry_type == "both":
+            if base_df_for_bsp.empty:
+                bsp_min = 1.01
+                bsp_max = 100.0
+            else:
+                combined_bsp = base_df_for_bsp[["lay_target_bsp", "back_target_bsp"]]
+                bsp_min = float(combined_bsp.min().min())
+                bsp_max = float(combined_bsp.max().max())
+        else:
+            if base_df_for_bsp.empty:
+                bsp_min = 1.01
+                bsp_max = 100.0
+            else:
+                bsp_min = float(base_df_for_bsp[bsp_col].min())
+                bsp_max = float(base_df_for_bsp[bsp_col].max())
+        if not math.isfinite(bsp_min):
+            bsp_min = 1.01
+        if not math.isfinite(bsp_max):
+            bsp_max = max(bsp_min, 100.0)
         bsp_min = max(1.01, round(bsp_min, 2))
         bsp_max = max(bsp_min, round(bsp_max, 2))
         # Inicializa defaults/clamp atuais em session_state
@@ -286,14 +540,14 @@ def main() -> None:
         # (campo movido para a frente do cabecalho de Stake)
 
     # Enriquecimento: num_runners (fallback se ausente)
-    if "num_runners" not in df.columns:
+    if "num_runners" not in df_filtered.columns:
         num_index = _build_num_runners_index()
-        if not df.empty:
-            df["_key_track"] = df["track_name"].astype(str).map(normalize_track_name)
-            df["_key_race"] = df["race_time_iso"].astype(str)
-            df["num_runners"] = df.apply(lambda r: num_index.get((str(r["_key_track"]), str(r["_key_race"])), pd.NA), axis=1)
+        if not df_filtered.empty:
+            df_filtered["_key_track"] = df_filtered["track_name"].astype(str).map(normalize_track_name)
+            df_filtered["_key_race"] = df_filtered["race_time_iso"].astype(str)
+            df_filtered["num_runners"] = df_filtered.apply(lambda r: num_index.get((str(r["_key_track"]), str(r["_key_race"])), pd.NA), axis=1)
 
-    filt = df.copy()
+    filt = df_filtered.copy()
     # Filtro adicional: participacao do lider (somente para regra lider_volume_total)
     if rule == "lider_volume_total":
         col_l1, col_l2 = st.columns([1, 2])
@@ -318,8 +572,6 @@ def main() -> None:
         cat_letters = sorted([c for c in filt["category"].dropna().unique().tolist() if isinstance(c, str) and c])
     else:
         cat_letters = []
-    if sel_dates:
-        filt = filt[filt["date"].isin(sel_dates)]
     if sel_tracks:
         filt = filt[filt["track_name"].isin(sel_tracks)]
     # Regra principal terceiro_queda50: diferenca > 50% em relacao ao vol3
