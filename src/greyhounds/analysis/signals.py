@@ -354,12 +354,18 @@ def _calc_signals_for_race(
         return []
 
     num_runners = len(group)
+    total_vol_race = 0.0
     triples: List[Tuple[str, float, float]] = []
     for name in top_names:
         runner = group.get(name)
         if not runner or pd.isna(runner.bsp):
             return []
         triples.append((name, max(0.0, float(runner.pptradedvol)), float(runner.bsp)))
+    for runner in group.values():
+        try:
+            total_vol_race += max(0.0, float(runner.pptradedvol))
+        except (TypeError, ValueError):
+            continue
 
     if len(triples) < 3:
         return []
@@ -381,9 +387,6 @@ def _calc_signals_for_race(
         target_name_clean = third[0]
         target_bsp_win = third[2]
     else:
-        total_vol_race = 0.0
-        for _, runner in bf_win_index.get((track_key, race_iso), {}).items():
-            total_vol_race += max(0.0, float(runner.pptradedvol))
         leader_share = (first[1] / total_vol_race) if total_vol_race > 0 else 0.0
         if leader_share < float(leader_share_min):
             return []
@@ -456,6 +459,7 @@ def _calc_signals_for_race(
         "market": market,
         "rule": rule,
         "rule_label": RULE_LABELS.get(rule, rule),
+        "total_matched_volume": round(total_vol_race, 2),
     }
 
     out_back = {
@@ -592,6 +596,7 @@ def write_signals_csv(
                 "back_target_bsp",
                 "leader_name_by_volume",
                 "leader_volume_share_pct",
+                "total_matched_volume",
                 "stake_fixed_10",
                 "liability_from_stake_fixed_10",
                 "stake_for_liability_10",

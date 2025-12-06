@@ -145,6 +145,15 @@ def _build_category_index() -> dict[tuple[str, str], dict[str, str]]:
     return _cached_category_index(signature)
 
 
+def _calc_drawdown(series: pd.Series) -> float:
+    """Retorna o drawdown máximo (maior perda acumulada) em valor negativo."""
+    if series.empty:
+        return 0.0
+    running_max = series.cummax()
+    drawdown = series - running_max
+    return float(drawdown.min()) if not drawdown.empty else 0.0
+
+
 def _build_num_runners_index() -> dict[tuple[str, str], int]:
     """Conta corredores por corrida a partir dos CSVs WIN (linhas por evento)."""
     paths = _iter_result_paths("dwbfgreyhoundwin*")
@@ -267,6 +276,9 @@ def main() -> None:
         return
 
     df_filtered = df.copy()
+    if "total_matched_volume" not in df_filtered.columns:
+        df_filtered["total_matched_volume"] = pd.NA
+    df_filtered["total_matched_volume"] = pd.to_numeric(df_filtered["total_matched_volume"], errors="coerce")
 
     # Filtros (sem ratio; regra fixa >50%)
     col_f1, col_f2, col_f3 = st.columns(3)
@@ -548,6 +560,27 @@ def main() -> None:
             df_filtered["num_runners"] = df_filtered.apply(lambda r: num_index.get((str(r["_key_track"]), str(r["_key_race"])), pd.NA), axis=1)
 
     filt = df_filtered.copy()
+
+    vol_col, _ = st.columns([1, 2])
+    volume_key = "min_total_volume"
+    if volume_key not in st.session_state:
+        st.session_state[volume_key] = 2000.0
+    with vol_col:
+        st.number_input(
+            "Volume total negociado mínimo",
+            min_value=0.0,
+            max_value=1_000_000.0,
+            value=float(st.session_state[volume_key]),
+            step=100.0,
+            format="%.0f",
+            key=volume_key,
+            help="Considera apenas corridas cuja soma de pptradedvol atinge o mínimo desejado.",
+        )
+        st.caption("Volume min. por corrida (soma de pptradedvol)")
+    min_total_volume = float(st.session_state.get(volume_key, 2000.0))
+    volume_series = pd.to_numeric(filt.get("total_matched_volume", pd.Series(dtype=float)), errors="coerce")
+    filt = filt[volume_series.fillna(0.0) >= min_total_volume]
+
     # Filtro adicional: participacao do lider (somente para regra lider_volume_total)
     if rule == "lider_volume_total":
         col_l1, col_l2 = st.columns([1, 2])
@@ -725,6 +758,12 @@ def main() -> None:
         total_pnl_stake = total_pnl_stake10 * scale_factor
         roi_stake = (total_pnl_stake / total_base_stake) if total_base_stake > 0 else 0.0
         acc_stake10 = (float((df_block["is_green"] == True).sum()) / len(df_block)) if not df_block.empty else 0.0
+        if df_block.empty:
+            drawdown_stake = 0.0
+        else:
+            ordered = df_block.sort_values("race_time_iso")
+            cumulative = (ordered["pnl_stake_fixed_10"] * scale_factor).cumsum()
+            drawdown_stake = _calc_drawdown(cumulative)
 
         st.subheader(title_suffix)
 
@@ -765,13 +804,22 @@ def main() -> None:
             unsafe_allow_html=True,
         )
         st.markdown('<div id="stake-row">', unsafe_allow_html=True)
-        s1, s2, s3 = st.columns(3)
+        s1, s2, s3, s4, s5 = st.columns(5)
         with s1:
             st.metric(" Base (Stake)", f"{total_base_stake:.2f}")
         with s2:
             st.metric("PnL Stake", f"{total_pnl_stake:.2f}")
         with s3:
             st.metric("ROI Stake", f"{roi_stake:.2%}")
+        min_pnl = 0.0
+        if not df_block.empty:
+            ordered_for_min = df_block.sort_values("race_time_iso")
+            cumulative_min = (ordered_for_min["pnl_stake_fixed_10"] * scale_factor).cumsum()
+            min_pnl = float(cumulative_min.min())
+        with s4:
+            st.metric("Menor PnL acumulado", f"{min_pnl:.2f}")
+        with s5:
+            st.metric("Drawdown máximo (Stake)", f"{drawdown_stake:.2f}")
         st.markdown('</div>', unsafe_allow_html=True)
 
         # Linha 3: Liability(10)  apenas para LAY
@@ -868,7 +916,7 @@ def main() -> None:
         # Tabela
         show_cols = [
             "date", "track_name", "category_token", "race_time_iso",
-            "num_runners",
+            "num_runners", "total_matched_volume",
             "tf_top1", "tf_top2", "tf_top3",
             "vol_top1", "vol_top2", "vol_top3",
             "second_name_by_volume", "third_name_by_volume",
@@ -980,6 +1028,12 @@ def main() -> None:
     total_base_stake = total_base_stake10 * scale_factor
     total_pnl_stake = total_pnl_stake10 * scale_factor
     roi_stake = (total_pnl_stake / total_base_stake) if total_base_stake > 0 else 0.0
+    if filt.empty:
+        drawdown_stake = 0.0
+    else:
+        ordered = filt.sort_values("race_time_iso")
+        cumulative = (ordered["pnl_stake_fixed_10"] * scale_factor).cumsum()
+        drawdown_stake = _calc_drawdown(cumulative)
 
     # Linha 2: Stake(10)
     st.subheader(f"Stake (valor fixo {base_amount:.2f})")
@@ -993,14 +1047,22 @@ def main() -> None:
         unsafe_allow_html=True,
     )
     st.markdown('<div id="stake-row">', unsafe_allow_html=True)
-    s1, s2, s3 = st.columns(3)
+    s1, s2, s3, s4, s5 = st.columns(5)
     with s1:
         st.metric(" Base (Stake)", f"{total_base_stake:.2f}")
     with s2:
         st.metric("PnL Stake", f"{total_pnl_stake:.2f}")
     with s3:
         st.metric("ROI Stake", f"{roi_stake:.2%}")
-
+    min_pnl_global = 0.0
+    if not filt.empty:
+        ordered_global = filt.sort_values("race_time_iso")
+        cumulative_global = (ordered_global["pnl_stake_fixed_10"] * scale_factor).cumsum()
+        min_pnl_global = float(cumulative_global.min())
+    with s4:
+        st.metric("Menor PnL acumulado", f"{min_pnl_global:.2f}")
+    with s5:
+        st.metric("Drawdown máximo (Stake)", f"{drawdown_stake:.2f}")
     st.markdown('</div>', unsafe_allow_html=True)
 
     # Linha 3: Liability(10)  apenas para LAY
@@ -1151,7 +1213,7 @@ def main() -> None:
     if entry_type != "both":
         show_cols = [
             "date", "track_name", "category_token", "race_time_iso",
-            "num_runners",
+            "num_runners", "total_matched_volume",
             "tf_top1", "tf_top2", "tf_top3",
             "vol_top1", "vol_top2", "vol_top3",
             "second_name_by_volume", "third_name_by_volume",
@@ -1169,7 +1231,7 @@ def main() -> None:
         if entry_type == "back":
             show_cols = [
                 "date", "track_name", "category_token", "race_time_iso",
-                "num_runners",
+                "num_runners", "total_matched_volume",
                 "tf_top1", "tf_top2", "tf_top3",
                 "vol_top1", "vol_top2", "vol_top3",
                 "second_name_by_volume", "third_name_by_volume",
@@ -1182,7 +1244,7 @@ def main() -> None:
         else:
             show_cols = [
                 "date", "track_name", "category_token", "race_time_iso",
-                "num_runners",
+                "num_runners", "total_matched_volume",
                 "tf_top1", "tf_top2", "tf_top3",
                 "vol_top1", "vol_top2", "vol_top3",
                 "second_name_by_volume", "third_name_by_volume",
