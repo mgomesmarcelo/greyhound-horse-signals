@@ -1,71 +1,105 @@
 ﻿# Projeto Unificado
 
-## Scripts principais
+Suite de raspagem, limpeza e análise de corridas de cavalos e galgos, com dashboards Streamlit e rotinas diárias para geração de sinais de aposta.
 
-### Cavalos
-- `python -m src.horses.scrape_betfair_index`
-- `python -m src.horses.scrape_betfair_races`
-- `python -m src.horses.scrape_timeform_update`
-- `python scripts/generate_horse_signals.py --source both --market both --strategy both --provider timeform`
-- `python scripts/clean_horse_results.py [--force]`
-- `python scripts/run_horses_streamlit.py --port 8502 --address 0.0.0.0`
+## Visão geral
+- Coleta dados brutos da Betfair, Timeform e Sporting Life usando Selenium.
+- Padroniza e versiona arquivos em `data/` (CSV e Parquet) para histórico e consumo analítico.
+- Gera sinais configuráveis (estratégias LAY/BACK, mercados WIN/PLACE) e indicadores auxiliares.
+- Disponibiliza dashboards interativos em Streamlit para inspeção rápida das corridas e dos sinais.
 
-#### Fluxo recomendado (horses)
-1. `python -m src.horses.run_daily`
-2. `python scripts/clean_horse_results.py`
-3. `python scripts/generate_horse_signals.py --source both --market both --strategy both --provider timeform`
-4. `python scripts/run_horses_streamlit.py`
+## Pré-requisitos
+- Python 3.9 ou superior.
+- Google Chrome (ou Chromium) instalado; o `webdriver-manager` baixa o driver compatível automaticamente.
+- Sistema operacional com suporte a Selenium (Windows, macOS ou Linux).
 
-### Galgos
-- `python -m src.greyhounds.scrape_betfair_index`
-- `python -m src.greyhounds.scrape_timeform_update`
-- `python -m src.greyhounds.run_daily`
-- `python scripts/generate_greyhound_signals.py --source both --market both --rule both --entry_type both`
-- `python scripts/clean_greyhound_results.py [--force]`
-- `python scripts/run_greyhounds_streamlit.py --port 8501 --address 0.0.0.0`
-- `python scripts/convert_greyhound_history.py [--dataset signals|timeform_top3|timeform_forecast|race_links|betfair_result] [--force]`
+### Instalação rápida
+1. `python -m venv .venv`
+2. `.\.venv\Scripts\activate` (Windows) ou `source .venv/bin/activate` (Linux/macOS)
+3. `pip install -r requirements.txt` ou `pip install -e .`
+4. (Opcional) crie um `.env` na raiz para armazenar credenciais e chaves utilizadas pelos scrapers.
 
-#### Fluxo recomendado (daily)
-1. `python -m src.greyhounds.run_daily`
-2. `python scripts/clean_greyhound_results.py`
-3. `python scripts/generate_greyhound_signals.py --source both --market both --rule both --entry_type both`
-4. `python scripts/run_greyhounds_streamlit.py`
+## Estrutura do projeto
+- `src/core/`: helpers compartilhados (configuração de diretórios e caminhos).
+- `src/horses/`: scrapers, análises e utilitários específicos de corridas de cavalos.
+- `src/greyhounds/`: scrapers, análises e utilitários específicos de corridas de galgos.
+- `scripts/`: pontos de entrada em linha de comando (raspagem diária, geração de sinais, dashboards).
+- `data/`: armazenamento local (bruto e processado). A estrutura base é criada automaticamente:
 
-### Pipeline completo
-- `python -m scripts.run_all_daily`
-
-### Download automático Betfair SP
-- `python scripts/download_betfair_prices.py [opções]`
-  - Sincroniza automaticamente os arquivos públicos da Betfair SP para `data/horses/Result` e `data/greyhounds/Result`, respeitando os nomes originais (Win/Place, UK/IRE etc.).
-  - Executa em duas fases: detecta a data mínima existente localmente (considerando toda a árvore `data/horses` ou `data/greyhounds`) e baixa apenas o que está faltando até a data atual.
-  - Principais flags:
-    - `--dry-run`: lista os arquivos faltantes sem baixar (recomendado na primeira execução).
-    - `--delay 2`: impõe espera em segundos entre downloads (default 1.5s) para evitar bloqueios.
-    - `--horses-start-date YYYY-MM-DD` / `--greyhounds-start-date YYYY-MM-DD`: sobrescrevem a data mínima detectada. Ex.: baixar galgos desde 2002 → `python scripts/download_betfair_prices.py --greyhounds-start-date 2002-01-01`.
-    - `--max-downloads N`: limita a quantidade de arquivos (útil para testes rápidos).
-
-## Estrutura de dados (data/)
 ```
 data/
   horses/
-    betfair_top3/
-    TimeformForecast/
-  greyhounds/
-    race_links/
     Result/
-    TimeformForecast/
+    signals/
     timeform_top3/
+    TimeformForecast/
+    betfair_top3/
+    sportinglife_top3/
+  greyhounds/
+    Result/
+    signals/
+    race_links/
+    timeform_top3/
+    TimeformForecast/
     processed/
-      race_links/
       Result/
-      TimeformForecast/
-      timeform_top3/
       signals/
+      race_links/
+      timeform_top3/
+      TimeformForecast/
 ```
 
-## Observacoes
-- O Selenium necessita de Chrome/Chromedriver compatíveis (webdriver-manager cuida disso).
-- Ajuste `settings.LOG_LEVEL` em `src/horses/config.py` ou `src/greyhounds/config.py` para controlar verbosidade.
-- Use `.env` para variáveis sensíveis (lidas via python-dotenv, se necessário).
-- Após raspagens/gerações antigas, execute `python scripts/convert_greyhound_history.py`
-  para sincronizar os Parquets em `data/greyhounds/processed/`.
+## Fluxo de trabalho recomendado
+
+### Cavalos (`horses`)
+- **Raspagem diária:** `python -m src.horses.run_daily`  
+  Executa em sequência os scrapers da Betfair, Sporting Life (atualização + backfill) e Timeform.
+- **Limpeza opcional:** `python scripts/clean_horse_results.py [--force]`  
+  Remove duplicados e corrige colunas de resultados.
+- **Geração de sinais:**  
+  `python scripts/generate_horse_signals.py --source both --market both --strategy both --provider timeform`
+- **Dashboard Streamlit:**  
+  `python scripts/run_horses_streamlit.py --port 8502 --address 0.0.0.0`
+
+### Galgos (`greyhounds`)
+- **Raspagem diária:** `python -m src.greyhounds.run_daily`  
+  Busca o índice da Betfair e atualizações Timeform.
+- **Limpeza opcional:** `python scripts/clean_greyhound_results.py [--force]`
+- **Geração de sinais:**  
+  `python scripts/generate_greyhound_signals.py --source both --market both --rule both --entry_type both`
+- **Dashboard Streamlit:**  
+  `python scripts/run_greyhounds_streamlit.py --port 8501 --address 0.0.0.0`
+
+### Pipeline completo
+- `python -m scripts.run_all_daily` executa `run_daily` de cavalos e galgos em sequência.
+
+## Dashboards Streamlit
+- `scripts/run_horses_streamlit.py`: filtros por pista, intervalo de datas, fonte (Timeform/Sporting Life) e estratégia; gráficos de ROI, drawdown e distribuição de odds.
+- `scripts/run_greyhounds_streamlit.py`: visão consolidada de sinais por regra, mercado e fonte; ranking de pistas/categorias, análise de desempenho e curvas acumuladas.
+- Parâmetros úteis:
+  - `--port`: porta HTTP (ex.: `--port 8502`).
+  - `--address`: endereço para bind (use `0.0.0.0` ao publicar na rede).
+
+## Scripts auxiliares
+- `python scripts/download_betfair_prices.py [opções]`  
+  Sincroniza históricos públicos Betfair SP para cavalos e galgos. Principais flags:
+  - `--dry-run` lista arquivos faltantes sem baixar.
+  - `--delay 2` ajusta a pausa entre downloads (default 1.5s).
+  - `--horses-start-date YYYY-MM-DD` / `--greyhounds-start-date YYYY-MM-DD` força a data inicial.
+  - `--max-downloads N` limita a quantidade por execução.
+- `python scripts/convert_greyhound_history.py --dataset <nome> [--force]`  
+  Converte CSV históricos de galgos para Parquet (datasets: `signals`, `timeform_top3`, `timeform_forecast`, `race_links`, `betfair_result`).
+- `python scripts/validate_data_layout.py`  
+  Validação leve dos nomes de arquivos e colunas esperadas em `data/`.
+- `python scripts/analyze_track_aliases.py`  
+  Normaliza e agrupa variações de nomes de pista usando os dados armazenados.
+
+## Configurações
+- Ajuste `settings.LOG_LEVEL` em `src/horses/config.py` ou `src/greyhounds/config.py` para controlar a verbosidade dos logs.
+- As mesmas configurações permitem ligar/desligar `SELENIUM_HEADLESS` e alterar timeouts ou diretórios base.
+- As rotinas utilizam `utf-8-sig` por padrão nas leituras/escritas CSV; mantenha o encoding ao criar arquivos externos.
+
+## Boas práticas
+- Execute os scrapers em horários espaçados para evitar bloqueios nas fontes externas.
+- Revise os diretórios `data/processed/` após processamentos antigos usando `convert_greyhound_history.py`.
+- Mantenha o Chrome atualizado para garantir compatibilidade do Selenium.
