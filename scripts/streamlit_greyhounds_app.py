@@ -200,8 +200,74 @@ def main() -> None:
     small_width = 360
     small_height = 180
 
+    def _render_weekday_perf(df_block: pd.DataFrame, entry_kind: str) -> None:
+        """Barra por dia da semana com linha zero."""
+        if df_block.empty or "race_time_iso" not in df_block.columns:
+            return
+        base_amount = float(st.session_state.get("base_amount", 1.0))
+        scale_factor = base_amount / 10.0
+        plot = df_block.copy()
+        plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
+        plot = plot.dropna(subset=["ts"]).sort_values("ts")
+        if plot.empty:
+            return
+        plot["date_only"] = plot["ts"].dt.date
+        daily = (
+            plot.groupby("date_only", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]]
+            .sum()
+            .sort_values("date_only")
+        )
+        daily["weekday"] = pd.to_datetime(daily["date_only"]).dt.weekday
+        wd_order = [0, 1, 2, 3, 4, 5, 6]
+        wd_names = {0: "Seg", 1: "Ter", 2: "Qua", 3: "Qui", 4: "Sex", 5: "Sab", 6: "Dom"}
+        wd_order_names = [wd_names[w] for w in wd_order]
+        by_wd = daily.groupby("weekday", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]].sum()
+        by_wd["weekday_name"] = by_wd["weekday"].map(wd_names)
+        by_wd["weekday_name"] = pd.Categorical(by_wd["weekday_name"], categories=wd_order_names, ordered=True)
+        by_wd["pnl_stake"] = by_wd["pnl_stake_fixed_10"] * scale_factor
+        if entry_kind == "lay":
+            by_wd["pnl_liab"] = by_wd["pnl_liability_fixed_10"] * scale_factor
+
+        zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+        bar_stake = (
+            alt.Chart(by_wd)
+            .mark_bar()
+            .encode(
+                x=alt.X("weekday_name:N", sort=wd_order_names, title=""),
+                y=alt.Y("pnl_stake:Q", title="PnL"),
+            )
+            .properties(width=small_width * 2, height=small_height)
+        )
+        stake_chart = alt.layer(zero_line, bar_stake)
+        with st.expander("Desempenho por dia da semana (PnL agregado)", expanded=False):
+            if entry_kind == "lay":
+                zero_line_liab = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+                bar_liab = (
+                    alt.Chart(by_wd)
+                    .mark_bar(color="#8888FF")
+                    .encode(
+                        x=alt.X("weekday_name:N", sort=wd_order_names, title=""),
+                        y=alt.Y("pnl_liab:Q", title="PnL"),
+                    )
+                    .properties(width=small_width * 2, height=small_height)
+                )
+                liab_chart = alt.layer(zero_line_liab, bar_liab)
+                st.altair_chart(
+                    alt.vconcat(
+                        stake_chart.properties(title="Stake"),
+                        liab_chart.properties(title="Liability"),
+                    ).resolve_scale(y="independent").configure_view(stroke="#888", strokeWidth=1),
+                    use_container_width=True,
+                )
+            else:
+                st.altair_chart(
+                    stake_chart.configure_view(stroke="#888", strokeWidth=1).properties(title="Stake"),
+                    use_container_width=True,
+                )
+
     # seletores de regra, fonte, mercado e tipo de entrada
-    col_rule, col_src, col_mkt, col_entry = st.columns([1.6, 1.2, 1, 1.2])
+    # Controles principais mais compactos; coluna extra para respiro
+    col_rule, col_src, col_mkt, col_entry, _ = st.columns([1, 1, 1, 1, 2])
 
     rule_label_pairs = [
         ("terceiro_queda50", RULE_LABELS["terceiro_queda50"]),
@@ -561,25 +627,63 @@ def main() -> None:
 
     filt = df_filtered.copy()
 
-    vol_col, _ = st.columns([1, 2])
+    # Linha: Volume total negociado (solo)
+    vol_col, _ = st.columns([2, 1])
     volume_key = "min_total_volume"
     if volume_key not in st.session_state:
         st.session_state[volume_key] = 2000.0
     with vol_col:
-        st.number_input(
-            "Volume total negociado mínimo",
-            min_value=0.0,
-            max_value=1_000_000.0,
-            value=float(st.session_state[volume_key]),
-            step=100.0,
-            format="%.0f",
-            key=volume_key,
-            help="Considera apenas corridas cuja soma de pptradedvol atinge o mínimo desejado.",
-        )
-        st.caption("Volume min. por corrida (soma de pptradedvol)")
+        vcol, _ = st.columns([3, 7])
+        with vcol:
+            st.number_input(
+                "Volume total negociado mínimo",
+                min_value=0.0,
+                max_value=1_000_000.0,
+                value=float(st.session_state[volume_key]),
+                step=100.0,
+                format="%.0f",
+                key=volume_key,
+                help="Considera apenas corridas cuja soma de pptradedvol atinge o mínimo desejado.",
+            )
+            st.caption("Volume min. por corrida (soma de pptradedvol)")
     min_total_volume = float(st.session_state.get(volume_key, 2000.0))
     volume_series = pd.to_numeric(filt.get("total_matched_volume", pd.Series(dtype=float)), errors="coerce")
     filt = filt[volume_series.fillna(0.0) >= min_total_volume]
+    # Linha separada: Numero de corredores (mantém tamanho da caixa)
+    st.caption("Numero de corredores")
+    nr_vals = sorted([int(v) for v in pd.to_numeric(filt.get("num_runners", pd.Series(dtype=float)), errors="coerce").dropna().unique().tolist()])
+    if nr_vals:
+        btn_all, btn_clear, _ = st.columns([1, 1, 6])
+        with btn_all:
+            st.button(
+                "Todos",
+                key="nr_all",
+                on_click=lambda: st.session_state.update({"num_runners_ms": nr_vals}),
+            )
+        with btn_clear:
+            st.button(
+                "Limpar",
+                key="nr_none",
+                on_click=lambda: st.session_state.update({"num_runners_ms": []}),
+            )
+        # Caixa mais curta abaixo dos botoes (agora menor)
+        col_ms, _ = st.columns([2, 8])
+        with col_ms:
+            prev_nr = st.session_state.get("sel_num_runners", nr_vals.copy())
+            default_nr = [v for v in prev_nr if v in nr_vals]
+            sel_nr = st.multiselect(
+                "Numero de corredores",
+                nr_vals,
+                default=default_nr if default_nr else nr_vals,
+                key="num_runners_ms",
+                label_visibility="collapsed",
+            )
+        sel_nr = [int(v) for v in sel_nr if v in nr_vals]
+        st.session_state["sel_num_runners"] = sel_nr
+        if sel_nr:
+            filt = filt[filt["num_runners"].isin(sel_nr)]
+        else:
+            filt = filt.iloc[0:0]
 
     # Filtro adicional: participacao do lider (somente para regra lider_volume_total)
     if rule == "lider_volume_total":
@@ -622,59 +726,25 @@ def main() -> None:
         current_bsp_col = "lay_target_bsp" if entry_type == "lay" else "back_target_bsp"
         filt = filt[(filt[current_bsp_col] >= bsp_low) & (filt[current_bsp_col] <= bsp_high)]
 
-    # Filtro por numero de corredores (dinamico conforme subconjunto atual)
-    st.caption("Numero de corredores")
-    nr_vals = sorted([int(v) for v in pd.to_numeric(filt.get("num_runners", pd.Series(dtype=float)), errors="coerce").dropna().unique().tolist()])
-    if nr_vals:
-        nrw, _ = st.columns([2, 5])
-        with nrw:
-            nb1, nb2 = st.columns([1, 1])
-            with nb1:
-                st.button(
-                    "Todos",
-                    key="nr_all",
-                    on_click=lambda: st.session_state.update({"num_runners_ms": nr_vals}),
-                )
-            with nb2:
-                st.button(
-                    "Limpar",
-                    key="nr_none",
-                    on_click=lambda: st.session_state.update({"num_runners_ms": []}),
-                )
-            prev_nr = st.session_state.get("sel_num_runners", nr_vals.copy())
-            default_nr = [v for v in prev_nr if v in nr_vals]
-            sel_nr = st.multiselect(
-                "Numero de corredores",
-                nr_vals,
-                default=default_nr if default_nr else nr_vals,
-                key="num_runners_ms",
-                label_visibility="collapsed",
-            )
-        sel_nr = [int(v) for v in sel_nr if v in nr_vals]
-        st.session_state["sel_num_runners"] = sel_nr
-        if sel_nr:
-            filt = filt[filt["num_runners"].isin(sel_nr)]
-        else:
-            filt = filt.iloc[0:0]
-
-    # Filtro por categoria
+    # Categorias (linha dedicada)
+    st.caption("Categorias")
     if cat_letters:
-        st.caption("Categorias")
-        cw, _ = st.columns([2, 5])
-        with cw:
-            cb1, cb2 = st.columns([1, 1])
-            with cb1:
-                st.button(
-                    "Todos",
-                    key="cats_all",
-                    on_click=lambda: st.session_state.update({"cats_ms": cat_letters}),
-                )
-            with cb2:
-                st.button(
-                    "Limpar",
-                    key="cats_none",
-                    on_click=lambda: st.session_state.update({"cats_ms": []}),
-                )
+        btn_all, btn_clear, _ = st.columns([1, 1, 6])
+        with btn_all:
+            st.button(
+                "Todos",
+                key="cats_all",
+                on_click=lambda: st.session_state.update({"cats_ms": cat_letters}),
+            )
+        with btn_clear:
+            st.button(
+                "Limpar",
+                key="cats_none",
+                on_click=lambda: st.session_state.update({"cats_ms": []}),
+            )
+        # Caixa mais curta abaixo dos botoes
+        col_ms, _ = st.columns([3, 7])
+        with col_ms:
             prev = st.session_state.get("sel_cats", cat_letters.copy())
             default_cats = [c for c in prev if c in cat_letters]
             sel_cats = st.multiselect(
@@ -692,7 +762,7 @@ def main() -> None:
             # sem selecao => nenhum resultado
             filt = filt.iloc[0:0]
 
-    # Filtro por subcategoria (tokens completos A1, A2, D1, OR3, ...)
+    # Filtro por subcategoria (tokens completos A1, A2, D1, OR3, ...) – continua logo apos categorias
     sub_tokens = []
     if "category_token" in filt.columns:
         raw_tokens = [t for t in filt["category_token"].dropna().astype(str).unique().tolist() if isinstance(t, str) and t]
@@ -747,7 +817,7 @@ def main() -> None:
 
     def render_block(title_suffix: str, df_block: pd.DataFrame, entry_kind: str) -> None:
         # ROI e Assertividade, reescalando a partir dos calculos base (10)
-        base_amount = float(st.session_state.get("base_amount", 10.0))
+        base_amount = float(st.session_state.get("base_amount", 1.0))
         scale_factor = base_amount / 10.0
         if entry_kind == "lay":
             total_base_stake10 = float(df_block["liability_from_stake_fixed_10"].sum()) if not df_block.empty else 0.0
@@ -786,7 +856,7 @@ def main() -> None:
             st.metric("Assertividade", f"{acc_stake10:.2%}")
 
         # Campo valor base (reutiliza ja existente)
-        base_amount = float(st.session_state.get("base_amount", 10.0))
+        base_amount = float(st.session_state.get("base_amount", 1.0))
         scale_factor = base_amount / 10.0
         total_base_stake = total_base_stake10 * scale_factor
         total_pnl_stake = total_pnl_stake10 * scale_factor
@@ -829,6 +899,15 @@ def main() -> None:
             total_stake_liab = total_stake_liab10 * scale_factor
             total_pnl_liab = total_pnl_liab10 * scale_factor
             roi_liab = (total_pnl_liab / (base_amount * len(df_block))) if not df_block.empty and base_amount > 0 else 0.0
+            # Min PnL e drawdown para Liability (mesma escala do base_amount)
+            if df_block.empty:
+                min_pnl_liab = 0.0
+                drawdown_liab = 0.0
+            else:
+                ordered_liab = df_block.sort_values("race_time_iso")
+                cumulative_liab = (ordered_liab["pnl_liability_fixed_10"] * scale_factor).cumsum()
+                min_pnl_liab = float(cumulative_liab.min())
+                drawdown_liab = _calc_drawdown(cumulative_liab)
             st.subheader(f"Liability (valor fixo {base_amount:.2f})")
             st.markdown(
                 """
@@ -840,13 +919,17 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
             st.markdown('<div id="liab-row">', unsafe_allow_html=True)
-            r1, r2, r3 = st.columns(3)
+            r1, r2, r3, r4, r5 = st.columns(5)
             with r1:
                 st.metric(" Stake (Liability)", f"{total_stake_liab:.2f}")
             with r2:
                 st.metric("PnL Liability", f"{total_pnl_liab:.2f}")
             with r3:
                 st.metric("ROI Liability", f"{roi_liab:.2%}")
+            with r4:
+                st.metric("Menor PnL (Liability)", f"{min_pnl_liab:.2f}")
+            with r5:
+                st.metric("Drawdown max (Liability)", f"{drawdown_liab:.2f}")
             st.markdown('</div>', unsafe_allow_html=True)
 
         # Graficos de evolucao
@@ -913,6 +996,9 @@ def main() -> None:
                         )
                         st.altair_chart(alt.layer(zero_line2, ch2).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
 
+        # Desempenho por dia da semana (antes da tabela)
+        _render_weekday_perf(df_block, entry_kind)
+
         # Tabela
         show_cols = [
             "date", "track_name", "category_token", "race_time_iso",
@@ -940,13 +1026,15 @@ def main() -> None:
         missing = [c for c in show_cols if c not in df_block.columns]
         for c in missing:
             df_block[c] = ""
-        st.dataframe(df_block[show_cols], use_container_width=True)
+        table_label = f"Tabela {title_suffix}"
+        with st.expander(table_label, expanded=False):
+            st.dataframe(df_block[show_cols], use_container_width=True)
 
     # Enriquecimento feito antes; agora renderizacao por bloco
     if entry_type == "both":
         # Campo de valor base acima dos blocos BACK/LAY quando ambos estao selecionados
         if "base_amount" not in st.session_state:
-            st.session_state["base_amount"] = 10.00
+            st.session_state["base_amount"] = 1.00
         cba_top, _ = st.columns([1, 6])
         with cba_top:
             st.number_input(
@@ -958,45 +1046,48 @@ def main() -> None:
                 format="%.2f",
                 key="base_amount",
                 label_visibility="collapsed",
+                help="Padrão: 1 (1 unidade da banca). Ajuste para reescalar PnL/ROI/drawdown.",
             )
-            st.caption("Stake/Liab base")
+            st.caption("Stake/Liab base (padrão: 1 unidade da banca)")
         render_block("Resultados BACK", filt[filt["entry_type"] == "back"], "back")
         render_block("Resultados LAY", filt[filt["entry_type"] == "lay"], "lay")
     else:
         # Evita duplicacao quando selecionado apenas um tipo: usar apenas os paineis agregados abaixo
         pass
 
-    # Linha 1: Pistas, Sinais, Greens, Reds, Media BSP, Assertividade
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    with c1:
-        st.metric("Pistas", filt["track_name"].nunique())
-    with c2:
-        st.metric("Sinais", len(filt))
-    # Contagem de greens/reds
-    num_greens = int((filt["is_green"] == True).sum()) if not filt.empty else 0
-    num_reds = int(len(filt) - num_greens) if not filt.empty else 0
-    with c3:
-        st.metric("Greens", num_greens)
-    with c4:
-        st.metric("Reds", num_reds)
-    with c5:
-        if entry_type == "lay":
-            avg_bsp = float(filt["lay_target_bsp"].mean()) if not filt.empty else 0.0
-        elif entry_type == "back":
-            avg_bsp = float(filt["back_target_bsp"].mean()) if not filt.empty else 0.0
-        else:
-            lay_series = pd.to_numeric(filt.get("lay_target_bsp", pd.Series(dtype=float)), errors="coerce")
-            back_series = pd.to_numeric(filt.get("back_target_bsp", pd.Series(dtype=float)), errors="coerce")
-            avg_bsp = float(pd.concat([lay_series, back_series]).mean()) if not filt.empty else 0.0
-        st.metric("Media BSP Alvo", f"{avg_bsp:.2f}")
-    with c6:
-        acc_val = (num_greens / len(filt)) if len(filt) > 0 else 0.0
-        st.metric("Assertividade", f"{acc_val:.2%}")
-
-    # Campo compacto antes do cabecalho de Stake para definir o valor base (somente quando nao for "ambos")
+    # Quando apenas um tipo e selecionado, exibimos o agregado desse tipo.
+    # Quando "both", os blocos BACK e LAY ja foram exibidos acima; evitamos repetir dados agregados.
     if entry_type != "both":
+        # Linha 1: Pistas, Sinais, Greens, Reds, Media BSP, Assertividade
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        with c1:
+            st.metric("Pistas", filt["track_name"].nunique())
+        with c2:
+            st.metric("Sinais", len(filt))
+        # Contagem de greens/reds
+        num_greens = int((filt["is_green"] == True).sum()) if not filt.empty else 0
+        num_reds = int(len(filt) - num_greens) if not filt.empty else 0
+        with c3:
+            st.metric("Greens", num_greens)
+        with c4:
+            st.metric("Reds", num_reds)
+        with c5:
+            if entry_type == "lay":
+                avg_bsp = float(filt["lay_target_bsp"].mean()) if not filt.empty else 0.0
+            elif entry_type == "back":
+                avg_bsp = float(filt["back_target_bsp"].mean()) if not filt.empty else 0.0
+            else:
+                lay_series = pd.to_numeric(filt.get("lay_target_bsp", pd.Series(dtype=float)), errors="coerce")
+                back_series = pd.to_numeric(filt.get("back_target_bsp", pd.Series(dtype=float)), errors="coerce")
+                avg_bsp = float(pd.concat([lay_series, back_series]).mean()) if not filt.empty else 0.0
+            st.metric("Media BSP Alvo", f"{avg_bsp:.2f}")
+        with c6:
+            acc_val = (num_greens / len(filt)) if len(filt) > 0 else 0.0
+            st.metric("Assertividade", f"{acc_val:.2%}")
+
+        # Campo compacto antes do cabecalho de Stake para definir o valor base
         if "base_amount" not in st.session_state:
-            st.session_state["base_amount"] = 10.00
+            st.session_state["base_amount"] = 1.00
         cba1, _ = st.columns([1, 6])
         with cba1:
             st.number_input(
@@ -1008,209 +1099,180 @@ def main() -> None:
                 format="%.2f",
                 key="base_amount",
                 label_visibility="collapsed",
+                help="Padrão: 1 (1 unidade da banca). Ajuste para reescalar PnL/ROI/drawdown.",
             )
-            st.caption("Stake/Liab base")
+            st.caption("Stake/Liab base (padrão: 1 unidade da banca)")
 
-    # Recalcula fatores apos possivel alteracao do input
-    base_amount = float(st.session_state.get("base_amount", 10.0))
-    scale_factor = base_amount / 10.0
-    # Base (Stake) depende do tipo de entrada
-    if entry_type == "lay":
-        total_base_stake10 = float(filt["liability_from_stake_fixed_10"].sum()) if not filt.empty else 0.0
-    elif entry_type == "back":
-        total_base_stake10 = 10.0 * len(filt)
-    else:
-        # ambos: soma base de LAY (liability_from_stake_fixed_10) + base de BACK (10 por aposta)
-        lay_part = float(filt.loc[filt["entry_type"] == "lay", "liability_from_stake_fixed_10"].sum())
-        back_part = 10.0 * int((filt["entry_type"] == "back").sum())
-        total_base_stake10 = lay_part + back_part
-    total_pnl_stake10 = float(filt["pnl_stake_fixed_10"].sum()) if not filt.empty else 0.0
-    total_base_stake = total_base_stake10 * scale_factor
-    total_pnl_stake = total_pnl_stake10 * scale_factor
-    roi_stake = (total_pnl_stake / total_base_stake) if total_base_stake > 0 else 0.0
-    if filt.empty:
-        drawdown_stake = 0.0
-    else:
-        ordered = filt.sort_values("race_time_iso")
-        cumulative = (ordered["pnl_stake_fixed_10"] * scale_factor).cumsum()
-        drawdown_stake = _calc_drawdown(cumulative)
+        # Recalcula fatores apos possivel alteracao do input
+        base_amount = float(st.session_state.get("base_amount", 1.0))
+        scale_factor = base_amount / 10.0
+        # Base (Stake) depende do tipo de entrada
+        if entry_type == "lay":
+            total_base_stake10 = float(filt["liability_from_stake_fixed_10"].sum()) if not filt.empty else 0.0
+        elif entry_type == "back":
+            total_base_stake10 = 10.0 * len(filt)
+        else:
+            # ambos: soma base de LAY (liability_from_stake_fixed_10) + base de BACK (10 por aposta)
+            lay_part = float(filt.loc[filt["entry_type"] == "lay", "liability_from_stake_fixed_10"].sum())
+            back_part = 10.0 * int((filt["entry_type"] == "back").sum())
+            total_base_stake10 = lay_part + back_part
+        total_pnl_stake10 = float(filt["pnl_stake_fixed_10"].sum()) if not filt.empty else 0.0
+        total_base_stake = total_base_stake10 * scale_factor
+        total_pnl_stake = total_pnl_stake10 * scale_factor
+        roi_stake = (total_pnl_stake / total_base_stake) if total_base_stake > 0 else 0.0
+        if filt.empty:
+            drawdown_stake = 0.0
+        else:
+            ordered = filt.sort_values("race_time_iso")
+            cumulative = (ordered["pnl_stake_fixed_10"] * scale_factor).cumsum()
+            drawdown_stake = _calc_drawdown(cumulative)
 
-    # Linha 2: Stake(10)
-    st.subheader(f"Stake (valor fixo {base_amount:.2f})")
-    st.markdown(
-        """
-        <style>
-        #stake-row [data-testid="stHorizontalBlock"] { gap: 0.25rem !important; }
-        #stake-row [data-testid="column"] { padding-left: 0.25rem !important; padding-right: 0.25rem !important; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown('<div id="stake-row">', unsafe_allow_html=True)
-    s1, s2, s3, s4, s5 = st.columns(5)
-    with s1:
-        st.metric(" Base (Stake)", f"{total_base_stake:.2f}")
-    with s2:
-        st.metric("PnL Stake", f"{total_pnl_stake:.2f}")
-    with s3:
-        st.metric("ROI Stake", f"{roi_stake:.2%}")
-    min_pnl_global = 0.0
-    if not filt.empty:
-        ordered_global = filt.sort_values("race_time_iso")
-        cumulative_global = (ordered_global["pnl_stake_fixed_10"] * scale_factor).cumsum()
-        min_pnl_global = float(cumulative_global.min())
-    with s4:
-        st.metric("Menor PnL acumulado", f"{min_pnl_global:.2f}")
-    with s5:
-        st.metric("Drawdown máximo (Stake)", f"{drawdown_stake:.2f}")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # Linha 3: Liability(10)  apenas para LAY
-    if entry_type == "lay":
-        total_stake_liab10 = float(filt["stake_for_liability_10"].sum()) if not filt.empty else 0.0
-        total_pnl_liab10 = float(filt["pnl_liability_fixed_10"].sum()) if not filt.empty else 0.0
-        total_stake_liab = total_stake_liab10 * scale_factor
-        total_pnl_liab = total_pnl_liab10 * scale_factor
-        roi_liab = (total_pnl_liab / (base_amount * len(filt))) if not filt.empty and base_amount > 0 else 0.0
-        st.subheader(f"Liability (valor fixo {base_amount:.2f})")
+        # Linha 2: Stake(10)
+        st.subheader(f"Stake (valor fixo {base_amount:.2f})")
         st.markdown(
             """
             <style>
-            #liab-row [data-testid=\"stHorizontalBlock\"] { gap: 0.15rem !important; }
-            #liab-row [data-testid=\"column\"] { padding-left: 0.15rem !important; padding-right: 0.15rem !important; }
+            #stake-row [data-testid="stHorizontalBlock"] { gap: 0.25rem !important; }
+            #stake-row [data-testid="column"] { padding-left: 0.25rem !important; padding-right: 0.25rem !important; }
             </style>
             """,
             unsafe_allow_html=True,
         )
-        st.markdown('<div id="liab-row">', unsafe_allow_html=True)
-        r1, r2, r3 = st.columns(3)
-        with r1:
-            st.metric(" Stake (Liability)", f"{total_stake_liab:.2f}")
-        with r2:
-            st.metric("PnL Liability", f"{total_pnl_liab:.2f}")
-        with r3:
-            st.metric("ROI Liability", f"{roi_liab:.2%}")
+        st.markdown('<div id="stake-row">', unsafe_allow_html=True)
+        s1, s2, s3, s4, s5 = st.columns(5)
+        with s1:
+            st.metric(" Base (Stake)", f"{total_base_stake:.2f}")
+        with s2:
+            st.metric("PnL Stake", f"{total_pnl_stake:.2f}")
+        with s3:
+            st.metric("ROI Stake", f"{roi_stake:.2%}")
+        min_pnl_global = 0.0
+        if not filt.empty:
+            ordered_global = filt.sort_values("race_time_iso")
+            cumulative_global = (ordered_global["pnl_stake_fixed_10"] * scale_factor).cumsum()
+            min_pnl_global = float(cumulative_global.min())
+        with s4:
+            st.metric("Menor PnL acumulado", f"{min_pnl_global:.2f}")
+        with s5:
+            st.metric("Drawdown máximo (Stake)", f"{drawdown_stake:.2f}")
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # Graficos de evolucao (por dia ou por bet) com opcao de minimizar
-    plot = filt.copy()
-    if not plot.empty:
-        plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
-        plot = plot.dropna(subset=["ts"]).sort_values("ts")
-        # Sempre calcula agregacao diaria para uso em graficos semanais, mesmo quando o eixo X e "Bet"
-        plot["date_only"] = plot["ts"].dt.date
-        daily = plot.groupby("date_only", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]].sum().sort_values("date_only")
-        daily["cum_stake"] = (daily["pnl_stake_fixed_10"] * scale_factor).cumsum()
-        daily["cum_liab"] = (daily["pnl_liability_fixed_10"] * scale_factor).cumsum()
+        # Linha 3: Liability(10)  apenas para LAY
+        if entry_type == "lay":
+            total_stake_liab10 = float(filt["stake_for_liability_10"].sum()) if not filt.empty else 0.0
+            total_pnl_liab10 = float(filt["pnl_liability_fixed_10"].sum()) if not filt.empty else 0.0
+            total_stake_liab = total_stake_liab10 * scale_factor
+            total_pnl_liab = total_pnl_liab10 * scale_factor
+            roi_liab = (total_pnl_liab / (base_amount * len(filt))) if not filt.empty and base_amount > 0 else 0.0
+            # Min PnL e drawdown para Liability (mesma escala do base_amount)
+            if filt.empty:
+                min_pnl_liab = 0.0
+                drawdown_liab = 0.0
+            else:
+                ordered_liab = filt.sort_values("race_time_iso")
+                cumulative_liab = (ordered_liab["pnl_liability_fixed_10"] * scale_factor).cumsum()
+                min_pnl_liab = float(cumulative_liab.min())
+                drawdown_liab = _calc_drawdown(cumulative_liab)
+            st.subheader(f"Liability (valor fixo {base_amount:.2f})")
+            st.markdown(
+                """
+                <style>
+                #liab-row [data-testid=\"stHorizontalBlock\"] { gap: 0.15rem !important; }
+                #liab-row [data-testid=\"column\"] { padding-left: 0.15rem !important; padding-right: 0.15rem !important; }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.markdown('<div id="liab-row">', unsafe_allow_html=True)
+            r1, r2, r3, r4, r5 = st.columns(5)
+            with r1:
+                st.metric(" Stake (Liability)", f"{total_stake_liab:.2f}")
+            with r2:
+                st.metric("PnL Liability", f"{total_pnl_liab:.2f}")
+            with r3:
+                st.metric("ROI Liability", f"{roi_liab:.2%}")
+            with r4:
+                st.metric("Menor PnL (Liability)", f"{min_pnl_liab:.2f}")
+            with r5:
+                st.metric("Drawdown max (Liability)", f"{drawdown_liab:.2f}")
+            st.markdown('</div>', unsafe_allow_html=True)
 
-        if x_axis_mode == "Dia":
+        # Graficos de evolucao (por dia ou por bet) com opcao de minimizar
+        plot = filt.copy()
+        if not plot.empty:
+            plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
+            plot = plot.dropna(subset=["ts"]).sort_values("ts")
+            # Sempre calcula agregacao diaria para uso em graficos semanais, mesmo quando o eixo X e "Bet"
             plot["date_only"] = plot["ts"].dt.date
             daily = plot.groupby("date_only", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]].sum().sort_values("date_only")
             daily["cum_stake"] = (daily["pnl_stake_fixed_10"] * scale_factor).cumsum()
             daily["cum_liab"] = (daily["pnl_liability_fixed_10"] * scale_factor).cumsum()
 
-            with st.expander("Evolucao Stake (PnL acumulado por dia)", expanded=False):
-                zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
-                ch = (
-                    alt.Chart(daily)
-                    .mark_line()
-                    .encode(
-                        x=alt.X("date_only:T", title="", axis=alt.Axis(format="%Y-%m-%d")),
-                        y=alt.Y("cum_stake:Q", title="PnL"),
-                    )
-                )
-                st.altair_chart(alt.layer(zero_line, ch).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
+            if x_axis_mode == "Dia":
+                plot["date_only"] = plot["ts"].dt.date
+                daily = plot.groupby("date_only", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]].sum().sort_values("date_only")
+                daily["cum_stake"] = (daily["pnl_stake_fixed_10"] * scale_factor).cumsum()
+                daily["cum_liab"] = (daily["pnl_liability_fixed_10"] * scale_factor).cumsum()
 
-            if entry_type == "lay":
-                with st.expander("Evolucao Liability (PnL acumulado por dia)", expanded=False):
-                    zero_line2 = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
-                    ch2 = (
+                with st.expander("Evolucao Stake (PnL acumulado por dia)", expanded=False):
+                    zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+                    ch = (
                         alt.Chart(daily)
                         .mark_line()
                         .encode(
                             x=alt.X("date_only:T", title="", axis=alt.Axis(format="%Y-%m-%d")),
-                            y=alt.Y("cum_liab:Q", title="PnL"),
+                            y=alt.Y("cum_stake:Q", title="PnL"),
                         )
                     )
-                    st.altair_chart(alt.layer(zero_line2, ch2).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
-        else:
-            # Evolucao por sequencia de apostas (ordem temporal)
-            plot["bet_idx"] = range(1, len(plot) + 1)
-            plot["cum_stake"] = (plot["pnl_stake_fixed_10"] * scale_factor).cumsum()
-            plot["cum_liab"] = (plot["pnl_liability_fixed_10"] * scale_factor).cumsum()
+                    st.altair_chart(alt.layer(zero_line, ch).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
 
-            with st.expander("Evolucao Stake (PnL acumulado por bet)", expanded=False):
-                zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
-                ch = (
-                    alt.Chart(plot)
-                    .mark_line()
-                    .encode(
-                        x=alt.X("bet_idx:Q", title="Bet #"),
-                        y=alt.Y("cum_stake:Q", title="PnL"),
-                    )
-                )
-                st.altair_chart(alt.layer(zero_line, ch).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
+                if entry_type == "lay":
+                    with st.expander("Evolucao Liability (PnL acumulado por dia)", expanded=False):
+                        zero_line2 = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+                        ch2 = (
+                            alt.Chart(daily)
+                            .mark_line()
+                            .encode(
+                                x=alt.X("date_only:T", title="", axis=alt.Axis(format="%Y-%m-%d")),
+                                y=alt.Y("cum_liab:Q", title="PnL"),
+                            )
+                        )
+                        st.altair_chart(alt.layer(zero_line2, ch2).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
+            else:
+                # Evolucao por sequencia de apostas (ordem temporal)
+                plot["bet_idx"] = range(1, len(plot) + 1)
+                plot["cum_stake"] = (plot["pnl_stake_fixed_10"] * scale_factor).cumsum()
+                plot["cum_liab"] = (plot["pnl_liability_fixed_10"] * scale_factor).cumsum()
 
-            if entry_type == "lay":
-                with st.expander("Evolucao Liability (PnL acumulado por bet)", expanded=False):
-                    zero_line2 = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
-                    ch2 = (
+                with st.expander("Evolucao Stake (PnL acumulado por bet)", expanded=False):
+                    zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+                    ch = (
                         alt.Chart(plot)
                         .mark_line()
                         .encode(
                             x=alt.X("bet_idx:Q", title="Bet #"),
-                            y=alt.Y("cum_liab:Q", title="PnL"),
+                            y=alt.Y("cum_stake:Q", title="PnL"),
                         )
                     )
-                    st.altair_chart(alt.layer(zero_line2, ch2).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
+                    st.altair_chart(alt.layer(zero_line, ch).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
 
-        # Desempenho agregado por dia da semana
-        daily["weekday"] = pd.to_datetime(daily["date_only"]).dt.weekday
-        wd_order = [0, 1, 2, 3, 4, 5, 6]
-        wd_names = {0: "Seg", 1: "Ter", 2: "Qua", 3: "Qui", 4: "Sex", 5: "Sab", 6: "Dom"}
-        wd_order_names = [wd_names[w] for w in wd_order]
-        by_wd = daily.groupby("weekday", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]].sum()
-        by_wd["weekday_name"] = by_wd["weekday"].map(wd_names)
-        by_wd["weekday_name"] = pd.Categorical(by_wd["weekday_name"], categories=wd_order_names, ordered=True)
-        by_wd["pnl_stake"] = by_wd["pnl_stake_fixed_10"] * scale_factor
-        if entry_type == "lay":
-            by_wd["pnl_liab"] = by_wd["pnl_liability_fixed_10"] * scale_factor
+                if entry_type == "lay":
+                    with st.expander("Evolucao Liability (PnL acumulado por bet)", expanded=False):
+                        zero_line2 = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+                        ch2 = (
+                            alt.Chart(plot)
+                            .mark_line()
+                            .encode(
+                                x=alt.X("bet_idx:Q", title="Bet #"),
+                                y=alt.Y("cum_liab:Q", title="PnL"),
+                            )
+                        )
+                        st.altair_chart(alt.layer(zero_line2, ch2).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
 
-        with st.expander("Desempenho por dia da semana (PnL agregado)", expanded=False):
-            bar_stake = (
-                alt.Chart(by_wd)
-                .mark_bar()
-                .encode(
-                    x=alt.X("weekday_name:N", sort=wd_order_names, title=""),
-                    y=alt.Y("pnl_stake:Q", title="PnL"),
-                )
-                .properties(width=small_width * 2, height=small_height)
-            )
-            if entry_type == "lay":
-                bar_liab = (
-                    alt.Chart(by_wd)
-                    .mark_bar(color="#8888FF")
-                    .encode(
-                        x=alt.X("weekday_name:N", sort=wd_order_names, title=""),
-                        y=alt.Y("pnl_liab:Q", title="PnL"),
-                    )
-                    .properties(width=small_width * 2, height=small_height)
-                )
-                st.altair_chart(
-                    alt.vconcat(
-                        bar_stake.properties(title="Stake"),
-                        bar_liab.properties(title="Liability"),
-                    ).resolve_scale(y="independent").configure_view(stroke="#888", strokeWidth=1),
-                    use_container_width=True,
-                )
-            else:
-                st.altair_chart(
-                    bar_stake.configure_view(stroke="#888", strokeWidth=1).properties(title="Stake"),
-                    use_container_width=True,
-                )
+        # Desempenho por dia da semana (antes da tabela)
+        _render_weekday_perf(filt, entry_type)
 
-    # Tabela (evita duplicacao quando entry_type == "both", pois ja exibimos 2 tabelas acima)
-    if entry_type != "both":
+        # Tabela (agregada para o tipo selecionado)
         show_cols = [
             "date", "track_name", "category_token", "race_time_iso",
             "num_runners", "total_matched_volume",
@@ -1259,7 +1321,9 @@ def main() -> None:
         missing = [c for c in show_cols if c not in filt.columns]
         for c in missing:
             filt[c] = ""
-        st.dataframe(filt[show_cols], use_container_width=True)
+        table_label = f"Tabela de resultados ({entry_type.upper()})"
+        with st.expander(table_label, expanded=False):
+            st.dataframe(filt[show_cols], use_container_width=True)
 
     # Graficos pequenos: evolucao por pista e por categoria (um bloco por tipo de entrada)
     def _render_small_charts(df_block: pd.DataFrame, entry_kind: str) -> None:
@@ -1269,7 +1333,7 @@ def main() -> None:
         plot2["ts"] = pd.to_datetime(plot2["race_time_iso"], errors="coerce")
         plot2 = plot2.dropna(subset=["ts"]).sort_values("ts")
         plot2["date_only"] = plot2["ts"].dt.date
-        local_scale = float(st.session_state.get("base_amount", 10.0)) / 10.0
+        local_scale = float(st.session_state.get("base_amount", 1.0)) / 10.0
 
         # Por pista
         if x_axis_mode == "Dia":
@@ -1544,11 +1608,73 @@ def main() -> None:
                     )
                     st.altair_chart(chart_nr.configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
 
-    if entry_type == "both":
-        _render_small_charts(filt[filt["entry_type"] == "back"], "back")
-        _render_small_charts(filt[filt["entry_type"] == "lay"], "lay")
-    else:
-        _render_small_charts(filt[filt["entry_type"] == entry_type], entry_type)
+    def _render_weekday_perf(df_block: pd.DataFrame, entry_kind: str) -> None:
+        """Barra por dia da semana com linha zero."""
+        if df_block.empty or "race_time_iso" not in df_block.columns:
+            return
+        base_amount = float(st.session_state.get("base_amount", 1.0))
+        base_amount = float(st.session_state.get("base_amount", 1.0))
+        base_amount = float(st.session_state.get("base_amount", 1.0))
+        base_amount = float(st.session_state.get("base_amount", 1.0))
+        scale_factor = base_amount / 10.0
+        plot = df_block.copy()
+        plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
+        plot = plot.dropna(subset=["ts"]).sort_values("ts")
+        if plot.empty:
+            return
+        plot["date_only"] = plot["ts"].dt.date
+        daily = (
+            plot.groupby("date_only", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]]
+            .sum()
+            .sort_values("date_only")
+        )
+        daily["weekday"] = pd.to_datetime(daily["date_only"]).dt.weekday
+        wd_order = [0, 1, 2, 3, 4, 5, 6]
+        wd_names = {0: "Seg", 1: "Ter", 2: "Qua", 3: "Qui", 4: "Sex", 5: "Sab", 6: "Dom"}
+        wd_order_names = [wd_names[w] for w in wd_order]
+        by_wd = daily.groupby("weekday", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]].sum()
+        by_wd["weekday_name"] = by_wd["weekday"].map(wd_names)
+        by_wd["weekday_name"] = pd.Categorical(by_wd["weekday_name"], categories=wd_order_names, ordered=True)
+        by_wd["pnl_stake"] = by_wd["pnl_stake_fixed_10"] * scale_factor
+        if entry_kind == "lay":
+            by_wd["pnl_liab"] = by_wd["pnl_liability_fixed_10"] * scale_factor
+
+        zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+        bar_stake = (
+            alt.Chart(by_wd)
+            .mark_bar()
+            .encode(
+                x=alt.X("weekday_name:N", sort=wd_order_names, title=""),
+                y=alt.Y("pnl_stake:Q", title="PnL"),
+            )
+            .properties(width=small_width * 2, height=small_height)
+        )
+        stake_chart = alt.layer(zero_line, bar_stake)
+        with st.expander("Desempenho por dia da semana (PnL agregado)", expanded=False):
+            if entry_kind == "lay":
+                zero_line_liab = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+                bar_liab = (
+                    alt.Chart(by_wd)
+                    .mark_bar(color="#8888FF")
+                    .encode(
+                        x=alt.X("weekday_name:N", sort=wd_order_names, title=""),
+                        y=alt.Y("pnl_liab:Q", title="PnL"),
+                    )
+                    .properties(width=small_width * 2, height=small_height)
+                )
+                liab_chart = alt.layer(zero_line_liab, bar_liab)
+                st.altair_chart(
+                    alt.vconcat(
+                        stake_chart.properties(title="Stake"),
+                        liab_chart.properties(title="Liability"),
+                    ).resolve_scale(y="independent").configure_view(stroke="#888", strokeWidth=1),
+                    use_container_width=True,
+                )
+            else:
+                st.altair_chart(
+                    stake_chart.configure_view(stroke="#888", strokeWidth=1).properties(title="Stake"),
+                    use_container_width=True,
+                )
 
     # --- Graficos cruzados: Categoria  Numero de corredores (Evolucao) ---
     def _render_cross_nr_category(df_block: pd.DataFrame, entry_kind: str) -> None:
@@ -1558,7 +1684,7 @@ def main() -> None:
         plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
         plot = plot.dropna(subset=["ts"]).sort_values("ts")
         plot["date_only"] = plot["ts"].dt.date
-        local_scale = float(st.session_state.get("base_amount", 10.0)) / 10.0
+        local_scale = float(st.session_state.get("base_amount", 1.0)) / 10.0
         # Titulos
         counts = plot.groupby(["category", "num_runners"], as_index=False).size().rename(columns={"size": "count"})
         if x_axis_mode == "Dia":
@@ -1614,7 +1740,7 @@ def main() -> None:
         plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
         plot = plot.dropna(subset=["ts"]).sort_values("ts")
         plot["date_only"] = plot["ts"].dt.date
-        local_scale = float(st.session_state.get("base_amount", 10.0)) / 10.0
+        local_scale = float(st.session_state.get("base_amount", 1.0)) / 10.0
         # Seleciona Top K pistas por quantidade
         top_k = 12
         track_sizes = plot.groupby("track_name", as_index=False).size().rename(columns={"size": "count"}).sort_values("count", ascending=False)
@@ -1667,84 +1793,18 @@ def main() -> None:
         )
         st.altair_chart(ch.configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
 
-    # --- Heatmaps por Categoria/Pista  Numero de corredores ---
-    def _render_heatmaps(df_block: pd.DataFrame, entry_kind: str) -> None:
-        base_amount = float(st.session_state.get("base_amount", 10.0))
-        scale = base_amount / 10.0
-        metric = st.selectbox(
-            f"Metrica do heatmap ({entry_kind.upper()})",
-            ["ROI", "PnL", "Assertividade"],
-            index=0,
-            key=f"heat_metric_{entry_kind}",
-        )
-        def _agg(df: pd.DataFrame, by_cols: list[str]) -> pd.DataFrame:
-            if df.empty:
-                return pd.DataFrame(columns=by_cols + ["roi", "pnl", "acc", "count"])
-            pnl10 = df["pnl_stake_fixed_10"].sum()
-            if entry_kind == "lay":
-                base10 = df["liability_from_stake_fixed_10"].sum()
-            else:
-                base10 = 10.0 * len(df)
-            pnl = pnl10 * scale
-            base_val = base10 * scale
-            roi = (pnl / base_val) if base_val > 0 else 0.0
-            acc = float((df["is_green"] == True).sum()) / len(df) if len(df) > 0 else 0.0
-            out = df.groupby(by_cols, as_index=False).size().rename(columns={"size": "count"})
-            out["roi"] = roi
-            out["pnl"] = pnl
-            out["acc"] = acc
-            return out
-        # Categoria  N
-        st.subheader(f"Heatmap por categoria  numero de corredores - {entry_kind.upper()}")
-        by_cat = _agg(df_block, ["category", "num_runners"]).copy()
-        if not by_cat.empty:
-            value_col = {"ROI": "roi", "PnL": "pnl", "Assertividade": "acc"}[metric]
-            by_cat["category"] = by_cat["category"].astype(str)
-            cat_heat = (
-                alt.Chart(by_cat)
-                .mark_rect()
-                .encode(
-                    x=alt.X("category:N", title="Categoria"),
-                    y=alt.Y("num_runners:O", title="N corredores", sort="ascending"),
-                    color=alt.Color(f"{value_col}:Q", title=metric),
-                    tooltip=["category", "num_runners", alt.Tooltip("count:Q", title="bets"), alt.Tooltip(f"{value_col}:Q", title=metric)],
-                )
-            )
-            st.altair_chart(cat_heat.configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
-        # Pista  N (Top K por contagem)
-        st.subheader(f"Heatmap por pista  numero de corredores - {entry_kind.upper()}")
-        top_k = 12
-        track_sizes = df_block.groupby("track_name", as_index=False).size().rename(columns={"size": "count"}).sort_values("count", ascending=False)
-        top_tracks = set(track_sizes.head(top_k)["track_name"].tolist())
-        df_top = df_block[df_block["track_name"].isin(top_tracks)].copy()
-        by_track = _agg(df_top, ["track_name", "num_runners"]).copy()
-        if not by_track.empty:
-            value_col = {"ROI": "roi", "PnL": "pnl", "Assertividade": "acc"}[metric]
-            by_track["track_name"] = by_track["track_name"].astype(str)
-            tr_heat = (
-                alt.Chart(by_track)
-                .mark_rect()
-                .encode(
-                    x=alt.X("track_name:N", title="Pista"),
-                    y=alt.Y("num_runners:O", title="N corredores", sort="ascending"),
-                    color=alt.Color(f"{value_col}:Q", title=metric),
-                    tooltip=["track_name", "num_runners", alt.Tooltip("count:Q", title="bets"), alt.Tooltip(f"{value_col}:Q", title=metric)],
-                )
-            )
-            st.altair_chart(tr_heat.configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
-
-    # Renderizacao dos novos blocos para BACK/LAY
+    # Renderizacao dos blocos na ordem BACK depois LAY, agrupando cross charts junto
     if entry_type == "both":
+        _render_small_charts(filt[filt["entry_type"] == "back"], "back")
         _render_cross_nr_category(filt[filt["entry_type"] == "back"], "back")
-        _render_cross_nr_category(filt[filt["entry_type"] == "lay"], "lay")
         _render_cross_nr_track(filt[filt["entry_type"] == "back"], "back")
+        _render_small_charts(filt[filt["entry_type"] == "lay"], "lay")
+        _render_cross_nr_category(filt[filt["entry_type"] == "lay"], "lay")
         _render_cross_nr_track(filt[filt["entry_type"] == "lay"], "lay")
-        _render_heatmaps(filt[filt["entry_type"] == "back"], "back")
-        _render_heatmaps(filt[filt["entry_type"] == "lay"], "lay")
     else:
+        _render_small_charts(filt[filt["entry_type"] == entry_type], entry_type)
         _render_cross_nr_category(filt[filt["entry_type"] == entry_type], entry_type)
         _render_cross_nr_track(filt[filt["entry_type"] == entry_type], entry_type)
-        _render_heatmaps(filt[filt["entry_type"] == entry_type], entry_type)
 
 
 if __name__ == "__main__":
