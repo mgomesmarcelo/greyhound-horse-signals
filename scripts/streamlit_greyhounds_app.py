@@ -161,6 +161,22 @@ def _build_num_runners_index() -> dict[tuple[str, str], int]:
     return _cached_num_runners_index(signature)
 
 
+def _get_signals_mtime(source: str, market: str, rule: str) -> float:
+    parquet_path = settings.PROCESSED_SIGNALS_DIR / f"signals_{source}_{market}_{rule}.parquet"
+    if parquet_path.exists():
+        try:
+            return parquet_path.stat().st_mtime
+        except OSError:
+            return 0.0
+    csv_path = settings.RAW_SIGNALS_DIR / f"signals_{source}_{market}_{rule}.csv"
+    if csv_path.exists():
+        try:
+            return csv_path.stat().st_mtime
+        except OSError:
+            return 0.0
+    return 0.0
+
+
 def load_signals(source: str = "top3", market: str = "win", rule: str = "terceiro_queda50") -> pd.DataFrame:
     parquet_path = settings.PROCESSED_SIGNALS_DIR / f"signals_{source}_{market}_{rule}.parquet"
     if parquet_path.exists():
@@ -188,6 +204,58 @@ def load_signals(source: str = "top3", market: str = "win", rule: str = "terceir
         except Exception:
             return pd.DataFrame()
     return pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False)
+def load_signals_enriched(
+    source: str = "top3",
+    market: str = "win",
+    rule: str = "terceiro_queda50",
+    signals_mtime: float = 0.0,
+) -> pd.DataFrame:
+    """
+    Carrega os sinais e faz um enriquecimento pesado (num_runners, categoria, etc.)
+    apenas uma vez, reaproveitando via cache entre interações do Streamlit.
+    O parâmetro signals_mtime é usado apenas para invalidar o cache quando o
+    arquivo de sinais for atualizado em disco.
+    """
+    del signals_mtime  # usado somente para a chave de cache
+    df = load_signals(source=source, market=market, rule=rule)
+    if df.empty:
+        return df
+
+    # Colunas auxiliares de data/tempo
+    if "date" in df.columns and "date_dt" not in df.columns:
+        df["date_dt"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    if "race_time_iso" in df.columns and "race_ts" not in df.columns:
+        df["race_ts"] = pd.to_datetime(df["race_time_iso"], errors="coerce")
+
+    # Chaves de corrida
+    if "track_name" in df.columns and "race_time_iso" in df.columns:
+        df["_key_track"] = df["track_name"].astype(str).map(normalize_track_name)
+        df["_key_race"] = df["race_time_iso"].astype(str)
+
+    # Enriquecimento: numero de corredores (fallback se ausente no parquet)
+    if "num_runners" not in df.columns:
+        num_index = _build_num_runners_index()
+        df["num_runners"] = df.apply(
+            lambda r: num_index.get((str(r.get("_key_track", "")), str(r.get("_key_race", ""))), pd.NA),
+            axis=1,
+        )
+
+    # Enriquecimento: categoria por corrida (A/B/D etc.) somente se faltar
+    if ("category" not in df.columns) or ("category_token" not in df.columns):
+        cat_index = _build_category_index()
+        df["category"] = df.apply(
+            lambda r: (cat_index.get((str(r.get("_key_track", "")), str(r.get("_key_race", ""))), {}) or {}).get("letter", ""),
+            axis=1,
+        )
+        df["category_token"] = df.apply(
+            lambda r: (cat_index.get((str(r.get("_key_track", "")), str(r.get("_key_race", ""))), {}) or {}).get("token", ""),
+            axis=1,
+        )
+
+    return df
 
 
 def main() -> None:
@@ -336,7 +404,8 @@ def main() -> None:
 
     st.caption(f"Regra selecionada: {selected_rule_label} · Fonte de dados: {source_label}")
 
-    df = load_signals(source=source, market=market, rule=rule)
+    signals_mtime = _get_signals_mtime(source, market, rule)
+    df = load_signals_enriched(source=source, market=market, rule=rule, signals_mtime=signals_mtime)
     if df.empty:
         st.info("Nenhum sinal encontrado para a selecao. Gere antes com: python scripts/generate_greyhound_signals.py --source {src} --market {mkt} --rule {rule} --entry_type both".format(src=source, mkt=market, rule=rule))
         return
@@ -699,16 +768,41 @@ def main() -> None:
             )
         filt = filt[filt["leader_volume_share_pct"].fillna(0) >= float(leader_min)]
     # Enriquecimento: categoria por corrida (A/B/D etc.)
-    cat_index = _build_category_index()
-    if not filt.empty:
-        filt["_key_track"] = filt["track_name"].astype(str).map(normalize_track_name)
-        filt["_key_race"] = filt["race_time_iso"].astype(str)
-        filt["category"] = filt.apply(lambda r: (cat_index.get((r["_key_track"], r["_key_race"]), {}) or {}).get("letter", ""), axis=1)
-        filt["category_token"] = filt.apply(lambda r: (cat_index.get((r["_key_track"], r["_key_race"]), {}) or {}).get("token", ""), axis=1)
-        # Ordena letras (facilita UI)
-        cat_letters = sorted([c for c in filt["category"].dropna().unique().tolist() if isinstance(c, str) and c])
+    # Se o DataFrame ja veio com as colunas de categoria, reaproveitamos diretamente.
+    if ("category" in filt.columns) and ("category_token" in filt.columns):
+        if not filt.empty:
+            cat_letters = sorted(
+                [
+                    c
+                    for c in filt["category"].dropna().unique().tolist()
+                    if isinstance(c, str) and c
+                ]
+            )
+        else:
+            cat_letters = []
     else:
-        cat_letters = []
+        cat_index = _build_category_index()
+        if not filt.empty:
+            filt["_key_track"] = filt["track_name"].astype(str).map(normalize_track_name)
+            filt["_key_race"] = filt["race_time_iso"].astype(str)
+            filt["category"] = filt.apply(
+                lambda r: (cat_index.get((str(r["_key_track"]), str(r["_key_race"])), {}) or {}).get("letter", ""),
+                axis=1,
+            )
+            filt["category_token"] = filt.apply(
+                lambda r: (cat_index.get((str(r["_key_track"]), str(r["_key_race"])), {}) or {}).get("token", ""),
+                axis=1,
+            )
+            # Ordena letras (facilita UI)
+            cat_letters = sorted(
+                [
+                    c
+                    for c in filt["category"].dropna().unique().tolist()
+                    if isinstance(c, str) and c
+                ]
+            )
+        else:
+            cat_letters = []
     if sel_tracks:
         filt = filt[filt["track_name"].isin(sel_tracks)]
     # Regra principal terceiro_queda50: diferenca > 50% em relacao ao vol3
