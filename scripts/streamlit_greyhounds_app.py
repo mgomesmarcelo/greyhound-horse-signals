@@ -1,4 +1,5 @@
 import datetime
+import calendar
 import math
 import sys
 from pathlib import Path
@@ -152,6 +153,91 @@ def _calc_drawdown(series: pd.Series) -> float:
     running_max = series.cummax()
     drawdown = series - running_max
     return float(drawdown.min()) if not drawdown.empty else 0.0
+
+
+def _compute_summary_metrics(df_block: pd.DataFrame, entry_kind: str, base_amount: float) -> dict[str, float]:
+    """Calcula métricas agregadas usadas no cabeçalho e no relatório mensal."""
+    metrics: dict[str, float] = {
+        "tracks": 0,
+        "signals": 0,
+        "greens": 0,
+        "reds": 0,
+        "avg_bsp": 0.0,
+        "accuracy": 0.0,
+        "base_stake": 0.0,
+        "pnl_stake": 0.0,
+        "roi_stake": 0.0,
+        "min_pnl_stake": 0.0,
+        "drawdown_stake": 0.0,
+    }
+    if df_block is None or df_block.empty:
+        return metrics
+
+    scale_factor = base_amount / 10.0
+    metrics["tracks"] = int(df_block["track_name"].nunique())
+    metrics["signals"] = int(len(df_block))
+    metrics["greens"] = int((df_block["is_green"] == True).sum())
+    metrics["reds"] = int(metrics["signals"] - metrics["greens"])
+
+    if entry_kind == "lay":
+        metrics["avg_bsp"] = float(df_block["lay_target_bsp"].mean())
+    else:
+        metrics["avg_bsp"] = float(df_block["back_target_bsp"].mean())
+    metrics["accuracy"] = (metrics["greens"] / metrics["signals"]) if metrics["signals"] > 0 else 0.0
+
+    if entry_kind == "lay":
+        total_base_stake10 = float(df_block["liability_from_stake_fixed_10"].sum())
+    else:
+        total_base_stake10 = 10.0 * metrics["signals"]
+    total_pnl_stake10 = float(df_block["pnl_stake_fixed_10"].sum())
+    metrics["base_stake"] = total_base_stake10 * scale_factor
+    metrics["pnl_stake"] = total_pnl_stake10 * scale_factor
+    metrics["roi_stake"] = (metrics["pnl_stake"] / metrics["base_stake"]) if metrics["base_stake"] > 0 else 0.0
+
+    ordered = df_block.sort_values("race_time_iso")
+    cumulative_stake = (ordered["pnl_stake_fixed_10"] * scale_factor).cumsum()
+    metrics["min_pnl_stake"] = float(cumulative_stake.min()) if not cumulative_stake.empty else 0.0
+    metrics["drawdown_stake"] = _calc_drawdown(cumulative_stake)
+
+    if entry_kind == "lay":
+        metrics["stake_liab"] = float(df_block["stake_for_liability_10"].sum()) * scale_factor
+        total_pnl_liab10 = float(df_block["pnl_liability_fixed_10"].sum())
+        metrics["pnl_liab"] = total_pnl_liab10 * scale_factor
+        metrics["roi_liab"] = (metrics["pnl_liab"] / (base_amount * metrics["signals"])) if metrics["signals"] > 0 and base_amount > 0 else 0.0
+
+        cumulative_liab = (ordered["pnl_liability_fixed_10"] * scale_factor).cumsum()
+        metrics["min_pnl_liab"] = float(cumulative_liab.min()) if not cumulative_liab.empty else 0.0
+        metrics["drawdown_liab"] = _calc_drawdown(cumulative_liab)
+    return metrics
+
+
+def _format_month_label(ts: pd.Timestamp) -> str:
+    """Retorna rótulo no formato Jan/2024 (abreviação em inglês)."""
+    if pd.isna(ts):
+        return ""
+    month_abbr = calendar.month_abbr[ts.month] if ts.month in range(1, 13) else ""
+    return f"{month_abbr}/{ts.year}"
+
+
+def _render_base_amount_input() -> float:
+    """Campo único para definir a base de Stake/Liab, usado em todos os modos."""
+    if "base_amount" not in st.session_state:
+        st.session_state["base_amount"] = 1.00
+    col_base, _ = st.columns([1, 6])
+    with col_base:
+        val = st.number_input(
+            "Valor base (Stake e Liability)",
+            min_value=0.01,
+            max_value=100000.0,
+            value=float(st.session_state["base_amount"]),
+            step=0.50,
+            format="%.2f",
+            key="base_amount",
+            label_visibility="collapsed",
+            help="Padrão: 1 (1 unidade da banca). Ajuste para reescalar PnL/ROI/drawdown.",
+        )
+        st.caption("Stake/Liab base (padrão: 1 unidade da banca)")
+    return float(val)
 
 
 def _build_num_runners_index() -> dict[tuple[str, str], int]:
@@ -910,51 +996,33 @@ def main() -> None:
     )
 
     def render_block(title_suffix: str, df_block: pd.DataFrame, entry_kind: str) -> None:
-        # ROI e Assertividade, reescalando a partir dos calculos base (10)
         base_amount = float(st.session_state.get("base_amount", 1.0))
         scale_factor = base_amount / 10.0
-        if entry_kind == "lay":
-            total_base_stake10 = float(df_block["liability_from_stake_fixed_10"].sum()) if not df_block.empty else 0.0
-        else:
-            total_base_stake10 = 10.0 * len(df_block)
-        total_pnl_stake10 = float(df_block["pnl_stake_fixed_10"].sum()) if not df_block.empty else 0.0
-        total_base_stake = total_base_stake10 * scale_factor
-        total_pnl_stake = total_pnl_stake10 * scale_factor
-        roi_stake = (total_pnl_stake / total_base_stake) if total_base_stake > 0 else 0.0
-        acc_stake10 = (float((df_block["is_green"] == True).sum()) / len(df_block)) if not df_block.empty else 0.0
-        if df_block.empty:
-            drawdown_stake = 0.0
-        else:
-            ordered = df_block.sort_values("race_time_iso")
-            cumulative = (ordered["pnl_stake_fixed_10"] * scale_factor).cumsum()
-            drawdown_stake = _calc_drawdown(cumulative)
+        summary = _compute_summary_metrics(df_block, entry_kind, base_amount)
 
         st.subheader(title_suffix)
 
         # Linha 1: Pistas, Sinais, Greens, Reds, Media BSP, Assertividade
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         with c1:
-            st.metric("Pistas", df_block["track_name"].nunique())
+            st.metric("Pistas", summary["tracks"])
         with c2:
-            st.metric("Sinais", len(df_block))
-        num_greens = int((df_block["is_green"] == True).sum()) if not df_block.empty else 0
-        num_reds = int(len(df_block) - num_greens) if not df_block.empty else 0
+            st.metric("Sinais", summary["signals"])
+        num_greens = summary["greens"]
+        num_reds = summary["reds"]
         with c3:
             st.metric("Greens", num_greens)
         with c4:
             st.metric("Reds", num_reds)
         with c5:
-            avg_bsp = float((df_block["lay_target_bsp"] if entry_kind == "lay" else df_block["back_target_bsp"]).mean()) if not df_block.empty else 0.0
-            st.metric("Media BSP Alvo", f"{avg_bsp:.2f}")
+            st.metric("Media BSP Alvo", f"{summary['avg_bsp']:.2f}")
         with c6:
-            st.metric("Assertividade", f"{acc_stake10:.2%}")
+            st.metric("Assertividade", f"{summary['accuracy']:.2%}")
 
         # Campo valor base (reutiliza ja existente)
-        base_amount = float(st.session_state.get("base_amount", 1.0))
-        scale_factor = base_amount / 10.0
-        total_base_stake = total_base_stake10 * scale_factor
-        total_pnl_stake = total_pnl_stake10 * scale_factor
-        roi_stake = (total_pnl_stake / total_base_stake) if total_base_stake > 0 else 0.0
+        total_base_stake = summary["base_stake"]
+        total_pnl_stake = summary["pnl_stake"]
+        roi_stake = summary["roi_stake"]
 
         # Linha 2: Stake(10)
         st.subheader(f"Stake (valor fixo {base_amount:.2f})")
@@ -975,33 +1043,20 @@ def main() -> None:
             st.metric("PnL Stake", f"{total_pnl_stake:.2f}")
         with s3:
             st.metric("ROI Stake", f"{roi_stake:.2%}")
-        min_pnl = 0.0
-        if not df_block.empty:
-            ordered_for_min = df_block.sort_values("race_time_iso")
-            cumulative_min = (ordered_for_min["pnl_stake_fixed_10"] * scale_factor).cumsum()
-            min_pnl = float(cumulative_min.min())
+        min_pnl = summary["min_pnl_stake"]
         with s4:
             st.metric("Menor PnL acumulado", f"{min_pnl:.2f}")
         with s5:
-            st.metric("Drawdown máximo (Stake)", f"{drawdown_stake:.2f}")
+            st.metric("Drawdown máximo (Stake)", f"{summary['drawdown_stake']:.2f}")
         st.markdown('</div>', unsafe_allow_html=True)
 
         # Linha 3: Liability(10)  apenas para LAY
         if entry_kind == "lay":
-            total_stake_liab10 = float(df_block["stake_for_liability_10"].sum()) if not df_block.empty else 0.0
-            total_pnl_liab10 = float(df_block["pnl_liability_fixed_10"].sum()) if not df_block.empty else 0.0
-            total_stake_liab = total_stake_liab10 * scale_factor
-            total_pnl_liab = total_pnl_liab10 * scale_factor
-            roi_liab = (total_pnl_liab / (base_amount * len(df_block))) if not df_block.empty and base_amount > 0 else 0.0
-            # Min PnL e drawdown para Liability (mesma escala do base_amount)
-            if df_block.empty:
-                min_pnl_liab = 0.0
-                drawdown_liab = 0.0
-            else:
-                ordered_liab = df_block.sort_values("race_time_iso")
-                cumulative_liab = (ordered_liab["pnl_liability_fixed_10"] * scale_factor).cumsum()
-                min_pnl_liab = float(cumulative_liab.min())
-                drawdown_liab = _calc_drawdown(cumulative_liab)
+            total_stake_liab = summary.get("stake_liab", 0.0)
+            total_pnl_liab = summary.get("pnl_liab", 0.0)
+            roi_liab = summary.get("roi_liab", 0.0)
+            min_pnl_liab = summary.get("min_pnl_liab", 0.0)
+            drawdown_liab = summary.get("drawdown_liab", 0.0)
             st.subheader(f"Liability (valor fixo {base_amount:.2f})")
             st.markdown(
                 """
@@ -1093,6 +1148,9 @@ def main() -> None:
         # Desempenho por dia da semana (antes da tabela)
         _render_weekday_perf(df_block, entry_kind)
 
+        # Relatorio mensal (entre desempenho semanal e tabela)
+        _render_monthly_table(df_block, entry_kind)
+
         # Tabela
         show_cols = [
             "date", "track_name", "category_token", "race_time_iso",
@@ -1124,25 +1182,62 @@ def main() -> None:
         with st.expander(table_label, expanded=False):
             st.dataframe(df_block[show_cols], use_container_width=True)
 
+    def _render_monthly_table(df_block: pd.DataFrame, entry_kind: str) -> None:
+        """Tabela mensal com mesmas métricas do cabeçalho."""
+        base_amount = float(st.session_state.get("base_amount", 1.0))
+        working = df_block.copy()
+        if "race_ts" not in working.columns:
+            working["race_ts"] = pd.to_datetime(working["race_time_iso"], errors="coerce")
+        else:
+            working["race_ts"] = pd.to_datetime(working["race_ts"], errors="coerce")
+        working = working.dropna(subset=["race_ts"])
+        if working.empty:
+            st.info("Sem dados para compor o relatório mensal.")
+            return
+
+        working["month_period"] = working["race_ts"].dt.to_period("M")
+        working["month_label"] = working["race_ts"].apply(_format_month_label)
+        rows: list[dict[str, float | str]] = []
+        for (period_val, label), grp in working.groupby(["month_period", "month_label"]):
+            summary = _compute_summary_metrics(grp, entry_kind, base_amount)
+            row: dict[str, float | str] = {
+                "Mes/Ano": label,
+                "_period": period_val,
+                "Pistas": summary["tracks"],
+                "Sinais": summary["signals"],
+                "Greens": summary["greens"],
+                "Reds": summary["reds"],
+                "Media BSP Alvo": summary["avg_bsp"],
+                "Assertividade": summary["accuracy"],
+                "Base (Stake)": summary["base_stake"],
+                "PnL Stake": summary["pnl_stake"],
+                "ROI Stake": summary["roi_stake"],
+                "Menor PnL acumulado": summary["min_pnl_stake"],
+                "Drawdown máximo (Stake)": summary["drawdown_stake"],
+            }
+            if entry_kind == "lay":
+                row.update(
+                    {
+                        "Stake (Liability)": summary.get("stake_liab", 0.0),
+                        "PnL Liability": summary.get("pnl_liab", 0.0),
+                        "ROI Liability": summary.get("roi_liab", 0.0),
+                        "Menor PnL (Liability)": summary.get("min_pnl_liab", 0.0),
+                        "Drawdown max (Liability)": summary.get("drawdown_liab", 0.0),
+                    }
+                )
+            rows.append(row)
+
+        monthly_df = pd.DataFrame(rows)
+        if not monthly_df.empty:
+            monthly_df = monthly_df.sort_values("_period").drop(columns=["_period"], errors="ignore")
+        with st.expander(f"Relatorio mensal ({entry_kind.upper()})", expanded=False):
+            st.dataframe(monthly_df, use_container_width=True)
+
+    # Campo base (único) pos-filtros, antes de renderizar resultados
+    _render_base_amount_input()
+
     # Enriquecimento feito antes; agora renderizacao por bloco
     if entry_type == "both":
-        # Campo de valor base acima dos blocos BACK/LAY quando ambos estao selecionados
-        if "base_amount" not in st.session_state:
-            st.session_state["base_amount"] = 1.00
-        cba_top, _ = st.columns([1, 6])
-        with cba_top:
-            st.number_input(
-                "Valor base (Stake e Liability)",
-                min_value=0.01,
-                max_value=100000.0,
-                value=float(st.session_state["base_amount"]),
-                step=0.50,
-                format="%.2f",
-                key="base_amount",
-                label_visibility="collapsed",
-                help="Padrão: 1 (1 unidade da banca). Ajuste para reescalar PnL/ROI/drawdown.",
-            )
-            st.caption("Stake/Liab base (padrão: 1 unidade da banca)")
         render_block("Resultados BACK", filt[filt["entry_type"] == "back"], "back")
         render_block("Resultados LAY", filt[filt["entry_type"] == "lay"], "lay")
     else:
@@ -1152,74 +1247,30 @@ def main() -> None:
     # Quando apenas um tipo e selecionado, exibimos o agregado desse tipo.
     # Quando "both", os blocos BACK e LAY ja foram exibidos acima; evitamos repetir dados agregados.
     if entry_type != "both":
+        summary = _compute_summary_metrics(filt, entry_type, float(st.session_state.get("base_amount", 1.0)))
         # Linha 1: Pistas, Sinais, Greens, Reds, Media BSP, Assertividade
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         with c1:
-            st.metric("Pistas", filt["track_name"].nunique())
+            st.metric("Pistas", summary["tracks"])
         with c2:
-            st.metric("Sinais", len(filt))
-        # Contagem de greens/reds
-        num_greens = int((filt["is_green"] == True).sum()) if not filt.empty else 0
-        num_reds = int(len(filt) - num_greens) if not filt.empty else 0
+            st.metric("Sinais", summary["signals"])
         with c3:
-            st.metric("Greens", num_greens)
+            st.metric("Greens", summary["greens"])
         with c4:
-            st.metric("Reds", num_reds)
+            st.metric("Reds", summary["reds"])
         with c5:
-            if entry_type == "lay":
-                avg_bsp = float(filt["lay_target_bsp"].mean()) if not filt.empty else 0.0
-            elif entry_type == "back":
-                avg_bsp = float(filt["back_target_bsp"].mean()) if not filt.empty else 0.0
-            else:
-                lay_series = pd.to_numeric(filt.get("lay_target_bsp", pd.Series(dtype=float)), errors="coerce")
-                back_series = pd.to_numeric(filt.get("back_target_bsp", pd.Series(dtype=float)), errors="coerce")
-                avg_bsp = float(pd.concat([lay_series, back_series]).mean()) if not filt.empty else 0.0
-            st.metric("Media BSP Alvo", f"{avg_bsp:.2f}")
+            st.metric("Media BSP Alvo", f"{summary['avg_bsp']:.2f}")
         with c6:
-            acc_val = (num_greens / len(filt)) if len(filt) > 0 else 0.0
-            st.metric("Assertividade", f"{acc_val:.2%}")
-
-        # Campo compacto antes do cabecalho de Stake para definir o valor base
-        if "base_amount" not in st.session_state:
-            st.session_state["base_amount"] = 1.00
-        cba1, _ = st.columns([1, 6])
-        with cba1:
-            st.number_input(
-                "Valor base (Stake e Liability)",
-                min_value=0.01,
-                max_value=100000.0,
-                value=float(st.session_state["base_amount"]),
-                step=0.50,
-                format="%.2f",
-                key="base_amount",
-                label_visibility="collapsed",
-                help="Padrão: 1 (1 unidade da banca). Ajuste para reescalar PnL/ROI/drawdown.",
-            )
-            st.caption("Stake/Liab base (padrão: 1 unidade da banca)")
+            st.metric("Assertividade", f"{summary['accuracy']:.2%}")
 
         # Recalcula fatores apos possivel alteracao do input
         base_amount = float(st.session_state.get("base_amount", 1.0))
         scale_factor = base_amount / 10.0
-        # Base (Stake) depende do tipo de entrada
-        if entry_type == "lay":
-            total_base_stake10 = float(filt["liability_from_stake_fixed_10"].sum()) if not filt.empty else 0.0
-        elif entry_type == "back":
-            total_base_stake10 = 10.0 * len(filt)
-        else:
-            # ambos: soma base de LAY (liability_from_stake_fixed_10) + base de BACK (10 por aposta)
-            lay_part = float(filt.loc[filt["entry_type"] == "lay", "liability_from_stake_fixed_10"].sum())
-            back_part = 10.0 * int((filt["entry_type"] == "back").sum())
-            total_base_stake10 = lay_part + back_part
-        total_pnl_stake10 = float(filt["pnl_stake_fixed_10"].sum()) if not filt.empty else 0.0
-        total_base_stake = total_base_stake10 * scale_factor
-        total_pnl_stake = total_pnl_stake10 * scale_factor
-        roi_stake = (total_pnl_stake / total_base_stake) if total_base_stake > 0 else 0.0
-        if filt.empty:
-            drawdown_stake = 0.0
-        else:
-            ordered = filt.sort_values("race_time_iso")
-            cumulative = (ordered["pnl_stake_fixed_10"] * scale_factor).cumsum()
-            drawdown_stake = _calc_drawdown(cumulative)
+        summary = _compute_summary_metrics(filt, entry_type, base_amount)
+        total_base_stake = summary["base_stake"]
+        total_pnl_stake = summary["pnl_stake"]
+        roi_stake = summary["roi_stake"]
+        drawdown_stake = summary["drawdown_stake"]
 
         # Linha 2: Stake(10)
         st.subheader(f"Stake (valor fixo {base_amount:.2f})")
@@ -1240,11 +1291,7 @@ def main() -> None:
             st.metric("PnL Stake", f"{total_pnl_stake:.2f}")
         with s3:
             st.metric("ROI Stake", f"{roi_stake:.2%}")
-        min_pnl_global = 0.0
-        if not filt.empty:
-            ordered_global = filt.sort_values("race_time_iso")
-            cumulative_global = (ordered_global["pnl_stake_fixed_10"] * scale_factor).cumsum()
-            min_pnl_global = float(cumulative_global.min())
+        min_pnl_global = summary["min_pnl_stake"]
         with s4:
             st.metric("Menor PnL acumulado", f"{min_pnl_global:.2f}")
         with s5:
@@ -1253,20 +1300,11 @@ def main() -> None:
 
         # Linha 3: Liability(10)  apenas para LAY
         if entry_type == "lay":
-            total_stake_liab10 = float(filt["stake_for_liability_10"].sum()) if not filt.empty else 0.0
-            total_pnl_liab10 = float(filt["pnl_liability_fixed_10"].sum()) if not filt.empty else 0.0
-            total_stake_liab = total_stake_liab10 * scale_factor
-            total_pnl_liab = total_pnl_liab10 * scale_factor
-            roi_liab = (total_pnl_liab / (base_amount * len(filt))) if not filt.empty and base_amount > 0 else 0.0
-            # Min PnL e drawdown para Liability (mesma escala do base_amount)
-            if filt.empty:
-                min_pnl_liab = 0.0
-                drawdown_liab = 0.0
-            else:
-                ordered_liab = filt.sort_values("race_time_iso")
-                cumulative_liab = (ordered_liab["pnl_liability_fixed_10"] * scale_factor).cumsum()
-                min_pnl_liab = float(cumulative_liab.min())
-                drawdown_liab = _calc_drawdown(cumulative_liab)
+            total_stake_liab = summary.get("stake_liab", 0.0)
+            total_pnl_liab = summary.get("pnl_liab", 0.0)
+            roi_liab = summary.get("roi_liab", 0.0)
+            min_pnl_liab = summary.get("min_pnl_liab", 0.0)
+            drawdown_liab = summary.get("drawdown_liab", 0.0)
             st.subheader(f"Liability (valor fixo {base_amount:.2f})")
             st.markdown(
                 """
@@ -1365,6 +1403,9 @@ def main() -> None:
 
         # Desempenho por dia da semana (antes da tabela)
         _render_weekday_perf(filt, entry_type)
+
+        # Relatorio mensal (entre desempenho semanal e tabela)
+        _render_monthly_table(filt, entry_type)
 
         # Tabela (agregada para o tipo selecionado)
         show_cols = [
