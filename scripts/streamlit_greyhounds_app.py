@@ -1230,8 +1230,60 @@ def main() -> None:
         monthly_df = pd.DataFrame(rows)
         if not monthly_df.empty:
             monthly_df = monthly_df.sort_values("_period").drop(columns=["_period"], errors="ignore")
+        month_order = monthly_df["Mes/Ano"].tolist() if not monthly_df.empty else []
         with st.expander(f"Relatorio mensal ({entry_kind.upper()})", expanded=False):
             st.dataframe(monthly_df, use_container_width=True)
+            chart_data = working.copy()
+            chart_data["date_only"] = chart_data["race_ts"].dt.date
+            daily_raw = (
+                chart_data.groupby(["month_label", "month_period", "date_only"], as_index=False)[["pnl_stake_fixed_10"]]
+                .sum()
+                .sort_values("date_only")
+            )
+            # Garante que cada mes apareca na janela inteira (preenche dias sem apostas com 0)
+            filled_frames: list[pd.DataFrame] = []
+            for (mlabel, mperiod), grp in daily_raw.groupby(["month_label", "month_period"]):
+                try:
+                    start_date = mperiod.start_time.date()
+                    end_date = mperiod.end_time.date()
+                except Exception:
+                    start_date = grp["date_only"].min()
+                    end_date = grp["date_only"].max()
+                full_dates = pd.date_range(start_date, end_date, freq="D").date
+                base = pd.DataFrame({"date_only": full_dates})
+                merged = base.merge(grp[["date_only", "pnl_stake_fixed_10"]], on="date_only", how="left")
+                merged["month_label"] = mlabel
+                merged["pnl_stake_fixed_10"] = merged["pnl_stake_fixed_10"].fillna(0)
+                filled_frames.append(merged)
+            daily = pd.concat(filled_frames, ignore_index=True) if filled_frames else pd.DataFrame()
+            daily = daily[daily["month_label"].notna()]
+            if daily.empty:
+                st.info("Sem dados suficientes para gerar os gráficos mensais.")
+            else:
+                daily["cum_stake"] = daily.groupby("month_label")["pnl_stake_fixed_10"].cumsum() * (base_amount / 10.0)
+                month_sort = month_order or list(daily["month_label"].unique())
+                col_count = min(4, max(1, len(month_sort)))
+                zero_line = alt.Chart().mark_rule(color="red", strokeWidth=1).encode(y=alt.datum(0))
+                base_line = (
+                    alt.Chart()
+                    .mark_line(color="#85b4ff")
+                    .encode(
+                        x=alt.X("date_only:T", title="", axis=alt.Axis(format="%d/%m")),
+                        y=alt.Y("cum_stake:Q", title="PnL"),
+                    )
+                    .properties(width=small_width, height=small_height)
+                )
+                month_chart = (
+                    alt.layer(zero_line, base_line)
+                    .facet(
+                        facet=alt.Facet("month_label:N", sort=month_sort, title=""),
+                        columns=col_count,
+                        data=daily,
+                    )
+                    .resolve_scale(x="independent", y="independent")
+                )
+                st.markdown("**Evolução mensal (PnL acumulado por dia)**")
+                st.altair_chart(month_chart.configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
 
     # Campo base (único) pos-filtros, antes de renderizar resultados
     _render_base_amount_input()
