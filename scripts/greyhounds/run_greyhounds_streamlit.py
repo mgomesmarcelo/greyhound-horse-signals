@@ -8,17 +8,17 @@ from pathlib import Path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Executa o app Streamlit dos cavalos.")
-    parser.add_argument("--port", type=int, default=8502, help="Porta do servidor (default: 8502)")
-    parser.add_argument("--address", type=str, default="localhost", help="Endereco do servidor (default: localhost)")
+    parser = argparse.ArgumentParser(description="Executa o app Streamlit dos greyhounds.")
+    parser.add_argument("--port", type=int, default=8501, help="Porta do servidor (default: 8501)")
+    parser.add_argument("--address", type=str, default="localhost", help="Endereço do servidor (default: localhost)")
     args = parser.parse_args()
 
-    project_root = Path(__file__).resolve().parent.parent
+    project_root = Path(__file__).resolve().parents[2]
     os.chdir(project_root)
 
-    script_path = project_root / "scripts" / "streamlit_horses_app.py"
+    script_path = project_root / "scripts" / "greyhounds" / "streamlit_greyhounds_app.py"
     if not script_path.exists():
-        print(f"Arquivo nao encontrado: {script_path}", file=sys.stderr)
+        print(f"Arquivo não encontrado: {script_path}", file=sys.stderr)
         sys.exit(1)
 
     cmd = [

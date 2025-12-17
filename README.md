@@ -23,7 +23,7 @@ Suite de raspagem, limpeza e análise de corridas de cavalos e galgos, com dashb
 - `src/core/`: helpers compartilhados (configuração de diretórios e caminhos).
 - `src/horses/`: scrapers, análises e utilitários específicos de corridas de cavalos.
 - `src/greyhounds/`: scrapers, análises e utilitários específicos de corridas de galgos.
-- `scripts/`: pontos de entrada em linha de comando (raspagem diária, geração de sinais, dashboards).
+- `scripts/`: pontos de entrada em linha de comando (raspagem diária, geração de sinais, dashboards); subpastas separam cavalos (`scripts/horses/`) e galgos.
 - `data/`: armazenamento local (bruto e processado). A estrutura base é criada automaticamente:
 
 ```
@@ -57,25 +57,25 @@ data/
 - **Limpeza opcional:** `python scripts/clean_horse_results.py [--force]`  
   Remove duplicados e corrige colunas de resultados.
 - **Geração de sinais:**  
-  `python scripts/generate_horse_signals.py --source both --market both --strategy both --provider timeform`
+  `python scripts/horses/generate_horse_signals.py --source both --market both --strategy both --provider timeform`
 - **Dashboard Streamlit:**  
-  `python scripts/run_horses_streamlit.py --port 8502 --address 0.0.0.0`
+  `python scripts/horses/run_horses_streamlit.py --port 8502 --address 0.0.0.0`
 
 ### Galgos (`greyhounds`)
 - **Raspagem diária:** `python -m src.greyhounds.run_daily`  
   Busca o índice da Betfair e atualizações Timeform.
-- **Limpeza opcional:** `python scripts/clean_greyhound_results.py [--force]`
+- **Limpeza opcional:** `python scripts/greyhounds/clean_greyhound_results.py [--force]`
 - **Geração de sinais:**  
-  `python scripts/generate_greyhound_signals.py --source both --market both --rule both --entry_type both`
+  `python scripts/greyhounds/generate_greyhound_signals.py --source both --market both --rule both --entry_type both`
 - **Dashboard Streamlit:**  
-  `python scripts/run_greyhounds_streamlit.py --port 8501 --address 0.0.0.0`
+  `python scripts/greyhounds/run_greyhounds_streamlit.py --port 8501 --address 0.0.0.0`
 
 ### Pipeline completo
 - `python -m scripts.run_all_daily` executa `run_daily` de cavalos e galgos em sequência.
 
 ## Dashboards Streamlit
-- `scripts/run_horses_streamlit.py`: filtros por pista, intervalo de datas, fonte (Timeform/Sporting Life) e estratégia; gráficos de ROI, drawdown e distribuição de odds.
-- `scripts/run_greyhounds_streamlit.py`: visão consolidada de sinais por regra, mercado e fonte; ranking de pistas/categorias, análise de desempenho e curvas acumuladas.
+- `scripts/horses/run_horses_streamlit.py`: filtros por pista, intervalo de datas, fonte (Timeform/Sporting Life) e estratégia; gráficos de ROI, drawdown e distribuição de odds.
+- `scripts/greyhounds/run_greyhounds_streamlit.py`: visão consolidada de sinais por regra, mercado e fonte; ranking de pistas/categorias, análise de desempenho e curvas acumuladas.
 - Parâmetros úteis:
   - `--port`: porta HTTP (ex.: `--port 8502`).
   - `--address`: endereço para bind (use `0.0.0.0` ao publicar na rede).
@@ -87,12 +87,12 @@ data/
   - `--delay 2` ajusta a pausa entre downloads (default 1.5s).
   - `--horses-start-date YYYY-MM-DD` / `--greyhounds-start-date YYYY-MM-DD` força a data inicial.
   - `--max-downloads N` limita a quantidade por execução.
-- `python scripts/convert_greyhound_history.py --dataset <nome> [--force]`  
+- `python scripts/greyhounds/convert_greyhound_history.py --dataset <nome> [--force]`  
   Converte CSV históricos de galgos para Parquet (datasets: `signals`, `timeform_top3`, `timeform_forecast`, `race_links`, `betfair_result`).
 - `python scripts/validate_data_layout.py`  
   Validação leve dos nomes de arquivos e colunas esperadas em `data/`.
-- `python scripts/analyze_track_aliases.py`  
-  Normaliza e agrupa variações de nomes de pista usando os dados armazenados.
+- `python scripts/greyhounds/analyze_track_aliases.py`  
+  Gera relatório de aliases de pistas de galgos em `data/greyhounds/reports/track_alias_report.json` a partir dos CSVs brutos (`data/greyhounds/Result`).
 
 ## Configurações
 - Ajuste `settings.LOG_LEVEL` em `src/horses/config.py` ou `src/greyhounds/config.py` para controlar a verbosidade dos logs.

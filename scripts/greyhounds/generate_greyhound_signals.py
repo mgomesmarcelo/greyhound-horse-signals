@@ -7,7 +7,7 @@ from loguru import logger
 from pathlib import Path
 
 if __package__ in (None, ""):
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[2]
     if str(project_root) not in sys.path:
         sys.path.append(str(project_root))
 

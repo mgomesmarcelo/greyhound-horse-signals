@@ -11,7 +11,7 @@ import re
 from dateutil import parser as date_parser
 import altair as alt
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(PROJECT_ROOT))
 
 from src.greyhounds.config import settings
@@ -493,7 +493,7 @@ def main() -> None:
     signals_mtime = _get_signals_mtime(source, market, rule)
     df = load_signals_enriched(source=source, market=market, rule=rule, signals_mtime=signals_mtime)
     if df.empty:
-        st.info("Nenhum sinal encontrado para a selecao. Gere antes com: python scripts/generate_greyhound_signals.py --source {src} --market {mkt} --rule {rule} --entry_type both".format(src=source, mkt=market, rule=rule))
+        st.info("Nenhum sinal encontrado para a selecao. Gere antes com: python scripts/greyhounds/generate_greyhound_signals.py --source {src} --market {mkt} --rule {rule} --entry_type both".format(src=source, mkt=market, rule=rule))
         return
 
     df_filtered = df.copy()

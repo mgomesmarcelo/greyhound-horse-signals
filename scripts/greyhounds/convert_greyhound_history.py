@@ -8,7 +8,7 @@ import pandas as pd
 from loguru import logger
 
 if __package__ in (None, ""):
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[2]
     import sys
 
     if str(project_root) not in sys.path:

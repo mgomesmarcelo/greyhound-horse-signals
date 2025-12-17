@@ -12,7 +12,7 @@ import pandas as pd
 def project_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parents[1]
+    return Path(__file__).resolve().parents[2]
 
 
 def extract_base_track(menu_hint: str) -> str:
@@ -24,7 +24,9 @@ def extract_base_track(menu_hint: str) -> str:
 
 def main() -> None:
     root = project_root()
-    sys.path.append(str(root / "src"))
+    # adiciona raiz do projeto para resolver o pacote src.*
+    if str(root) not in sys.path:
+        sys.path.append(str(root))
 
     from src.greyhounds.utils.text import normalize_track_name  # pylint: disable=import-outside-top-level
 
@@ -64,11 +66,9 @@ def main() -> None:
         if len(variants) > 1
     }
 
-    output_path = root / "scripts" / "track_alias_report.json"
-    output_path.write_text(
-        json.dumps(alias_report, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    output_path = root / "data" / "greyhounds" / "reports" / "track_alias_report.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(alias_report, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(f"Relatório escrito em: {output_path}")
 
