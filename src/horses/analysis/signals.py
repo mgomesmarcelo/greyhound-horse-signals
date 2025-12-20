@@ -16,6 +16,9 @@ from ..utils.text import clean_horse_name, normalize_track_name
 
 _TRAP_PREFIX_RE = re.compile(r"^\s*\d+\.\s*")
 
+RAW_SIGNALS_DIR = settings.DATA_DIR / "signals"
+PROCESSED_SIGNALS_DIR = settings.DATA_DIR / "processed" / "signals"
+
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -23,6 +26,16 @@ def _ensure_dir(path: Path) -> None:
 
 def _strip_trap_prefix(name: str) -> str:
     return _TRAP_PREFIX_RE.sub("", name or "").strip()
+
+
+def _signals_snapshot_path(source: str, market: str, rule: str, provider: str) -> Path:
+    filename = f"signals_{source}_{market}_{rule}.parquet"
+    return PROCESSED_SIGNALS_DIR / provider / filename
+
+
+def _signals_raw_path(source: str, market: str, rule: str, provider: str) -> Path:
+    filename = f"signals_{source}_{market}_{rule}.csv"
+    return RAW_SIGNALS_DIR / provider / filename
 
 
 def _extract_track_from_menu_hint(menu_hint: str) -> str:
@@ -81,6 +94,14 @@ def _to_iso_series(values: pd.Series) -> pd.Series:
         return values.astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
 
 
+def _iter_result_paths(pattern: str) -> list[Path]:
+    result_dir = settings.DATA_DIR / "Result"
+    parquet_files = sorted(result_dir.glob(f"{pattern}.parquet"))
+    if parquet_files:
+        return parquet_files
+    return sorted(result_dir.glob(f"{pattern}.csv"))
+
+
 def _parse_forecast_top3(text: str) -> List[str]:
     """Extrai apenas os 3 primeiros nomes previstos da string TimeformForecast.
 
@@ -128,17 +149,19 @@ def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
     - dwbfpricesirewin*.csv
     - ou, genericamente, dwbfprices*win*.csv
     """
-    result_dir = settings.DATA_DIR / "Result"
-    all_files = sorted(result_dir.glob("dwbfprices*win*.csv"))
+    all_files = _iter_result_paths("dwbfprices*win*")
     index: Dict[Tuple[str, str], Dict[str, RunnerBF]] = {}
 
-    for csv_path in all_files:
+    for result_path in all_files:
         try:
-            df = pd.read_csv(csv_path, encoding=settings.CSV_ENCODING)
+            if result_path.suffix.lower() == ".parquet":
+                df = pd.read_parquet(result_path)
+            else:
+                df = pd.read_csv(result_path, encoding=settings.CSV_ENCODING)
             # Normaliza cabecalhos para minusculas (compativel com arquivos antigos em CAIXA ALTA)
             df.columns = [str(c).strip().lower() for c in df.columns]
         except Exception as e:
-            logger.error("Falha ao ler {}: {}", csv_path.name, e)
+            logger.error("Falha ao ler {}: {}", result_path.name, e)
             continue
 
         # Garante colunas
@@ -163,13 +186,29 @@ def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
                 name_clean = r["selection_name_clean"]
                 if not isinstance(name_clean, str) or not name_clean:
                     continue
-                runners[name_clean] = RunnerBF(
-                    selection_name_raw=r["selection_name_raw"],
-                    selection_name_clean=name_clean,
-                    pptradedvol=float(r["pptradedvol"]),
-                    bsp=float(r["bsp"]) if pd.notna(r["bsp"]) else float("nan"),
-                    win_lose=int(r["win_lose"]),
-                )
+                new_pp = float(r["pptradedvol"])
+                new_bsp = float(r["bsp"]) if pd.notna(r["bsp"]) else float("nan")
+                new_win = int(r["win_lose"])
+                existing = runners.get(name_clean)
+                if existing:
+                    merged_pp = existing.pptradedvol + new_pp
+                    merged_bsp = new_bsp if pd.notna(new_bsp) else existing.bsp
+                    merged_win = 1 if existing.win_lose == 1 or new_win == 1 else existing.win_lose
+                    runners[name_clean] = RunnerBF(
+                        selection_name_raw=existing.selection_name_raw,
+                        selection_name_clean=name_clean,
+                        pptradedvol=merged_pp,
+                        bsp=merged_bsp,
+                        win_lose=merged_win,
+                    )
+                else:
+                    runners[name_clean] = RunnerBF(
+                        selection_name_raw=r["selection_name_raw"],
+                        selection_name_clean=name_clean,
+                        pptradedvol=new_pp,
+                        bsp=new_bsp,
+                        win_lose=new_win,
+                    )
 
     logger.info("Betfair WIN index criado: {} corridas", len(index))
     return index
@@ -183,17 +222,19 @@ def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
     - dwbfpricesireplace*.csv
     - ou, genericamente, dwbfprices*place*.csv
     """
-    result_dir = settings.DATA_DIR / "Result"
-    all_files = sorted(result_dir.glob("dwbfprices*place*.csv"))
+    all_files = _iter_result_paths("dwbfprices*place*")
     index: Dict[Tuple[str, str], Dict[str, RunnerBF]] = {}
 
-    for csv_path in all_files:
+    for result_path in all_files:
         try:
-            df = pd.read_csv(csv_path, encoding=settings.CSV_ENCODING)
+            if result_path.suffix.lower() == ".parquet":
+                df = pd.read_parquet(result_path)
+            else:
+                df = pd.read_csv(result_path, encoding=settings.CSV_ENCODING)
             # Normaliza cabecalhos para minusculas (compativel com arquivos antigos em CAIXA ALTA)
             df.columns = [str(c).strip().lower() for c in df.columns]
         except Exception as e:
-            logger.error("Falha ao ler {}: {}", csv_path.name, e)
+            logger.error("Falha ao ler {}: {}", result_path.name, e)
             continue
 
         # Garante colunas
@@ -218,13 +259,29 @@ def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
                 name_clean = r["selection_name_clean"]
                 if not isinstance(name_clean, str) or not name_clean:
                     continue
-                runners[name_clean] = RunnerBF(
-                    selection_name_raw=r["selection_name_raw"],
-                    selection_name_clean=name_clean,
-                    pptradedvol=float(r["pptradedvol"]),
-                    bsp=float(r["bsp"]) if pd.notna(r["bsp"]) else float("nan"),
-                    win_lose=int(r["win_lose"]),
-                )
+                new_pp = float(r["pptradedvol"])
+                new_bsp = float(r["bsp"]) if pd.notna(r["bsp"]) else float("nan")
+                new_win = int(r["win_lose"])
+                existing = runners.get(name_clean)
+                if existing:
+                    merged_pp = existing.pptradedvol + new_pp
+                    merged_bsp = new_bsp if pd.notna(new_bsp) else existing.bsp
+                    merged_win = 1 if existing.win_lose == 1 or new_win == 1 else existing.win_lose
+                    runners[name_clean] = RunnerBF(
+                        selection_name_raw=existing.selection_name_raw,
+                        selection_name_clean=name_clean,
+                        pptradedvol=merged_pp,
+                        bsp=merged_bsp,
+                        win_lose=merged_win,
+                    )
+                else:
+                    runners[name_clean] = RunnerBF(
+                        selection_name_raw=r["selection_name_raw"],
+                        selection_name_clean=name_clean,
+                        pptradedvol=new_pp,
+                        bsp=new_bsp,
+                        win_lose=new_win,
+                    )
 
     logger.info("Betfair PLACE index criado: {} corridas", len(index))
     return index
@@ -375,7 +432,7 @@ def load_sportinglife_top3() -> List[dict]:
 
         for _, r in df.iterrows():
             track = normalize_track_name(str(r.get("track_name", "")))
-            race_iso = str(r.get("race_time_iso", ""))
+            race_iso = _to_iso_yyyy_mm_dd_thh_mm(str(r.get("race_time_iso", "")))
             names = [clean_horse_name(str(r.get(c, ""))) for c in ["TimeformTop1", "TimeformTop2", "TimeformTop3"]]
             if not track or not race_iso or not any(names):
                 continue
@@ -429,7 +486,7 @@ def load_sportinglife_forecast_top3() -> List[dict]:
 
         for _, r in df.iterrows():
             track = normalize_track_name(str(r.get("track_name", "")))
-            race_iso = str(r.get("race_time_iso", ""))
+            race_iso = _to_iso_yyyy_mm_dd_thh_mm(str(r.get("race_time_iso", "")))
             names = _parse_forecast_top3(str(r.get("TimeformForecast", "")))
             if not track or not race_iso or not names:
                 continue
@@ -457,116 +514,104 @@ def _calc_signals_for_race(
     bf_win_index: Dict[Tuple[str, str], Dict[str, RunnerBF]],
     bf_place_index: Dict[Tuple[str, str], Dict[str, RunnerBF]] | None = None,
     market: str = "win",
-    strategy: str = "lay",
+    rule: str = "terceiro_queda50",
     leader_share_min: float = 0.5,
-) -> dict | None:
+) -> List[dict]:
     track_key = tf_row["track_key"]
     race_iso = tf_row["race_iso"]
     top_names = [n for n in tf_row["top_names"] if isinstance(n, str) and n]
     # Selecao por volume sempre no mercado WIN
     group = bf_win_index.get((track_key, race_iso))
     if not group:
-        return None
+        return []
+
+    num_runners = len(group)
+    total_vol_race = 0.0
+    for runner in group.values():
+        try:
+            vol = float(runner.pptradedvol)
+        except (TypeError, ValueError):
+            vol = 0.0
+        if vol > 0:
+            total_vol_race += vol
 
     # Coleta volumes e BSP para os tres de referencia
     triples: List[Tuple[str, float, float]] = []  # (name_clean, vol, bsp)
     for name in top_names:
         r = group.get(name)
         if not r or pd.isna(r.bsp):
-            return None
+            return []
         triples.append((name, max(0.0, float(r.pptradedvol)), float(r.bsp)))
 
     if len(triples) < 3:
-        return None
+        return []
 
     # Ordena por volume desc entre os Top3 de referencia
     triples_sorted = sorted(triples, key=lambda t: t[1], reverse=True)
     first, second, third = triples_sorted[0], triples_sorted[1], triples_sorted[2]
 
-    # Metricas auxiliares entre 2o e 3o (usadas pela estrategia LAY)
+    # Metricas auxiliares entre 2o e 3o
     vol2, vol3 = second[1], third[1]
     pct_diff = (vol2 - vol3) / vol2 if vol2 > 0 else float("inf")
     ratio = (vol2 / vol3) if vol3 > 0 else float("inf")
-
-    # Para LAY, manter a regra de queda > 50% relativa ao segundo
-    if strategy == "lay":
-        if vol3 <= 0:
-            return None
-        if pct_diff <= 0.5:
-            return None
-
-    # Para BACK, a selecao e o lider por volume (entre os Top3),
-    # com checagem de participacao sobre o total da corrida (no mercado WIN)
-    # Total de volume no WIN para toda a corrida
-    total_vol_race = 0.0
-    for _name, r in bf_win_index.get((track_key, race_iso), {}).items():
-        total_vol_race += max(0.0, float(r.pptradedvol))
     leader_share = (first[1] / total_vol_race) if total_vol_race > 0 else 0.0
-    if strategy == "back" and leader_share < float(leader_share_min):
-        return None
 
-    # Define alvo conforme estrategia
-    if strategy == "back":
-        # Alvo e o lider por volume entre os Top3
-        target_name_clean = first[0]
-        target_bsp_win = first[2]
-    else:
-        # LAY: alvo e o 3o por volume entre os Top3
+    target_name_clean: str | None = None
+    target_bsp_win: float | None = None
+    if rule == "terceiro_queda50":
+        if vol3 <= 0 or pct_diff <= 0.5:
+            return []
         target_name_clean = third[0]
         target_bsp_win = third[2]
+    else:
+        if leader_share < float(leader_share_min):
+            return []
+        target_name_clean = first[0]
+        target_bsp_win = first[2]
 
-    # Recupera runner conforme mercado (win/place) para obter BSP/label corretos
+    if not target_name_clean:
+        return []
+
     if market == "place" and bf_place_index is not None:
         target_runner = bf_place_index.get((track_key, race_iso), {}).get(target_name_clean)
     else:
         target_runner = bf_win_index.get((track_key, race_iso), {}).get(target_name_clean)
     if not target_runner:
-        return None
+        return []
+
     target_win_lose = int(target_runner.win_lose)
+    odd = float(target_runner.bsp) if market == "place" else float(target_bsp_win or 0.0)
 
-    # Para place, usar BSP do mercado PLACE; para win, BSP do WIN do terceiro por volume
-    odd = float(target_runner.bsp) if market == "place" and target_runner is not None else target_bsp_win
+    stake_fix10 = 1.0
+    commission_rate = 0.065
 
-    # Stake base
-    stake_fix10 = 10.00
-
-    if strategy == "back":
-        # Back: lucro quando win_lose==1, PnL = stake*(odd-1) ou -stake
-        if target_win_lose == 1:
-            pnl_stake10 = stake_fix10 * max(0.0, odd - 1.0)
-            is_green = True
-        else:
-            pnl_stake10 = -stake_fix10
-            is_green = False
-        # Campos nao aplicaveis ao back, manter como 0 para compatibilidade
-        liability_from_stake10 = 0.0
-        liability_fix10 = 0.0
-        stake_from_liab10 = 0.0
-        pnl_liab10 = 0.0
+    back_is_green = target_win_lose == 1
+    if back_is_green:
+        back_profit_gross = stake_fix10 * max(0.0, odd - 1.0)
+        back_pnl_stake10 = back_profit_gross * (1.0 - commission_rate)
     else:
-        # Lay: perde quando win_lose==1
-        liability_from_stake10 = stake_fix10 * max(0.0, odd - 1.0)
-        liability_fix10 = 10.00
-        stake_from_liab10 = (liability_fix10 / max(0.001, odd - 1.0))
-        commission_rate = 0.065
-        if target_win_lose == 1:
-            pnl_stake10 = -liability_from_stake10
-            pnl_liab10 = -liability_fix10
-            is_green = False
-        else:
-            gross_gain_stake10 = stake_fix10
-            gross_gain_liab10 = stake_from_liab10
-            pnl_stake10 = gross_gain_stake10 * (1.0 - commission_rate)
-            pnl_liab10 = gross_gain_liab10 * (1.0 - commission_rate)
-            is_green = True
+        back_pnl_stake10 = -stake_fix10
+
+    liability_from_stake10 = stake_fix10 * max(0.0, odd - 1.0)
+    liability_fix10 = 1.0
+    stake_from_liab10 = liability_fix10 / max(0.001, odd - 1.0)
+
+    if target_win_lose == 1:
+        lay_pnl_stake10 = -liability_from_stake10
+        lay_pnl_liab10 = -liability_fix10
+        lay_is_green = False
+    else:
+        lay_pnl_stake10 = stake_fix10 * (1.0 - commission_rate)
+        lay_pnl_liab10 = stake_from_liab10 * (1.0 - commission_rate)
+        lay_is_green = True
 
     raw = tf_row["raw"]
-    # Helpers seguros para obter volumes dos Top1/2/3
-    def _vol_for(name_raw: object) -> float:
-        name = clean_horse_name(str(name_raw)) if isinstance(name_raw, (str,)) else ""
-        return next((v for n, v, _ in triples if n == name), 0.0)
 
-    out = {
+    def _vol_for(name_raw: object) -> float:
+        name = clean_horse_name(str(name_raw)) if isinstance(name_raw, str) else ""
+        return next((v for runner_name, v, _ in triples if runner_name == name), 0.0)
+
+    base = {
         "date": race_iso.split("T")[0],
         "track_name": raw.get("track_name", ""),
         "race_time_iso": race_iso,
@@ -579,34 +624,73 @@ def _calc_signals_for_race(
         "second_name_by_volume": second[0],
         "third_name_by_volume": third[0],
         "ratio_second_over_third": round(ratio, 2),
-        # Percentual agora relativo ao volume do 2o colocado por volume
         "pct_diff_second_vs_third": round(pct_diff * 100.0, 2),
-        # Campos de alvo, diferenciando por estrategia
-        "lay_target_name": target_name_clean if strategy == "lay" else "",
-        "lay_target_bsp": round(odd, 2) if strategy == "lay" else float("nan"),
-        "back_target_name": target_name_clean if strategy == "back" else "",
-        "back_target_bsp": round(odd, 2) if strategy == "back" else float("nan"),
-        # Participacao do lider (sempre calculada com base no WIN)
+        "num_runners": int(num_runners),
+        "total_matched_volume": round(total_vol_race, 2),
         "leader_name_by_volume": first[0],
         "leader_volume_share_pct": round(leader_share * 100.0, 2),
+        "market": market,
+        "rule": rule,
+    }
+
+    out_back = {
+        **base,
+        "entry_type": "back",
+        "back_target_name": target_name_clean,
+        "back_target_bsp": round(odd, 2),
+        "lay_target_name": "",
+        "lay_target_bsp": float("nan"),
+        "stake_fixed_10": round(stake_fix10, 2),
+        "liability_from_stake_fixed_10": 0.0,
+        "stake_for_liability_10": 0.0,
+        "liability_fixed_10": 0.0,
+        "win_lose": target_win_lose,
+        "is_green": back_is_green,
+        "pnl_stake_fixed_10": round(back_pnl_stake10, 2),
+        "pnl_liability_fixed_10": 0.0,
+        "roi_row_stake_fixed_10": round(back_pnl_stake10 / stake_fix10 if stake_fix10 > 0 else 0.0, 4),
+        "roi_row_liability_fixed_10": 0.0,
+    }
+
+    out_lay = {
+        **base,
+        "entry_type": "lay",
+        "back_target_name": "",
+        "back_target_bsp": float("nan"),
+        "lay_target_name": target_name_clean,
+        "lay_target_bsp": round(odd, 2),
         "stake_fixed_10": round(stake_fix10, 2),
         "liability_from_stake_fixed_10": round(liability_from_stake10, 2),
         "stake_for_liability_10": round(stake_from_liab10, 2),
         "liability_fixed_10": round(liability_fix10, 2),
         "win_lose": target_win_lose,
-        "is_green": is_green,
-        "pnl_stake_fixed_10": round(pnl_stake10, 2),
-        "pnl_liability_fixed_10": round(pnl_liab10, 2),
-        # ROI: para lay usa liability; para back usa stake
-        "roi_row_stake_fixed_10": round((pnl_stake10 / (liability_from_stake10 if strategy == "lay" else stake_fix10)) if (liability_from_stake10 if strategy == "lay" else stake_fix10) > 0 else 0.0, 4),
-        "roi_row_liability_fixed_10": round((pnl_liab10 / liability_fix10) if liability_fix10 > 0 else 0.0, 4),
-        "market": market,
-        "strategy": strategy,
+        "is_green": lay_is_green,
+        "pnl_stake_fixed_10": round(lay_pnl_stake10, 2),
+        "pnl_liability_fixed_10": round(lay_pnl_liab10, 2),
+        "roi_row_stake_fixed_10": round(
+            lay_pnl_stake10 / liability_from_stake10 if liability_from_stake10 > 0 else 0.0,
+            4,
+        ),
+        "roi_row_liability_fixed_10": round(
+            lay_pnl_liab10 / liability_fix10 if liability_fix10 > 0 else 0.0,
+            4,
+        ),
     }
-    return out
+
+    return [out_back, out_lay]
 
 
-def generate_signals(source: str = "top3", market: str = "win", strategy: str = "lay", leader_share_min: float = 0.5, provider: str = "timeform") -> pd.DataFrame:
+def generate_signals(
+    source: str = "top3",
+    market: str = "win",
+    rule: str = "terceiro_queda50",
+    entry_type: str = "both",
+    provider: str = "timeform",
+    leader_share_min: float = 0.5,
+    strategy: str | None = None,
+) -> pd.DataFrame:
+    if strategy:
+        entry_type = strategy
     bf_win_index = load_betfair_win()
     bf_place_index = load_betfair_place() if market == "place" else None
     if provider == "sportinglife":
@@ -622,46 +706,61 @@ def generate_signals(source: str = "top3", market: str = "win", strategy: str = 
 
     signals: List[dict] = []
     for row in tf_rows:
-        result = _calc_signals_for_race(row, bf_win_index, bf_place_index, market=market, strategy=strategy, leader_share_min=leader_share_min)
-        if result:
-            signals.append(result)
+        results = _calc_signals_for_race(
+            row,
+            bf_win_index,
+            bf_place_index,
+            market=market,
+            rule=rule,
+            leader_share_min=leader_share_min,
+        )
+        for res in results:
+            if entry_type == "both" or res.get("entry_type") == entry_type:
+                signals.append(res)
 
     df = pd.DataFrame(signals)
-    logger.info("Sinais encontrados (provider={}, source={}, market={}, strategy={}, leader_share_min={}): {}", provider, source, market, strategy, leader_share_min, len(df))
+    logger.info(
+        "Sinais encontrados (provider={}, source={}, market={}, rule={}, entry_type={}, leader_share_min={}): {}",
+        provider,
+        source,
+        market,
+        rule,
+        entry_type,
+        leader_share_min,
+        len(df),
+    )
+    try:
+        parquet_path = _signals_snapshot_path(
+            source=source,
+            market=market,
+            rule=rule,
+            provider=provider,
+        )
+        _ensure_dir(parquet_path.parent)
+        df.to_parquet(parquet_path, index=False)
+        logger.info("Parquet de sinais salvo: {} ({} linhas)", parquet_path, len(df))
+    except Exception as e:
+        logger.error("Falha ao salvar Parquet de sinais para horses: {}", e)
     return df
 
 
-def write_signals_csv(df: pd.DataFrame, source: str = "top3", market: str = "win", strategy: str = "lay", provider: str = "timeform") -> Path:
-    base_dir = settings.DATA_DIR / "signals"
-    if provider == "sportinglife":
-        out_dir = base_dir / "sportinglife"
-    else:
-        out_dir = base_dir
-    _ensure_dir(out_dir)
-    if strategy == "back":
-        if source == "forecast" and market == "place":
-            name = "back_signals_forecast_place.csv"
-        elif source == "forecast":
-            name = "back_signals_forecast.csv"
-        elif market == "place":
-            name = "back_signals_place.csv"
-        else:
-            name = "back_signals.csv"
-    else:
-        if source == "forecast" and market == "place":
-            name = "lay_signals_forecast_place.csv"
-        elif source == "forecast":
-            name = "lay_signals_forecast.csv"
-        elif market == "place":
-            name = "lay_signals_place.csv"
-        else:
-            name = "lay_signals.csv"
-    out_path = out_dir / name
+def write_signals_csv(
+    df: pd.DataFrame,
+    source: str = "top3",
+    market: str = "win",
+    rule: str = "terceiro_queda50",
+    provider: str = "timeform",
+) -> Path:
+    out_path = _signals_raw_path(source=source, market=market, rule=rule, provider=provider)
+    _ensure_dir(out_path.parent)
     df = df.copy()
     df["source"] = source
     df["market"] = market
-    df["strategy"] = strategy
+    df["rule"] = rule
     df["provider"] = provider
+    for col in ["num_runners", "total_matched_volume"]:
+        if col not in df.columns:
+            df[col] = pd.NA
     if df.empty:
         # cria CSV vazio com cabecalhos padrao
         df_sorted = pd.DataFrame([], columns=[
@@ -670,6 +769,7 @@ def write_signals_csv(df: pd.DataFrame, source: str = "top3", market: str = "win
             "vol_top1","vol_top2","vol_top3",
             "second_name_by_volume","third_name_by_volume",
             "ratio_second_over_third","pct_diff_second_vs_third",
+            "num_runners","total_matched_volume",
             "lay_target_name","lay_target_bsp",
             "back_target_name","back_target_bsp",
             "leader_name_by_volume","leader_volume_share_pct",
@@ -677,11 +777,23 @@ def write_signals_csv(df: pd.DataFrame, source: str = "top3", market: str = "win
             "stake_for_liability_10","liability_fixed_10",
             "win_lose","is_green","pnl_stake_fixed_10","pnl_liability_fixed_10",
             "roi_row_stake_fixed_10","roi_row_liability_fixed_10",
-            "source","market","strategy",
+            "source","market","rule","provider","entry_type",
         ])
     else:
-        df_sorted = df.sort_values(["date", "track_name", "race_time_iso"]).reset_index(drop=True)
+        df_sorted = df.sort_values(["date", "track_name", "race_time_iso", "entry_type"]).reset_index(drop=True)
     df_sorted.to_csv(out_path, index=False, encoding=settings.CSV_ENCODING)
+    try:
+        parquet_path = _signals_snapshot_path(
+            source=source,
+            market=market,
+            rule=rule,
+            provider=provider,
+        )
+        _ensure_dir(parquet_path.parent)
+        df_sorted.to_parquet(parquet_path, index=False)
+        logger.info("Parquet de sinais processados salvo: {} ({} linhas)", parquet_path, len(df_sorted))
+    except Exception as e:
+        logger.error("Falha ao salvar Parquet processado de sinais para horses: {}", e)
     logger.info("Gerado: {} ({} linhas)", out_path, len(df_sorted))
     return out_path
 
