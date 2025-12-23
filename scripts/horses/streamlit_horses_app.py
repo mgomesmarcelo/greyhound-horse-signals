@@ -1656,7 +1656,7 @@ def main() -> None:
                     )
                     zero_line_n = alt.Chart(nd).mark_rule(color="red", strokeWidth=1).encode(y=alt.datum(0))
                     chart_nr = alt.layer(zero_line_n, base_nr).facet(
-                        facet=alt.Facet("nr_title:N", sort=NR_BUCKET_LABELS, header=alt.Header(title="")),
+                        facet=alt.Facet("nr_bucket:N", sort=NR_BUCKET_LABELS, header=alt.Header(title="")),
                         columns=4,
                     )
                     st.altair_chart(chart_nr.configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
@@ -1678,7 +1678,7 @@ def main() -> None:
                     )
                     zero_line_n = alt.Chart(nd).mark_rule(color="red", strokeWidth=1).encode(y=alt.datum(0))
                     chart_nr = alt.layer(zero_line_n, base_nr).facet(
-                        facet=alt.Facet("nr_title:N", sort=NR_BUCKET_LABELS, header=alt.Header(title="")),
+                        facet=alt.Facet("nr_bucket:N", sort=NR_BUCKET_LABELS, header=alt.Header(title="")),
                         columns=4,
                     )
                     st.altair_chart(chart_nr.configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
