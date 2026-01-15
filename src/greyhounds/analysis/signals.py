@@ -410,28 +410,41 @@ def _calc_signals_for_race(
         else float(target_bsp_win or 0.0)
     )
 
-    stake_fix10 = 10.0
+    # Nova referência: 1 unidade (mantemos colunas _fixed_10 por compatibilidade)
+    stake_ref = 1.0
+    liability_ref = 1.0
+    legacy_scale = 10.0  # TODO: descontinuar colunas *_fixed_10 após migração completa
     commission_rate = 0.065
 
+    # BACK - referência 1
     back_is_green = target_win_lose == 1
     if back_is_green:
-        back_profit_gross = stake_fix10 * max(0.0, odd - 1.0)
-        back_pnl_stake10 = back_profit_gross * (1.0 - commission_rate)
+        back_profit_gross_ref = stake_ref * max(0.0, odd - 1.0)
+        back_pnl_stake_ref = back_profit_gross_ref * (1.0 - commission_rate)
     else:
-        back_pnl_stake10 = -stake_fix10
+        back_pnl_stake_ref = -stake_ref
 
-    liability_from_stake10 = stake_fix10 * max(0.0, odd - 1.0)
-    liability_fix10 = 10.0
-    stake_from_liab10 = liability_fix10 / max(0.001, odd - 1.0)
+    # LAY - referência 1
+    liability_from_stake_ref = stake_ref * max(0.0, odd - 1.0)
+    stake_from_liab_ref = liability_ref / max(0.001, odd - 1.0)
 
     if target_win_lose == 1:
-        lay_pnl_stake10 = -liability_from_stake10
-        lay_pnl_liab10 = -liability_fix10
+        lay_pnl_stake_ref = -liability_from_stake_ref
+        lay_pnl_liab_ref = -liability_ref
         lay_is_green = False
     else:
-        lay_pnl_stake10 = stake_fix10 * (1.0 - commission_rate)
-        lay_pnl_liab10 = stake_from_liab10 * (1.0 - commission_rate)
+        lay_pnl_stake_ref = stake_ref * (1.0 - commission_rate)
+        lay_pnl_liab_ref = stake_from_liab_ref * (1.0 - commission_rate)
         lay_is_green = True
+
+    # Colunas legado (x10) preservadas
+    stake_fix10 = stake_ref * legacy_scale
+    liability_fix10 = liability_ref * legacy_scale
+    liability_from_stake10 = liability_from_stake_ref * legacy_scale
+    stake_from_liab10 = stake_from_liab_ref * legacy_scale
+    back_pnl_stake10 = back_pnl_stake_ref * legacy_scale
+    lay_pnl_stake10 = lay_pnl_stake_ref * legacy_scale
+    lay_pnl_liab10 = lay_pnl_liab_ref * legacy_scale
 
     raw = tf_row["raw"]
 
@@ -469,6 +482,17 @@ def _calc_signals_for_race(
         "back_target_bsp": round(odd, 2),
         "lay_target_name": "",
         "lay_target_bsp": float("nan"),
+        # Referência 1
+        "stake_ref": round(stake_ref, 2),
+        "liability_from_stake_ref": 0.0,
+        "stake_for_liability_ref": 0.0,
+        "liability_ref": 0.0,
+        "pnl_stake_ref": round(back_pnl_stake_ref, 4),
+        "pnl_liability_ref": 0.0,
+        "roi_row_stake_ref": round(back_pnl_stake_ref / stake_ref if stake_ref > 0 else 0.0, 4),
+        "roi_row_liability_ref": 0.0,
+        "roi_row_exposure_ref": 0.0,
+        # Legado (x10) - TODO: remover *_fixed_10 após migração
         "stake_fixed_10": round(stake_fix10, 2),
         "liability_from_stake_fixed_10": 0.0,
         "stake_for_liability_10": 0.0,
@@ -479,6 +503,7 @@ def _calc_signals_for_race(
         "pnl_liability_fixed_10": 0.0,
         "roi_row_stake_fixed_10": round(back_pnl_stake10 / stake_fix10 if stake_fix10 > 0 else 0.0, 4),
         "roi_row_liability_fixed_10": 0.0,
+        "roi_row_exposure_fixed_10": 0.0,
     }
 
     out_lay = {
@@ -488,6 +513,26 @@ def _calc_signals_for_race(
         "back_target_bsp": float("nan"),
         "lay_target_name": target_name_clean,
         "lay_target_bsp": round(odd, 2),
+        # Referência 1
+        "stake_ref": round(stake_ref, 2),
+        "liability_from_stake_ref": round(liability_from_stake_ref, 4),
+        "stake_for_liability_ref": round(stake_from_liab_ref, 4),
+        "liability_ref": round(liability_ref, 2),
+        "pnl_stake_ref": round(lay_pnl_stake_ref, 4),
+        "pnl_liability_ref": round(lay_pnl_liab_ref, 4),
+        "roi_row_stake_ref": round(
+            lay_pnl_stake_ref / stake_ref if stake_ref > 0 else 0.0,
+            4,
+        ),
+        "roi_row_liability_ref": round(
+            lay_pnl_liab_ref / liability_ref if liability_ref > 0 else 0.0,
+            4,
+        ),
+        "roi_row_exposure_ref": round(
+            lay_pnl_stake_ref / liability_from_stake_ref if liability_from_stake_ref > 0 else 0.0,
+            4,
+        ),
+        # Legado (x10) - TODO: remover *_fixed_10 após migração
         "stake_fixed_10": round(stake_fix10, 2),
         "liability_from_stake_fixed_10": round(liability_from_stake10, 2),
         "stake_for_liability_10": round(stake_from_liab10, 2),
@@ -497,11 +542,15 @@ def _calc_signals_for_race(
         "pnl_stake_fixed_10": round(lay_pnl_stake10, 2),
         "pnl_liability_fixed_10": round(lay_pnl_liab10, 2),
         "roi_row_stake_fixed_10": round(
-            lay_pnl_stake10 / liability_from_stake10 if liability_from_stake10 > 0 else 0.0,
+            lay_pnl_stake10 / stake_fix10 if stake_fix10 > 0 else 0.0,
             4,
         ),
         "roi_row_liability_fixed_10": round(
             lay_pnl_liab10 / liability_fix10 if liability_fix10 > 0 else 0.0,
+            4,
+        ),
+        "roi_row_exposure_fixed_10": round(
+            lay_pnl_stake10 / liability_from_stake10 if liability_from_stake10 > 0 else 0.0,
             4,
         ),
     }
@@ -597,6 +646,15 @@ def write_signals_csv(
                 "leader_name_by_volume",
                 "leader_volume_share_pct",
                 "total_matched_volume",
+                "stake_ref",
+                "liability_from_stake_ref",
+                "stake_for_liability_ref",
+                "liability_ref",
+                "pnl_stake_ref",
+                "pnl_liability_ref",
+                "roi_row_stake_ref",
+                "roi_row_liability_ref",
+                "roi_row_exposure_ref",
                 "stake_fixed_10",
                 "liability_from_stake_fixed_10",
                 "stake_for_liability_10",
@@ -607,6 +665,7 @@ def write_signals_csv(
                 "pnl_liability_fixed_10",
                 "roi_row_stake_fixed_10",
                 "roi_row_liability_fixed_10",
+                "roi_row_exposure_fixed_10",
                 "source",
                 "market",
                 "rule",

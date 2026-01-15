@@ -17,6 +17,10 @@ sys.path.append(str(PROJECT_ROOT))
 from src.greyhounds.config import settings
 from src.greyhounds.config import RULE_LABELS, RULE_LABELS_INV, ENTRY_TYPE_LABELS, SOURCE_LABELS, SOURCE_LABELS_INV
 from src.greyhounds.utils.text import normalize_track_name
+from scripts.greyhounds.units_helper import get_ref_factor, get_scale, get_col, to_bool_series
+
+# Fator de referência global (definido em tempo de execução com base no dataset carregado).
+_REF_FACTOR: float = 10.0
 
 
 def _iter_result_paths(pattern: str) -> List[Path]:
@@ -173,42 +177,60 @@ def _compute_summary_metrics(df_block: pd.DataFrame, entry_kind: str, base_amoun
     if df_block is None or df_block.empty:
         return metrics
 
-    scale_factor = base_amount / 10.0
+    ref_factor = _REF_FACTOR if _REF_FACTOR else get_ref_factor(df_block)
+    scale_factor = get_scale(base_amount, ref_factor)
     metrics["tracks"] = int(df_block["track_name"].nunique())
     metrics["signals"] = int(len(df_block))
     metrics["greens"] = int((df_block["is_green"] == True).sum())
     metrics["reds"] = int(metrics["signals"] - metrics["greens"])
+    metrics["accuracy"] = (metrics["greens"] / metrics["signals"]) if metrics["signals"] > 0 else 0.0
 
     if entry_kind == "lay":
         metrics["avg_bsp"] = float(df_block["lay_target_bsp"].mean())
     else:
         metrics["avg_bsp"] = float(df_block["back_target_bsp"].mean())
-    metrics["accuracy"] = (metrics["greens"] / metrics["signals"]) if metrics["signals"] > 0 else 0.0
 
-    if entry_kind == "lay":
-        total_base_stake10 = float(df_block["liability_from_stake_fixed_10"].sum())
-    else:
-        total_base_stake10 = 10.0 * metrics["signals"]
-    total_pnl_stake10 = float(df_block["pnl_stake_fixed_10"].sum())
-    metrics["base_stake"] = total_base_stake10 * scale_factor
-    metrics["pnl_stake"] = total_pnl_stake10 * scale_factor
+    # Séries canônicas
+    stake_series = get_col(df_block, "stake_ref", "stake_fixed_10")
+    pnl_stake_series = get_col(df_block, "pnl_stake_ref", "pnl_stake_fixed_10")
+
+    liability_series = get_col(df_block, "liability_ref", "liability_fixed_10")
+    pnl_liab_series = get_col(df_block, "pnl_liability_ref", "pnl_liability_fixed_10") if entry_kind == "lay" else None
+
+    exposure_series = get_col(df_block, "liability_from_stake_ref", "liability_from_stake_fixed_10")
+
+    # Stake ROI: PnL stake / base stake (ambos reescalados)
+    total_base_stake_raw = float(stake_series.sum())
+    total_pnl_stake_raw = float(pnl_stake_series.sum())
+    metrics["base_stake"] = total_base_stake_raw * scale_factor
+    metrics["pnl_stake"] = total_pnl_stake_raw * scale_factor
     metrics["roi_stake"] = (metrics["pnl_stake"] / metrics["base_stake"]) if metrics["base_stake"] > 0 else 0.0
 
+    # ROI exposição (PnL stake / liability derivada da stake) – opcional, mantido como campo separado
+    total_exposure_raw = float(exposure_series.sum())
+    metrics["roi_stake_exposure"] = (metrics["pnl_stake"] / (total_exposure_raw * scale_factor)) if total_exposure_raw > 0 else 0.0
+
     ordered = df_block.sort_values("race_time_iso")
-    cumulative_stake = (ordered["pnl_stake_fixed_10"] * scale_factor).cumsum()
+    cumulative_stake = (get_col(ordered, "pnl_stake_ref", "pnl_stake_fixed_10") * scale_factor).cumsum()
     metrics["min_pnl_stake"] = float(cumulative_stake.min()) if not cumulative_stake.empty else 0.0
     metrics["drawdown_stake"] = _calc_drawdown(cumulative_stake)
 
     if entry_kind == "lay":
-        metrics["stake_liab"] = float(df_block["stake_for_liability_10"].sum()) * scale_factor
-        total_pnl_liab10 = float(df_block["pnl_liability_fixed_10"].sum())
-        metrics["pnl_liab"] = total_pnl_liab10 * scale_factor
-        metrics["roi_liab"] = (metrics["pnl_liab"] / (base_amount * metrics["signals"])) if metrics["signals"] > 0 and base_amount > 0 else 0.0
+        # Liability ROI: PnL liability / base liability (ambos reescalados)
+        total_base_liab_raw = float(liability_series.sum())
+        metrics["stake_liab"] = total_base_liab_raw * scale_factor
+        total_pnl_liab_raw = float(pnl_liab_series.sum()) if pnl_liab_series is not None else 0.0
+        metrics["pnl_liab"] = total_pnl_liab_raw * scale_factor
+        metrics["roi_liab"] = (metrics["pnl_liab"] / metrics["stake_liab"]) if metrics["stake_liab"] > 0 else 0.0
 
-        cumulative_liab = (ordered["pnl_liability_fixed_10"] * scale_factor).cumsum()
+        cumulative_liab = (get_col(ordered, "pnl_liability_ref", "pnl_liability_fixed_10") * scale_factor).cumsum()
         metrics["min_pnl_liab"] = float(cumulative_liab.min()) if not cumulative_liab.empty else 0.0
         metrics["drawdown_liab"] = _calc_drawdown(cumulative_liab)
     return metrics
+
+# Teste rápido de assertividade esperado:
+# signals=10, greens=6 -> accuracy=0.6 -> 60.00%
+# signals=0, greens=0 -> accuracy=0.0 -> 0.00%
 
 
 def _format_month_label(ts: pd.Timestamp) -> str:
@@ -220,13 +242,13 @@ def _format_month_label(ts: pd.Timestamp) -> str:
 
 
 def _render_base_amount_input() -> float:
-    """Campo único para definir a base de Stake/Liab, usado em todos os modos."""
+    """Campo único para definir unidades por aposta (% da banca)."""
     if "base_amount" not in st.session_state:
         st.session_state["base_amount"] = 1.00
     col_base, _ = st.columns([1, 6])
     with col_base:
         val = st.number_input(
-            "Valor base (Stake e Liability)",
+            "Unidades por aposta (% da banca)",
             min_value=0.01,
             max_value=100000.0,
             value=float(st.session_state["base_amount"]),
@@ -234,9 +256,9 @@ def _render_base_amount_input() -> float:
             format="%.2f",
             key="base_amount",
             label_visibility="collapsed",
-            help="Padrão: 1 (1 unidade da banca). Ajuste para reescalar PnL/ROI/drawdown.",
+            help="1 unidade = 1% da banca por aposta; 10 unidades = 10% por aposta.",
         )
-        st.caption("Stake/Liab base (padrão: 1 unidade da banca)")
+        st.caption("1 unidade = 1% da banca; 10 unidades = 10%")
     return float(val)
 
 
@@ -359,15 +381,18 @@ def main() -> None:
         if df_block.empty or "race_time_iso" not in df_block.columns:
             return
         base_amount = float(st.session_state.get("base_amount", 1.0))
-        scale_factor = base_amount / 10.0
+        ref_factor = _REF_FACTOR
+        scale_factor = get_scale(base_amount, ref_factor)
         plot = df_block.copy()
         plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
         plot = plot.dropna(subset=["ts"]).sort_values("ts")
         if plot.empty:
             return
+        plot["_pnl_stake"] = get_col(plot, "pnl_stake_ref", "pnl_stake_fixed_10")
+        plot["_pnl_liab"] = get_col(plot, "pnl_liability_ref", "pnl_liability_fixed_10")
         plot["date_only"] = plot["ts"].dt.date
         daily = (
-            plot.groupby("date_only", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]]
+            plot.groupby("date_only", as_index=False)[["_pnl_stake", "_pnl_liab"]]
             .sum()
             .sort_values("date_only")
         )
@@ -375,12 +400,12 @@ def main() -> None:
         wd_order = [0, 1, 2, 3, 4, 5, 6]
         wd_names = {0: "Seg", 1: "Ter", 2: "Qua", 3: "Qui", 4: "Sex", 5: "Sab", 6: "Dom"}
         wd_order_names = [wd_names[w] for w in wd_order]
-        by_wd = daily.groupby("weekday", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]].sum()
+        by_wd = daily.groupby("weekday", as_index=False)[["_pnl_stake", "_pnl_liab"]].sum()
         by_wd["weekday_name"] = by_wd["weekday"].map(wd_names)
         by_wd["weekday_name"] = pd.Categorical(by_wd["weekday_name"], categories=wd_order_names, ordered=True)
-        by_wd["pnl_stake"] = by_wd["pnl_stake_fixed_10"] * scale_factor
+        by_wd["pnl_stake"] = by_wd["_pnl_stake"] * scale_factor
         if entry_kind == "lay":
-            by_wd["pnl_liab"] = by_wd["pnl_liability_fixed_10"] * scale_factor
+            by_wd["pnl_liab"] = by_wd["_pnl_liab"] * scale_factor
 
         zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
         bar_stake = (
@@ -495,6 +520,9 @@ def main() -> None:
     if df.empty:
         st.info("Nenhum sinal encontrado para a selecao. Gere antes com: python scripts/greyhounds/generate_greyhound_signals.py --source {src} --market {mkt} --rule {rule} --entry_type both".format(src=source, mkt=market, rule=rule))
         return
+
+    global _REF_FACTOR
+    _REF_FACTOR = get_ref_factor(df)
 
     df_filtered = df.copy()
     if "total_matched_volume" not in df_filtered.columns:
@@ -997,7 +1025,8 @@ def main() -> None:
 
     def render_block(title_suffix: str, df_block: pd.DataFrame, entry_kind: str) -> None:
         base_amount = float(st.session_state.get("base_amount", 1.0))
-        scale_factor = base_amount / 10.0
+        ref_factor = _REF_FACTOR
+        scale_factor = get_scale(base_amount, ref_factor)
         summary = _compute_summary_metrics(df_block, entry_kind, base_amount)
 
         st.subheader(title_suffix)
@@ -1086,12 +1115,14 @@ def main() -> None:
         if not plot.empty:
             plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
             plot = plot.dropna(subset=["ts"]).sort_values("ts")
+            plot["_pnl_stake"] = get_col(plot, "pnl_stake_ref", "pnl_stake_fixed_10")
+            plot["_pnl_liab"] = get_col(plot, "pnl_liability_ref", "pnl_liability_fixed_10")
 
             if x_axis_mode == "Dia":
                 plot["date_only"] = plot["ts"].dt.date
-                daily = plot.groupby("date_only", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]].sum().sort_values("date_only")
-                daily["cum_stake"] = (daily["pnl_stake_fixed_10"] * scale_factor).cumsum()
-                daily["cum_liab"] = (daily["pnl_liability_fixed_10"] * scale_factor).cumsum()
+                daily = plot.groupby("date_only", as_index=False)[["_pnl_stake", "_pnl_liab"]].sum().sort_values("date_only")
+                daily["cum_stake"] = (daily["_pnl_stake"] * scale_factor).cumsum()
+                daily["cum_liab"] = (daily["_pnl_liab"] * scale_factor).cumsum()
                 with st.expander("Evolucao Stake (PnL acumulado por dia)", expanded=False):
                     zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
                     ch = (
@@ -1118,9 +1149,9 @@ def main() -> None:
             else:
                 # Evolucao por sequencia de apostas (ordem temporal)
                 plot["bet_idx"] = range(1, len(plot) + 1)
-                plot["cum_stake"] = (plot["pnl_stake_fixed_10"] * scale_factor).cumsum()
+                plot["cum_stake"] = (plot["_pnl_stake"] * scale_factor).cumsum()
                 if entry_kind == "lay":
-                    plot["cum_liab"] = (plot["pnl_liability_fixed_10"] * scale_factor).cumsum()
+                    plot["cum_liab"] = (plot["_pnl_liab"] * scale_factor).cumsum()
                 with st.expander("Evolucao Stake (PnL acumulado por bet)", expanded=False):
                     zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
                     ch = (
@@ -1152,6 +1183,9 @@ def main() -> None:
         _render_monthly_table(df_block, entry_kind)
 
         # Tabela
+        def _pref(ref_name: str, legacy_name: str) -> str:
+            return ref_name if ref_name in df_block.columns else legacy_name
+
         show_cols = [
             "date", "track_name", "category_token", "race_time_iso",
             "num_runners", "total_matched_volume",
@@ -1160,20 +1194,29 @@ def main() -> None:
             "second_name_by_volume", "third_name_by_volume",
             "pct_diff_second_vs_third",
         ]
+        stake_col = _pref("stake_ref", "stake_fixed_10")
+        pnl_stake_col = _pref("pnl_stake_ref", "pnl_stake_fixed_10")
+        roi_stake_col = _pref("roi_row_stake_ref", "roi_row_stake_fixed_10")
         if entry_kind == "lay":
+            liab_from_stake_col = _pref("liability_from_stake_ref", "liability_from_stake_fixed_10")
+            stake_for_liab_col = _pref("stake_for_liability_ref", "stake_for_liability_10")
+            liab_col = _pref("liability_ref", "liability_fixed_10")
+            pnl_liab_col = _pref("pnl_liability_ref", "pnl_liability_fixed_10")
+            roi_liab_col = _pref("roi_row_liability_ref", "roi_row_liability_fixed_10")
+            roi_expo_col = _pref("roi_row_exposure_ref", "roi_row_exposure_fixed_10")
             show_cols += [
                 "lay_target_name", "lay_target_bsp",
-                "stake_fixed_10", "liability_from_stake_fixed_10",
-                "stake_for_liability_10", "liability_fixed_10",
-                "win_lose", "is_green", "pnl_stake_fixed_10", "pnl_liability_fixed_10",
-                "roi_row_stake_fixed_10", "roi_row_liability_fixed_10",
+                stake_col, liab_from_stake_col,
+                stake_for_liab_col, liab_col,
+                "win_lose", "is_green", pnl_stake_col, pnl_liab_col,
+                roi_stake_col, roi_liab_col, roi_expo_col,
             ]
         else:
             show_cols += [
                 "back_target_name", "back_target_bsp",
-                "stake_fixed_10",
-                "win_lose", "is_green", "pnl_stake_fixed_10",
-                "roi_row_stake_fixed_10",
+                stake_col,
+                "win_lose", "is_green", pnl_stake_col,
+                roi_stake_col,
             ]
         missing = [c for c in show_cols if c not in df_block.columns]
         for c in missing:
@@ -1229,14 +1272,42 @@ def main() -> None:
 
         monthly_df = pd.DataFrame(rows)
         if not monthly_df.empty:
-            monthly_df = monthly_df.sort_values("_period").drop(columns=["_period"], errors="ignore")
+            monthly_df = monthly_df.sort_values("_period")
+            # ROI mensal já presente (stake/liab). Agora adicionamos tendências.
+            monthly_df["base_cum"] = monthly_df["Base (Stake)"].cumsum()
+            monthly_df["pnl_cum"] = monthly_df["PnL Stake"].cumsum()
+            monthly_df["ROI Stake (acum)"] = monthly_df.apply(
+                lambda r: (r["pnl_cum"] / r["base_cum"]) if r["base_cum"] > 0 else 0.0,
+                axis=1,
+            )
+            monthly_df["base_3m"] = monthly_df["Base (Stake)"].rolling(window=3, min_periods=1).sum()
+            monthly_df["pnl_3m"] = monthly_df["PnL Stake"].rolling(window=3, min_periods=1).sum()
+            monthly_df["ROI Stake (3M)"] = monthly_df.apply(
+                lambda r: (r["pnl_3m"] / r["base_3m"]) if r["base_3m"] > 0 else 0.0,
+                axis=1,
+            )
+            if entry_kind == "lay" and "Stake (Liability)" in monthly_df.columns:
+                monthly_df["base_liab_cum"] = monthly_df["Stake (Liability)"].cumsum()
+                monthly_df["pnl_liab_cum"] = monthly_df["PnL Liability"].cumsum()
+                monthly_df["ROI Liability (acum)"] = monthly_df.apply(
+                    lambda r: (r["pnl_liab_cum"] / r["base_liab_cum"]) if r["base_liab_cum"] > 0 else 0.0,
+                    axis=1,
+                )
+                monthly_df["base_liab_3m"] = monthly_df["Stake (Liability)"].rolling(window=3, min_periods=1).sum()
+                monthly_df["pnl_liab_3m"] = monthly_df["PnL Liability"].rolling(window=3, min_periods=1).sum()
+                monthly_df["ROI Liability (3M)"] = monthly_df.apply(
+                    lambda r: (r["pnl_liab_3m"] / r["base_liab_3m"]) if r["base_liab_3m"] > 0 else 0.0,
+                    axis=1,
+                )
+            monthly_df = monthly_df.drop(columns=["_period"], errors="ignore")
         month_order = monthly_df["Mes/Ano"].tolist() if not monthly_df.empty else []
         with st.expander(f"Relatorio mensal ({entry_kind.upper()})", expanded=False):
-            st.dataframe(monthly_df, use_container_width=True)
+            st.dataframe(monthly_df.style.format({"Assertividade": "{:.2%}"}), use_container_width=True)
             chart_data = working.copy()
             chart_data["date_only"] = chart_data["race_ts"].dt.date
+            chart_data["_pnl_stake"] = get_col(chart_data, "pnl_stake_ref", "pnl_stake_fixed_10")
             daily_raw = (
-                chart_data.groupby(["month_label", "month_period", "date_only"], as_index=False)[["pnl_stake_fixed_10"]]
+                chart_data.groupby(["month_label", "month_period", "date_only"], as_index=False)[["_pnl_stake"]]
                 .sum()
                 .sort_values("date_only")
             )
@@ -1251,16 +1322,17 @@ def main() -> None:
                     end_date = grp["date_only"].max()
                 full_dates = pd.date_range(start_date, end_date, freq="D").date
                 base = pd.DataFrame({"date_only": full_dates})
-                merged = base.merge(grp[["date_only", "pnl_stake_fixed_10"]], on="date_only", how="left")
+                merged = base.merge(grp[["date_only", "_pnl_stake"]], on="date_only", how="left")
                 merged["month_label"] = mlabel
-                merged["pnl_stake_fixed_10"] = merged["pnl_stake_fixed_10"].fillna(0)
+                merged["_pnl_stake"] = merged["_pnl_stake"].fillna(0)
                 filled_frames.append(merged)
             daily = pd.concat(filled_frames, ignore_index=True) if filled_frames else pd.DataFrame()
             daily = daily[daily["month_label"].notna()]
             if daily.empty:
                 st.info("Sem dados suficientes para gerar os gráficos mensais.")
             else:
-                daily["cum_stake"] = daily.groupby("month_label")["pnl_stake_fixed_10"].cumsum() * (base_amount / 10.0)
+                local_scale = get_scale(base_amount, _REF_FACTOR)
+                daily["cum_stake"] = daily.groupby("month_label")["_pnl_stake"].cumsum() * local_scale
                 month_sort = month_order or list(daily["month_label"].unique())
                 col_count = min(4, max(1, len(month_sort)))
                 zero_line = alt.Chart().mark_rule(color="red", strokeWidth=1).encode(y=alt.datum(0))
@@ -1317,7 +1389,7 @@ def main() -> None:
 
         # Recalcula fatores apos possivel alteracao do input
         base_amount = float(st.session_state.get("base_amount", 1.0))
-        scale_factor = base_amount / 10.0
+        scale_factor = get_scale(base_amount, _REF_FACTOR)
         summary = _compute_summary_metrics(filt, entry_type, base_amount)
         total_base_stake = summary["base_stake"]
         total_pnl_stake = summary["pnl_stake"]
@@ -1388,15 +1460,17 @@ def main() -> None:
             plot = plot.dropna(subset=["ts"]).sort_values("ts")
             # Sempre calcula agregacao diaria para uso em graficos semanais, mesmo quando o eixo X e "Bet"
             plot["date_only"] = plot["ts"].dt.date
-            daily = plot.groupby("date_only", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]].sum().sort_values("date_only")
-            daily["cum_stake"] = (daily["pnl_stake_fixed_10"] * scale_factor).cumsum()
-            daily["cum_liab"] = (daily["pnl_liability_fixed_10"] * scale_factor).cumsum()
+            plot["_pnl_stake"] = get_col(plot, "pnl_stake_ref", "pnl_stake_fixed_10")
+            plot["_pnl_liab"] = get_col(plot, "pnl_liability_ref", "pnl_liability_fixed_10")
+            daily = plot.groupby("date_only", as_index=False)[["_pnl_stake", "_pnl_liab"]].sum().sort_values("date_only")
+            daily["cum_stake"] = (daily["_pnl_stake"] * scale_factor).cumsum()
+            daily["cum_liab"] = (daily["_pnl_liab"] * scale_factor).cumsum()
 
             if x_axis_mode == "Dia":
                 plot["date_only"] = plot["ts"].dt.date
-                daily = plot.groupby("date_only", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]].sum().sort_values("date_only")
-                daily["cum_stake"] = (daily["pnl_stake_fixed_10"] * scale_factor).cumsum()
-                daily["cum_liab"] = (daily["pnl_liability_fixed_10"] * scale_factor).cumsum()
+                daily = plot.groupby("date_only", as_index=False)[["_pnl_stake", "_pnl_liab"]].sum().sort_values("date_only")
+                daily["cum_stake"] = (daily["_pnl_stake"] * scale_factor).cumsum()
+                daily["cum_liab"] = (daily["_pnl_liab"] * scale_factor).cumsum()
 
                 with st.expander("Evolucao Stake (PnL acumulado por dia)", expanded=False):
                     zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
@@ -1425,8 +1499,8 @@ def main() -> None:
             else:
                 # Evolucao por sequencia de apostas (ordem temporal)
                 plot["bet_idx"] = range(1, len(plot) + 1)
-                plot["cum_stake"] = (plot["pnl_stake_fixed_10"] * scale_factor).cumsum()
-                plot["cum_liab"] = (plot["pnl_liability_fixed_10"] * scale_factor).cumsum()
+                plot["cum_stake"] = (plot["_pnl_stake"] * scale_factor).cumsum()
+                plot["cum_liab"] = (plot["_pnl_liab"] * scale_factor).cumsum()
 
                 with st.expander("Evolucao Stake (PnL acumulado por bet)", expanded=False):
                     zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
@@ -1460,6 +1534,9 @@ def main() -> None:
         _render_monthly_table(filt, entry_type)
 
         # Tabela (agregada para o tipo selecionado)
+        def _pref(ref_name: str, legacy_name: str) -> str:
+            return ref_name if ref_name in filt.columns else legacy_name
+
         show_cols = [
             "date", "track_name", "category_token", "race_time_iso",
             "num_runners", "total_matched_volume",
@@ -1467,10 +1544,11 @@ def main() -> None:
             "vol_top1", "vol_top2", "vol_top3",
             "second_name_by_volume", "third_name_by_volume",
             "lay_target_name", "lay_target_bsp",
-            "stake_fixed_10", "liability_from_stake_fixed_10",
-            "stake_for_liability_10", "liability_fixed_10",
-            "win_lose", "is_green", "pnl_stake_fixed_10", "pnl_liability_fixed_10",
-            "roi_row_stake_fixed_10", "roi_row_liability_fixed_10",
+            _pref("stake_ref", "stake_fixed_10"), _pref("liability_from_stake_ref", "liability_from_stake_fixed_10"),
+            _pref("stake_for_liability_ref", "stake_for_liability_10"), _pref("liability_ref", "liability_fixed_10"),
+            "win_lose", "is_green", _pref("pnl_stake_ref", "pnl_stake_fixed_10"), _pref("pnl_liability_ref", "pnl_liability_fixed_10"),
+            _pref("roi_row_stake_ref", "roi_row_stake_fixed_10"), _pref("roi_row_liability_ref", "roi_row_liability_fixed_10"),
+            _pref("roi_row_exposure_ref", "roi_row_exposure_fixed_10"),
             "pct_diff_second_vs_third",
         ]
         missing = [c for c in show_cols if c not in filt.columns]
@@ -1485,9 +1563,9 @@ def main() -> None:
                 "vol_top1", "vol_top2", "vol_top3",
                 "second_name_by_volume", "third_name_by_volume",
                 "back_target_name", "back_target_bsp",
-                "stake_fixed_10",
-                "win_lose", "is_green", "pnl_stake_fixed_10",
-                "roi_row_stake_fixed_10",
+                _pref("stake_ref", "stake_fixed_10"),
+                "win_lose", "is_green", _pref("pnl_stake_ref", "pnl_stake_fixed_10"),
+                _pref("roi_row_stake_ref", "roi_row_stake_fixed_10"),
                 "pct_diff_second_vs_third",
             ]
         else:
@@ -1498,10 +1576,11 @@ def main() -> None:
                 "vol_top1", "vol_top2", "vol_top3",
                 "second_name_by_volume", "third_name_by_volume",
                 "lay_target_name", "lay_target_bsp",
-                "stake_fixed_10", "liability_from_stake_fixed_10",
-                "stake_for_liability_10", "liability_fixed_10",
-                "win_lose", "is_green", "pnl_stake_fixed_10", "pnl_liability_fixed_10",
-                "roi_row_stake_fixed_10", "roi_row_liability_fixed_10",
+                _pref("stake_ref", "stake_fixed_10"), _pref("liability_from_stake_ref", "liability_from_stake_fixed_10"),
+                _pref("stake_for_liability_ref", "stake_for_liability_10"), _pref("liability_ref", "liability_fixed_10"),
+                "win_lose", "is_green", _pref("pnl_stake_ref", "pnl_stake_fixed_10"), _pref("pnl_liability_ref", "pnl_liability_fixed_10"),
+                _pref("roi_row_stake_ref", "roi_row_stake_fixed_10"), _pref("roi_row_liability_ref", "roi_row_liability_fixed_10"),
+                _pref("roi_row_exposure_ref", "roi_row_exposure_fixed_10"),
                 "pct_diff_second_vs_third",
             ]
 
@@ -1520,13 +1599,15 @@ def main() -> None:
         plot2["ts"] = pd.to_datetime(plot2["race_time_iso"], errors="coerce")
         plot2 = plot2.dropna(subset=["ts"]).sort_values("ts")
         plot2["date_only"] = plot2["ts"].dt.date
-        local_scale = float(st.session_state.get("base_amount", 1.0)) / 10.0
+        local_scale = get_scale(float(st.session_state.get("base_amount", 1.0)), _REF_FACTOR)
+        plot2["_pnl_stake"] = get_col(plot2, "pnl_stake_ref", "pnl_stake_fixed_10")
+        pnl_stake_col = "_pnl_stake"
 
         # Por pista
         if x_axis_mode == "Dia":
-            td = plot2.groupby(["track_name", "date_only"], as_index=False)[["pnl_stake_fixed_10"]].sum().sort_values("date_only")
+            td = plot2.groupby(["track_name", "date_only"], as_index=False)[["_pnl_stake"]].sum().sort_values("date_only")
             if not td.empty:
-                td["cum"] = td.groupby("track_name")["pnl_stake_fixed_10"].cumsum() * local_scale
+                td["cum"] = td.groupby("track_name")["_pnl_stake"].cumsum() * local_scale
                 track_counts = plot2.groupby("track_name", as_index=False).size().rename(columns={"size": "count"})
                 td = td.merge(track_counts, on="track_name", how="left")
                 td["count"] = td["count"].fillna(0).astype(int)
@@ -1547,7 +1628,7 @@ def main() -> None:
         else:
             # Evolucao por sequencia de apostas dentro de cada pista
             plot2["bet_idx"] = plot2.groupby("track_name").cumcount() + 1
-            plot2["cum"] = plot2.groupby("track_name")["pnl_stake_fixed_10"].cumsum() * local_scale
+            plot2["cum"] = plot2.groupby("track_name")["_pnl_stake"].cumsum() * local_scale
             td = plot2[["track_name", "bet_idx", "cum"]].copy()
             if not td.empty:
                 track_counts = plot2.groupby("track_name", as_index=False).size().rename(columns={"size": "count"})
@@ -1574,10 +1655,10 @@ def main() -> None:
             if not cd.empty:
                 cat_counts = cd.groupby("category", as_index=False).size().rename(columns={"size": "count"})
                 if x_axis_mode == "Dia":
-                    cd = cd.groupby(["category", "date_only"], as_index=False)[["pnl_stake_fixed_10"]].sum().sort_values("date_only")
+                    cd = cd.groupby(["category", "date_only"], as_index=False)[["_pnl_stake"]].sum().sort_values("date_only")
                     cd = cd.merge(cat_counts, on="category", how="left")
                     cd["count"] = cd["count"].fillna(0).astype(int)
-                    cd["cum"] = cd.groupby("category")["pnl_stake_fixed_10"].cumsum() * local_scale
+                    cd["cum"] = cd.groupby("category")["_pnl_stake"].cumsum() * local_scale
                     cd["category_title"] = cd["category"].astype(str) + " (" + cd["count"].astype(str) + ")"
                     st.subheader(f"Evolucao por categoria (PnL acumulado) - {entry_kind.upper()}")
                     base_cats = (
@@ -1595,7 +1676,7 @@ def main() -> None:
                 else:
                     # Evolucao por sequencia de apostas dentro de cada categoria
                     cd["bet_idx"] = cd.groupby("category").cumcount() + 1
-                    cd["cum"] = cd.groupby("category")["pnl_stake_fixed_10"].cumsum() * local_scale
+                    cd["cum"] = cd.groupby("category")["_pnl_stake"].cumsum() * local_scale
                     cd = cd.merge(cat_counts, on="category", how="left")
                     cd["count"] = cd["count"].fillna(0).astype(int)
                     cd["category_title"] = cd["category"].astype(str) + " (" + cd["count"].astype(str) + ")"
@@ -1627,10 +1708,10 @@ def main() -> None:
                     return ((m2.group(1) if m2 else str(x)), 0)
                 ordered_tokens = sorted(sub_counts["category_token"].astype(str).unique().tolist(), key=_subkey)
                 if x_axis_mode == "Dia":
-                    sd = sd.groupby(["category_token", "date_only"], as_index=False)[["pnl_stake_fixed_10"]].sum().sort_values("date_only")
+                    sd = sd.groupby(["category_token", "date_only"], as_index=False)[[pnl_stake_col]].sum().sort_values("date_only")
                     sd = sd.merge(sub_counts, on="category_token", how="left")
                     sd["count"] = sd["count"].fillna(0).astype(int)
-                    sd["cum"] = sd.groupby("category_token")["pnl_stake_fixed_10"].cumsum() * local_scale
+                    sd["cum"] = sd.groupby("category_token")[pnl_stake_col].cumsum() * local_scale
                     sd["subcat_title"] = sd["category_token"].astype(str) + " (" + sd["count"].astype(str) + ")"
                     sd["category_token"] = pd.Categorical(sd["category_token"], categories=ordered_tokens, ordered=True)
                     st.subheader(f"Evolucao por subcategoria (PnL acumulado) - {entry_kind.upper()}")
@@ -1657,7 +1738,7 @@ def main() -> None:
                     st.altair_chart(chart_sub.configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
                 else:
                     sd["bet_idx"] = sd.groupby("category_token").cumcount() + 1
-                    sd["cum"] = sd.groupby("category_token")["pnl_stake_fixed_10"].cumsum() * local_scale
+                    sd["cum"] = sd.groupby("category_token")[pnl_stake_col].cumsum() * local_scale
                     sd = sd.merge(sub_counts, on="category_token", how="left")
                     sd["count"] = sd["count"].fillna(0).astype(int)
                     sd["subcat_title"] = sd["category_token"].astype(str) + " (" + sd["count"].astype(str) + ")"
@@ -1698,12 +1779,12 @@ def main() -> None:
 
                 st.subheader(f"Subcategorias por pista (PnL acumulado) - {entry_kind.upper()}")
                 if x_axis_mode == "Dia":
-                    gp = sp.groupby(["track_name", "category_token", "date_only"], as_index=False)[["pnl_stake_fixed_10"]].sum().sort_values("date_only")
+                    gp = sp.groupby(["track_name", "category_token", "date_only"], as_index=False)[[pnl_stake_col]].sum().sort_values("date_only")
                     gp = gp.merge(sp[["track_name", "track_title"]].drop_duplicates(), on="track_name", how="left")
                     # contador por celula (pista  subcategoria)
                     cell_counts = sp.groupby(["track_name", "category_token"], as_index=False).size().rename(columns={"size": "cell_count"})
                     gp = gp.merge(cell_counts, on=["track_name", "category_token"], how="left")
-                    gp["cum"] = gp.groupby(["track_name", "category_token"])['pnl_stake_fixed_10'].cumsum() * local_scale
+                    gp["cum"] = gp.groupby(["track_name", "category_token"])[pnl_stake_col].cumsum() * local_scale
                     base_sp = (
                         alt.Chart(gp)
                         .mark_line()
@@ -1720,7 +1801,7 @@ def main() -> None:
                     )
                 else:
                     sp["bet_idx"] = sp.groupby(["track_name", "category_token"]).cumcount() + 1
-                    sp["cum"] = sp.groupby(["track_name", "category_token"])['pnl_stake_fixed_10'].cumsum() * local_scale
+                    sp["cum"] = sp.groupby(["track_name", "category_token"])[pnl_stake_col].cumsum() * local_scale
                     gp = sp[["track_name", "track_title", "category_token", "bet_idx", "cum"]].copy()
                     cell_counts = sp.groupby(["track_name", "category_token"], as_index=False).size().rename(columns={"size": "cell_count"})
                     gp = gp.merge(cell_counts, on=["track_name", "category_token"], how="left")
@@ -1751,10 +1832,10 @@ def main() -> None:
                 nd["num_runners"] = pd.to_numeric(nd["num_runners"], errors="coerce").astype("Int64")
                 nr_counts = nd.groupby("num_runners", as_index=False).size().rename(columns={"size": "count"})
                 if x_axis_mode == "Dia":
-                    nd = nd.groupby(["num_runners", "date_only"], as_index=False)[["pnl_stake_fixed_10"]].sum().sort_values("date_only")
+                    nd = nd.groupby(["num_runners", "date_only"], as_index=False)[[pnl_stake_col]].sum().sort_values("date_only")
                     nd = nd.merge(nr_counts, on="num_runners", how="left")
                     nd["count"] = nd["count"].fillna(0).astype(int)
-                    nd["cum"] = nd.groupby("num_runners")["pnl_stake_fixed_10"].cumsum() * local_scale
+                    nd["cum"] = nd.groupby("num_runners")[pnl_stake_col].cumsum() * local_scale
                     nd["nr_title"] = nd["num_runners"].astype(str) + " (" + nd["count"].astype(str) + ")"
                     st.subheader(f"Evolucao por numero de corredores (PnL acumulado) - {entry_kind.upper()}")
                     base_nr = (
@@ -1774,7 +1855,7 @@ def main() -> None:
                     st.altair_chart(chart_nr.configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
                 else:
                     nd["bet_idx"] = nd.groupby("num_runners").cumcount() + 1
-                    nd["cum"] = nd.groupby("num_runners")["pnl_stake_fixed_10"].cumsum() * local_scale
+                    nd["cum"] = nd.groupby("num_runners")[pnl_stake_col].cumsum() * local_scale
                     nd = nd.merge(nr_counts, on="num_runners", how="left")
                     nd["count"] = nd["count"].fillna(0).astype(int)
                     nd["nr_title"] = nd["num_runners"].astype(str) + " (" + nd["count"].astype(str) + ")"
@@ -1800,18 +1881,18 @@ def main() -> None:
         if df_block.empty or "race_time_iso" not in df_block.columns:
             return
         base_amount = float(st.session_state.get("base_amount", 1.0))
-        base_amount = float(st.session_state.get("base_amount", 1.0))
-        base_amount = float(st.session_state.get("base_amount", 1.0))
-        base_amount = float(st.session_state.get("base_amount", 1.0))
-        scale_factor = base_amount / 10.0
+        ref_factor = _REF_FACTOR
+        scale_factor = get_scale(base_amount, ref_factor)
         plot = df_block.copy()
         plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
         plot = plot.dropna(subset=["ts"]).sort_values("ts")
         if plot.empty:
             return
+        plot["_pnl_stake"] = get_col(plot, "pnl_stake_ref", "pnl_stake_fixed_10")
+        plot["_pnl_liab"] = get_col(plot, "pnl_liability_ref", "pnl_liability_fixed_10")
         plot["date_only"] = plot["ts"].dt.date
         daily = (
-            plot.groupby("date_only", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]]
+            plot.groupby("date_only", as_index=False)[["_pnl_stake", "_pnl_liab"]]
             .sum()
             .sort_values("date_only")
         )
@@ -1819,12 +1900,12 @@ def main() -> None:
         wd_order = [0, 1, 2, 3, 4, 5, 6]
         wd_names = {0: "Seg", 1: "Ter", 2: "Qua", 3: "Qui", 4: "Sex", 5: "Sab", 6: "Dom"}
         wd_order_names = [wd_names[w] for w in wd_order]
-        by_wd = daily.groupby("weekday", as_index=False)[["pnl_stake_fixed_10", "pnl_liability_fixed_10"]].sum()
+        by_wd = daily.groupby("weekday", as_index=False)[["_pnl_stake", "_pnl_liab"]].sum()
         by_wd["weekday_name"] = by_wd["weekday"].map(wd_names)
         by_wd["weekday_name"] = pd.Categorical(by_wd["weekday_name"], categories=wd_order_names, ordered=True)
-        by_wd["pnl_stake"] = by_wd["pnl_stake_fixed_10"] * scale_factor
+        by_wd["pnl_stake"] = by_wd["_pnl_stake"] * scale_factor
         if entry_kind == "lay":
-            by_wd["pnl_liab"] = by_wd["pnl_liability_fixed_10"] * scale_factor
+            by_wd["pnl_liab"] = by_wd["_pnl_liab"] * scale_factor
 
         zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
         bar_stake = (
@@ -1871,14 +1952,16 @@ def main() -> None:
         plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
         plot = plot.dropna(subset=["ts"]).sort_values("ts")
         plot["date_only"] = plot["ts"].dt.date
-        local_scale = float(st.session_state.get("base_amount", 1.0)) / 10.0
+        local_scale = get_scale(float(st.session_state.get("base_amount", 1.0)), _REF_FACTOR)
+        plot["_pnl_stake"] = get_col(plot, "pnl_stake_ref", "pnl_stake_fixed_10")
+        pnl_stake_col = "_pnl_stake"
         # Titulos
         counts = plot.groupby(["category", "num_runners"], as_index=False).size().rename(columns={"size": "count"})
         if x_axis_mode == "Dia":
-            agg = plot.groupby(["category", "num_runners", "date_only"], as_index=False)[["pnl_stake_fixed_10"]].sum().sort_values("date_only")
+            agg = plot.groupby(["category", "num_runners", "date_only"], as_index=False)[[pnl_stake_col]].sum().sort_values("date_only")
             agg = agg.merge(counts, on=["category", "num_runners"], how="left")
             agg["count"] = agg["count"].fillna(0).astype(int)
-            agg["cum"] = agg.groupby(["category", "num_runners"])['pnl_stake_fixed_10'].cumsum() * local_scale
+            agg["cum"] = agg.groupby(["category", "num_runners"])[pnl_stake_col].cumsum() * local_scale
             agg["facet_col"] = agg["category"].astype(str) + " (" + agg["count"].astype(str) + ")"
             base = (
                 alt.Chart(agg)
@@ -1891,7 +1974,7 @@ def main() -> None:
             )
         else:
             plot["bet_idx"] = plot.groupby(["category", "num_runners"]).cumcount() + 1
-            plot["cum"] = plot.groupby(["category", "num_runners"])['pnl_stake_fixed_10'].cumsum() * local_scale
+            plot["cum"] = plot.groupby(["category", "num_runners"])[pnl_stake_col].cumsum() * local_scale
             agg = plot[["category", "num_runners", "bet_idx", "cum"]].copy()
             agg = agg.merge(counts, on=["category", "num_runners"], how="left")
             agg["count"] = agg["count"].fillna(0).astype(int)
@@ -1927,7 +2010,9 @@ def main() -> None:
         plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
         plot = plot.dropna(subset=["ts"]).sort_values("ts")
         plot["date_only"] = plot["ts"].dt.date
-        local_scale = float(st.session_state.get("base_amount", 1.0)) / 10.0
+        local_scale = get_scale(float(st.session_state.get("base_amount", 1.0)), _REF_FACTOR)
+        plot["_pnl_stake"] = get_col(plot, "pnl_stake_ref", "pnl_stake_fixed_10")
+        pnl_stake_col = "_pnl_stake"
         # Seleciona Top K pistas por quantidade
         top_k = 12
         track_sizes = plot.groupby("track_name", as_index=False).size().rename(columns={"size": "count"}).sort_values("count", ascending=False)
@@ -1936,10 +2021,10 @@ def main() -> None:
         counts = plot.groupby(["track_name", "num_runners"], as_index=False).size().rename(columns={"size": "count"})
         plot = plot.merge(track_sizes[["track_name", "count"]].rename(columns={"count": "track_total"}), on="track_name", how="left")
         if x_axis_mode == "Dia":
-            agg = plot.groupby(["track_name", "num_runners", "date_only"], as_index=False)[["pnl_stake_fixed_10"]].sum().sort_values("date_only")
+            agg = plot.groupby(["track_name", "num_runners", "date_only"], as_index=False)[[pnl_stake_col]].sum().sort_values("date_only")
             agg = agg.merge(counts, on=["track_name", "num_runners"], how="left")
             agg["count"] = agg["count"].fillna(0).astype(int)
-            agg["cum"] = agg.groupby(["track_name", "num_runners"])['pnl_stake_fixed_10'].cumsum() * local_scale
+            agg["cum"] = agg.groupby(["track_name", "num_runners"])[pnl_stake_col].cumsum() * local_scale
             agg["facet_col"] = agg["track_name"].astype(str) + " (" + agg["count"].astype(str) + ")"
             base = (
                 alt.Chart(agg)
@@ -1952,7 +2037,7 @@ def main() -> None:
             )
         else:
             plot["bet_idx"] = plot.groupby(["track_name", "num_runners"]).cumcount() + 1
-            plot["cum"] = plot.groupby(["track_name", "num_runners"])['pnl_stake_fixed_10'].cumsum() * local_scale
+            plot["cum"] = plot.groupby(["track_name", "num_runners"])[pnl_stake_col].cumsum() * local_scale
             agg = plot[["track_name", "num_runners", "bet_idx", "cum"]].copy()
             agg = agg.merge(counts, on=["track_name", "num_runners"], how="left")
             agg["count"] = agg["count"].fillna(0).astype(int)
