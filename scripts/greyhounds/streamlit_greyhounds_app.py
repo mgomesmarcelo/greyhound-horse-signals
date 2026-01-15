@@ -521,6 +521,26 @@ def main() -> None:
         st.info("Nenhum sinal encontrado para a selecao. Gere antes com: python scripts/greyhounds/generate_greyhound_signals.py --source {src} --market {mkt} --rule {rule} --entry_type both".format(src=source, mkt=market, rule=rule))
         return
 
+    # Normaliza is_green (bool) para evitar assertividade zerada por tipos diferentes.
+    if "is_green" in df.columns:
+        df["is_green"] = to_bool_series(df["is_green"])
+    elif "win_lose" in df.columns:
+        win_numeric = pd.to_numeric(df["win_lose"], errors="coerce")
+        entry_series = df.get("entry_type", pd.Series(dtype=str)).astype(str)
+        df["is_green"] = False
+        df.loc[entry_series == "back", "is_green"] = win_numeric.loc[entry_series == "back"] == 1
+        df.loc[entry_series == "lay", "is_green"] = win_numeric.loc[entry_series == "lay"] == 0
+
+    # Normaliza is_green (bool) para evitar assertividade zerada por tipos diferentes.
+    if "is_green" in df.columns:
+        df["is_green"] = to_bool_series(df["is_green"])
+    elif "win_lose" in df.columns:
+        win_numeric = pd.to_numeric(df["win_lose"], errors="coerce")
+        entry_series = df.get("entry_type", pd.Series(dtype=str)).astype(str)
+        df["is_green"] = False
+        df.loc[entry_series == "back", "is_green"] = win_numeric.loc[entry_series == "back"] == 1
+        df.loc[entry_series == "lay", "is_green"] = win_numeric.loc[entry_series == "lay"] == 0
+
     global _REF_FACTOR
     _REF_FACTOR = get_ref_factor(df)
 
