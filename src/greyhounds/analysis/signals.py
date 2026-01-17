@@ -433,7 +433,7 @@ def _calc_signals_for_race(
     stake_ref = 1.0
     liability_ref = 1.0
     legacy_scale = 10.0  # TODO: descontinuar colunas *_fixed_10 após migração completa
-    commission_rate = 0.065
+    commission_rate = 0.02
 
     # BACK - referência 1
     back_is_green = target_win_lose == 1
