@@ -655,6 +655,17 @@ def main() -> None:
             if st.session_state.get(date_end_key) != sanitized_end:
                 st.session_state[date_end_key] = sanitized_end
 
+            mode_options = ["Calendário", "Barra"]
+            default_mode = st.session_state.get("date_mode", "Calendário")
+            active_mode = st.radio(
+                "Modo de seleção de datas",
+                mode_options,
+                horizontal=True,
+                index=0 if default_mode != "Barra" else 1,
+                key="date_mode_selector",
+            )
+            st.session_state["date_mode"] = active_mode
+
             start_col, end_col = st.columns(2)
             with start_col:
                 start_selected = st.date_input(
@@ -663,6 +674,7 @@ def main() -> None:
                     min_value=min_date,
                     max_value=max_date,
                     key=date_start_key,
+                    disabled=active_mode == "Barra",
                 )
             with end_col:
                 end_selected = st.date_input(
@@ -671,8 +683,10 @@ def main() -> None:
                     min_value=min_date,
                     max_value=max_date,
                     key=date_end_key,
+                    disabled=active_mode == "Barra",
                 )
 
+            # Faixa inicial derivada do calendário (default)
             range_start = min(start_selected, end_selected)
             range_end = max(start_selected, end_selected)
 
@@ -684,6 +698,7 @@ def main() -> None:
                 datetime.datetime.combine(range_end, datetime.time.min),
             )
 
+            # Valor inicial do slider (clamp), sem sobrescrever após renderizar
             current_slider_value = st.session_state.get(slider_key, default_slider_value)
             if not isinstance(current_slider_value, (tuple, list)) or len(current_slider_value) != 2:
                 current_slider_value = default_slider_value
@@ -708,40 +723,29 @@ def main() -> None:
                     end_norm = start_norm
                 current_slider_value = (start_norm, end_norm)
 
-            if st.session_state.get(slider_key) != current_slider_value:
-                st.session_state[slider_key] = current_slider_value
-
             slider_start_dt, slider_end_dt = st.slider(
                 "Intervalo de datas (barra)",
                 min_value=slider_min_dt,
                 max_value=slider_max_dt,
-                value=st.session_state[slider_key],
+                value=current_slider_value,
                 format="YYYY-MM-DD",
                 key=slider_key,
+                disabled=active_mode == "Calendário",
             )
             slider_start_date = slider_start_dt.date()
             slider_end_date = slider_end_dt.date()
 
-            slider_changed = (slider_start_date != sanitized_start) or (slider_end_date != sanitized_end)
+            # Faixas derivadas de cada modo
+            cal_range_start = min(start_selected, end_selected)
+            cal_range_end = max(start_selected, end_selected)
+            bar_range_start = slider_start_date
+            bar_range_end = slider_end_date
 
-            if slider_changed:
-                range_start = slider_start_date
-                range_end = slider_end_date
-                final_slider_state = (
-                    datetime.datetime.combine(range_start, datetime.time.min),
-                    datetime.datetime.combine(range_end, datetime.time.min),
-                )
-                if st.session_state.get(slider_key) != final_slider_state:
-                    st.session_state[slider_key] = final_slider_state
+            # Modo ativo decide qual faixa usar
+            if active_mode == "Barra":
+                range_start, range_end = bar_range_start, bar_range_end
             else:
-                range_start = sanitized_start
-                range_end = sanitized_end
-                desired_slider_state = (
-                    datetime.datetime.combine(range_start, datetime.time.min),
-                    datetime.datetime.combine(range_end, datetime.time.min),
-                )
-                if st.session_state.get(slider_key) != desired_slider_state:
-                    st.session_state[slider_key] = desired_slider_state
+                range_start, range_end = cal_range_start, cal_range_end
 
             range_start = max(min_date, range_start)
             range_end = min(max_date, range_end)
