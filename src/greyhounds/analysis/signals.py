@@ -14,6 +14,7 @@ from src.greyhounds.utils.text import clean_horse_name, normalize_track_name
 from src.greyhounds.utils.files import write_dataframe_snapshots
 
 _TRAP_PREFIX_RE = re.compile(r"^\s*\d+\.\s*")
+_TRAP_NUMBER_RE = re.compile(r"^\s*([1-6])[\.\s]+")
 
 
 def _ensure_dir(path: Path) -> None:
@@ -22,6 +23,18 @@ def _ensure_dir(path: Path) -> None:
 
 def _strip_trap_prefix(name: str) -> str:
     return _TRAP_PREFIX_RE.sub("", name or "").strip()
+
+
+def _extract_trap_number(name: str) -> int | None:
+    """Extrai número da trap a partir do prefixo do nome, limitado a 1-6."""
+    match = _TRAP_NUMBER_RE.match(name or "")
+    if not match:
+        return None
+    try:
+        val = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return val if 1 <= val <= 6 else None
 
 
 def _extract_track_from_menu_hint(menu_hint: str) -> str:
@@ -64,6 +77,7 @@ class RunnerBF:
     pptradedvol: float
     bsp: float
     win_lose: int
+    trap_number: int | None
 
 
 def _iter_result_paths(pattern: str) -> List[Path]:
@@ -103,6 +117,7 @@ def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
         df["selection_name_clean"] = (
             df["selection_name_raw"].map(_strip_trap_prefix).map(clean_horse_name)
         )
+        df["trap_number"] = df["selection_name_raw"].map(_extract_trap_number)
         df["pptradedvol"] = pd.to_numeric(df["pptradedvol"], errors="coerce").fillna(0.0)
         df["bsp"] = pd.to_numeric(df["bsp"], errors="coerce")
         df["win_lose"] = pd.to_numeric(df["win_lose"], errors="coerce").fillna(0).astype(int)
@@ -121,6 +136,7 @@ def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
                     pptradedvol=float(row["pptradedvol"]),
                     bsp=float(row["bsp"]) if pd.notna(row["bsp"]) else float("nan"),
                     win_lose=int(row["win_lose"]),
+                    trap_number=int(row["trap_number"]) if pd.notna(row["trap_number"]) else None,
                 )
 
     logger.info("Betfair WIN index criado: {} corridas", len(index))
@@ -157,6 +173,7 @@ def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
         df["selection_name_clean"] = (
             df["selection_name_raw"].map(_strip_trap_prefix).map(clean_horse_name)
         )
+        df["trap_number"] = df["selection_name_raw"].map(_extract_trap_number)
         df["pptradedvol"] = pd.to_numeric(df["pptradedvol"], errors="coerce").fillna(0.0)
         df["bsp"] = pd.to_numeric(df["bsp"], errors="coerce")
         df["win_lose"] = pd.to_numeric(df["win_lose"], errors="coerce").fillna(0).astype(int)
@@ -175,6 +192,7 @@ def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
                     pptradedvol=float(row["pptradedvol"]),
                     bsp=float(row["bsp"]) if pd.notna(row["bsp"]) else float("nan"),
                     win_lose=int(row["win_lose"]),
+                    trap_number=int(row["trap_number"]) if pd.notna(row["trap_number"]) else None,
                 )
 
     logger.info("Betfair PLACE index criado: {} corridas", len(index))
@@ -404,6 +422,7 @@ def _calc_signals_for_race(
         return []
 
     target_win_lose = int(target_runner.win_lose)
+    trap_number = target_runner.trap_number
     odd = (
         float(target_runner.bsp)
         if market == "place" and target_runner is not None
@@ -480,6 +499,7 @@ def _calc_signals_for_race(
         "entry_type": "back",
         "back_target_name": target_name_clean,
         "back_target_bsp": round(odd, 2),
+        "trap_number": trap_number if trap_number is not None else pd.NA,
         "lay_target_name": "",
         "lay_target_bsp": float("nan"),
         # Referência 1
@@ -513,6 +533,7 @@ def _calc_signals_for_race(
         "back_target_bsp": float("nan"),
         "lay_target_name": target_name_clean,
         "lay_target_bsp": round(odd, 2),
+        "trap_number": trap_number if trap_number is not None else pd.NA,
         # Referência 1
         "stake_ref": round(stake_ref, 2),
         "liability_from_stake_ref": round(liability_from_stake_ref, 4),
@@ -639,6 +660,7 @@ def write_signals_csv(
                 "ratio_second_over_third",
                 "pct_diff_second_vs_third",
                 "num_runners",
+                "trap_number",
                 "lay_target_name",
                 "lay_target_bsp",
                 "back_target_name",

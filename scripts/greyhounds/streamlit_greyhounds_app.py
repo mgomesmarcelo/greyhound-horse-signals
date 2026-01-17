@@ -444,6 +444,68 @@ def main() -> None:
                     use_container_width=True,
                 )
 
+    def _render_trap_perf(df_block: pd.DataFrame, entry_kind: str) -> None:
+        """Barra por trap com mesma lógica do gráfico semanal."""
+        if df_block.empty or "trap_number" not in df_block.columns:
+            return
+        base_amount = float(st.session_state.get("base_amount", 1.0))
+        ref_factor = _REF_FACTOR
+        scale_factor = get_scale(base_amount, ref_factor)
+        plot = df_block.copy()
+        plot["trap_number"] = pd.to_numeric(plot["trap_number"], errors="coerce").astype("Int64")
+        plot = plot.dropna(subset=["trap_number"])
+        if plot.empty:
+            return
+        plot["_pnl_stake"] = get_col(plot, "pnl_stake_ref", "pnl_stake_fixed_10")
+        plot["_pnl_liab"] = get_col(plot, "pnl_liability_ref", "pnl_liability_fixed_10")
+        by_trap = plot.groupby("trap_number", as_index=False)[["_pnl_stake", "_pnl_liab"]].sum()
+        order_labels = ["1", "2", "3", "4", "5", "6"]
+        by_trap["trap_label"] = by_trap["trap_number"].astype(int).astype(str)
+        by_trap = by_trap[by_trap["trap_label"].isin(order_labels)]
+        if by_trap.empty:
+            return
+        by_trap["trap_label"] = pd.Categorical(by_trap["trap_label"], categories=order_labels, ordered=True)
+        by_trap["pnl_stake"] = by_trap["_pnl_stake"] * scale_factor
+        if entry_kind == "lay":
+            by_trap["pnl_liab"] = by_trap["_pnl_liab"] * scale_factor
+
+        zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+        bar_stake = (
+            alt.Chart(by_trap)
+            .mark_bar()
+            .encode(
+                x=alt.X("trap_label:N", sort=order_labels, title=""),
+                y=alt.Y("pnl_stake:Q", title="PnL"),
+            )
+            .properties(width=small_width * 2, height=small_height)
+        )
+        stake_chart = alt.layer(zero_line, bar_stake)
+        with st.expander("Desempenho por trap (PnL agregado)", expanded=False):
+            if entry_kind == "lay":
+                zero_line_liab = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+                bar_liab = (
+                    alt.Chart(by_trap)
+                    .mark_bar(color="#8888FF")
+                    .encode(
+                        x=alt.X("trap_label:N", sort=order_labels, title=""),
+                        y=alt.Y("pnl_liab:Q", title="PnL"),
+                    )
+                    .properties(width=small_width * 2, height=small_height)
+                )
+                liab_chart = alt.layer(zero_line_liab, bar_liab)
+                st.altair_chart(
+                    alt.vconcat(
+                        stake_chart.properties(title="Stake"),
+                        liab_chart.properties(title="Liability"),
+                    ).resolve_scale(y="independent").configure_view(stroke="#888", strokeWidth=1),
+                    use_container_width=True,
+                )
+            else:
+                st.altair_chart(
+                    stake_chart.configure_view(stroke="#888", strokeWidth=1).properties(title="Stake"),
+                    use_container_width=True,
+                )
+
     # seletores de regra, fonte, mercado e tipo de entrada
     # Controles principais mais compactos; coluna extra para respiro
     col_rule, col_src, col_mkt, col_entry, _ = st.columns([1, 1, 1, 1, 2])
@@ -1198,6 +1260,7 @@ def main() -> None:
 
         # Desempenho por dia da semana (antes da tabela)
         _render_weekday_perf(df_block, entry_kind)
+        _render_trap_perf(df_block, entry_kind)
 
         # Relatorio mensal (entre desempenho semanal e tabela)
         _render_monthly_table(df_block, entry_kind)
@@ -1549,6 +1612,7 @@ def main() -> None:
 
         # Desempenho por dia da semana (antes da tabela)
         _render_weekday_perf(filt, entry_type)
+        _render_trap_perf(filt, entry_type)
 
         # Relatorio mensal (entre desempenho semanal e tabela)
         _render_monthly_table(filt, entry_type)
