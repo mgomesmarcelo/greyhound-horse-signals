@@ -18,7 +18,7 @@ from src.greyhounds.config import settings
 from src.greyhounds.utils.files import write_dataframe_snapshots
 from src.greyhounds.utils.dates import iso_to_hhmm
 from src.greyhounds.utils.selenium_driver import build_chrome_driver
-from src.greyhounds.utils.text import clean_horse_name, normalize_track_name
+from src.greyhounds.utils.text import clean_greyhound_name, normalize_track_name
 
 
 _TIMEFORM_HOME = settings.TIMEFORM_BASE_URL
@@ -139,7 +139,7 @@ def _extract_top3(driver) -> List[str]:
                 name_el = selection.find_element(By.CSS_SELECTOR, ".rpf-verdict-selection-name a")
                 name = name_el.text.strip()
                 if name:
-                    top_names.append(clean_horse_name(name))
+                    top_names.append(clean_greyhound_name(name))
             except Exception:
                 continue
         return top_names

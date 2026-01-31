@@ -74,7 +74,7 @@ def strip_accents(text: str) -> str:
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
-def clean_horse_name(raw_name: str) -> str:
+def clean_greyhound_name(raw_name: str) -> str:
     name = strip_country_suffix(raw_name or "")
     name = normalize_spaces(name)
     name = remove_apostrophes(name)

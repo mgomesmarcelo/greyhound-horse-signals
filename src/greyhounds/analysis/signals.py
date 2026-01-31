@@ -10,7 +10,7 @@ from dateutil import parser as date_parser
 from loguru import logger
 
 from src.greyhounds.config import RULE_LABELS, settings
-from src.greyhounds.utils.text import clean_horse_name, normalize_track_name
+from src.greyhounds.utils.text import clean_greyhound_name, normalize_track_name
 from src.greyhounds.utils.files import write_dataframe_snapshots
 
 _TRAP_PREFIX_RE = re.compile(r"^\s*\d+\.\s*")
@@ -62,7 +62,7 @@ def _parse_forecast_top3(text: str) -> List[str]:
         else:
             candidate = re.sub(r"\s*\([^\)]*\)\s*$", "", part).strip()
         candidate = _strip_trap_prefix(candidate)
-        cleaned = clean_horse_name(candidate)
+        cleaned = clean_greyhound_name(candidate)
         if cleaned and cleaned not in names:
             names.append(cleaned)
         if len(names) >= 3:
@@ -115,7 +115,7 @@ def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
         df["race_iso"] = df["event_dt"].astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
         df["selection_name_raw"] = df["selection_name"].astype(str)
         df["selection_name_clean"] = (
-            df["selection_name_raw"].map(_strip_trap_prefix).map(clean_horse_name)
+            df["selection_name_raw"].map(_strip_trap_prefix).map(clean_greyhound_name)
         )
         df["trap_number"] = df["selection_name_raw"].map(_extract_trap_number)
         df["pptradedvol"] = pd.to_numeric(df["pptradedvol"], errors="coerce").fillna(0.0)
@@ -171,7 +171,7 @@ def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
         df["race_iso"] = df["event_dt"].astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
         df["selection_name_raw"] = df["selection_name"].astype(str)
         df["selection_name_clean"] = (
-            df["selection_name_raw"].map(_strip_trap_prefix).map(clean_horse_name)
+            df["selection_name_raw"].map(_strip_trap_prefix).map(clean_greyhound_name)
         )
         df["trap_number"] = df["selection_name_raw"].map(_extract_trap_number)
         df["pptradedvol"] = pd.to_numeric(df["pptradedvol"], errors="coerce").fillna(0.0)
@@ -242,7 +242,7 @@ def load_timeform_top3() -> List[dict]:
             track = normalize_track_name(str(row.get("track_name", "")))
             race_iso = str(row.get("race_time_iso", ""))
             names = [
-                clean_horse_name(str(row.get(col, "")))
+                clean_greyhound_name(str(row.get(col, "")))
                 for col in ["TimeformTop1", "TimeformTop2", "TimeformTop3"]
             ]
             if not track or not race_iso or not any(names):
@@ -468,7 +468,7 @@ def _calc_signals_for_race(
     raw = tf_row["raw"]
 
     def _vol_for(name_raw: object) -> float:
-        name = clean_horse_name(str(name_raw)) if isinstance(name_raw, str) else ""
+        name = clean_greyhound_name(str(name_raw)) if isinstance(name_raw, str) else ""
         return next((vol for runner_name, vol, _ in triples if runner_name == name), 0.0)
 
     base = {
