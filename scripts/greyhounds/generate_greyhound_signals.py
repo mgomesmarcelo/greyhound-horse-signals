@@ -26,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--market", choices=["win", "place", "both"], default="both")
     parser.add_argument(
         "--rule",
-        choices=["lider_volume_total", "terceiro_queda50", "both"],
+        choices=["lider_volume_total", "terceiro_queda50", "forecast_odds", "both"],
         default="both",
     )
     parser.add_argument("--entry_type", choices=["back", "lay", "both"], default="both")
@@ -68,12 +68,20 @@ def main(argv: list[str] | None = None) -> int:
     rules = (
         [args.rule]
         if args.rule != "both"
-        else ["lider_volume_total", "terceiro_queda50"]
+        else ["lider_volume_total", "terceiro_queda50", "forecast_odds"]
     )
 
     for source_value in sources:
         for market_value in markets:
             for rule_value in rules:
+                if rule_value == "forecast_odds" and source_value != "forecast":
+                    logger.info(
+                        "Pulando combinação inválida: source={} market={} rule={}",
+                        source_value,
+                        market_value,
+                        rule_value,
+                    )
+                    continue
                 _run_for(source_value, market_value, rule_value)
 
     return 0

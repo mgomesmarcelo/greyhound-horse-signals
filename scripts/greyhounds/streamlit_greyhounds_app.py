@@ -506,14 +506,81 @@ def main() -> None:
                     use_container_width=True,
                 )
 
+    def _render_forecast_rank_perf(df_block: pd.DataFrame, entry_kind: str) -> None:
+        """Barra por forecast_rank (so aparece quando a regra e forecast_odds e ha coluna forecast_rank)."""
+        if df_block.empty or "forecast_rank" not in df_block.columns:
+            return
+        base_amount = float(st.session_state.get("base_amount", 1.0))
+        ref_factor = _REF_FACTOR
+        scale_factor = get_scale(base_amount, ref_factor)
+        plot = df_block.copy()
+        plot["forecast_rank"] = pd.to_numeric(plot["forecast_rank"], errors="coerce")
+        plot = plot.dropna(subset=["forecast_rank"])
+        if plot.empty:
+            return
+        plot["_pnl_stake"] = get_col(plot, "pnl_stake_ref", "pnl_stake_fixed_10")
+        plot["_pnl_liab"] = get_col(plot, "pnl_liability_ref", "pnl_liability_fixed_10")
+        by_rank = plot.groupby("forecast_rank", as_index=False)[["_pnl_stake", "_pnl_liab"]].sum()
+        by_rank["forecast_rank"] = by_rank["forecast_rank"].astype(int)
+        by_rank["rank_label"] = by_rank["forecast_rank"].astype(str)
+        order_labels = sorted(by_rank["rank_label"].unique(), key=lambda x: int(x))
+        if not order_labels:
+            return
+        by_rank["rank_label"] = pd.Categorical(by_rank["rank_label"], categories=order_labels, ordered=True)
+        by_rank["pnl_stake"] = by_rank["_pnl_stake"] * scale_factor
+        if entry_kind == "lay":
+            by_rank["pnl_liab"] = by_rank["_pnl_liab"] * scale_factor
+
+        zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+        bar_stake = (
+            alt.Chart(by_rank)
+            .mark_bar()
+            .encode(
+                x=alt.X("rank_label:N", sort=order_labels, title=""),
+                y=alt.Y("pnl_stake:Q", title="PnL"),
+            )
+            .properties(width=small_width * 2, height=small_height)
+        )
+        stake_chart = alt.layer(zero_line, bar_stake)
+        with st.expander("Desempenho por forecast rank (PnL agregado)", expanded=False):
+            if entry_kind == "lay":
+                zero_line_liab = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+                bar_liab = (
+                    alt.Chart(by_rank)
+                    .mark_bar(color="#8888FF")
+                    .encode(
+                        x=alt.X("rank_label:N", sort=order_labels, title=""),
+                        y=alt.Y("pnl_liab:Q", title="PnL"),
+                    )
+                    .properties(width=small_width * 2, height=small_height)
+                )
+                liab_chart = alt.layer(zero_line_liab, bar_liab)
+                st.altair_chart(
+                    alt.vconcat(
+                        stake_chart.properties(title="Stake"),
+                        liab_chart.properties(title="Liability"),
+                    ).resolve_scale(y="independent").configure_view(stroke="#888", strokeWidth=1),
+                    use_container_width=True,
+                )
+            else:
+                st.altair_chart(
+                    stake_chart.configure_view(stroke="#888", strokeWidth=1).properties(title="Stake"),
+                    use_container_width=True,
+                )
+
     # seletores de regra, fonte, mercado e tipo de entrada
     # Controles principais mais compactos; coluna extra para respiro
     col_rule, col_src, col_mkt, col_entry, _ = st.columns([1, 1, 1, 1, 2])
 
     rule_label_pairs = [
-        ("terceiro_queda50", RULE_LABELS["terceiro_queda50"]),
-        ("lider_volume_total", RULE_LABELS["lider_volume_total"]),
+        ("terceiro_queda50", RULE_LABELS.get("terceiro_queda50", "terceiro_queda50")),
+        ("lider_volume_total", RULE_LABELS.get("lider_volume_total", "líder volume total")),
+        ("forecast_odds", RULE_LABELS.get("forecast_odds", "Forecast Odds (Timeform)")),
     ]
+    # Diagnóstico temporário (descomente para ver qual config está sendo importado):
+    # import src.greyhounds.config as _cfg
+    # st.write("config.__file__:", getattr(_cfg, "__file__", "?"))
+    # st.write("RULE_LABELS.keys():", list(getattr(_cfg, "RULE_LABELS", {}).keys()))
     rule_labels = [label for _, label in rule_label_pairs]
 
     def _reset_rule_dependent_state() -> None:
@@ -533,6 +600,10 @@ def main() -> None:
             "bsp_low",
             "bsp_high",
             "bsp_slider",
+            "forecast_rank_ms",
+            "value_ratio_min",
+            "value_ratio_max",
+            "only_value_bets",
         ]
         for key in keys_to_clear:
             st.session_state.pop(key, None)
@@ -550,7 +621,12 @@ def main() -> None:
             key="rule_select_label",
             on_change=_on_rule_change,
         )
-        rule = RULE_LABELS_INV.get(selected_rule_label, "terceiro_queda50")
+        # label -> rule (robusto, mesmo se RULE_LABELS_INV estiver incompleto)
+        rule = RULE_LABELS_INV.get(selected_rule_label)
+        if not rule and selected_rule_label == "Forecast Odds (Timeform)":
+            rule = "forecast_odds"
+        if not rule:
+            rule = "terceiro_queda50"
 
     with col_src:
         source_options = ["top3", "forecast", "betfair_resultado"]
@@ -579,6 +655,13 @@ def main() -> None:
 
     signals_mtime = _get_signals_mtime(source, market, rule)
     df = load_signals_enriched(source=source, market=market, rule=rule, signals_mtime=signals_mtime)
+    with st.expander("Debug (carregamento de sinais)", expanded=False):
+        st.write("PROCESSED_SIGNALS_DIR:", str(settings.PROCESSED_SIGNALS_DIR))
+        st.write("Selecionado:", {"source": source, "market": market, "rule": rule})
+        expected = settings.PROCESSED_SIGNALS_DIR / f"signals_{source}_{market}_{rule}.parquet"
+        st.write("Esperado:", str(expected), "exists=", expected.exists())
+        st.write("df.shape:", df.shape)
+        st.write("df.columns(sample):", list(df.columns)[:80])
     if df.empty:
         st.info("Nenhum sinal encontrado para a selecao. Gere antes com: python scripts/greyhounds/generate_greyhound_signals.py --source {src} --market {mkt} --rule {rule} --entry_type both".format(src=source, mkt=market, rule=rule))
         return
@@ -795,12 +878,16 @@ def main() -> None:
             base_df_for_bsp = df_filtered
         if entry_type == "both":
             if base_df_for_bsp.empty:
-                bsp_min = 1.01
-                bsp_max = 100.0
+                bsp_min, bsp_max = 1.01, 100.0
+            elif "lay_target_bsp" not in base_df_for_bsp.columns or "back_target_bsp" not in base_df_for_bsp.columns:
+                bsp_min, bsp_max = 1.01, 100.0
             else:
                 combined_bsp = base_df_for_bsp[["lay_target_bsp", "back_target_bsp"]]
-                bsp_min = float(combined_bsp.min().min())
-                bsp_max = float(combined_bsp.max().max())
+                if combined_bsp.dropna(how="all").empty:
+                    bsp_min, bsp_max = 1.01, 100.0
+                else:
+                    bsp_min = float(combined_bsp.min().min())
+                    bsp_max = float(combined_bsp.max().max())
         else:
             if base_df_for_bsp.empty:
                 bsp_min = 1.01
@@ -917,7 +1004,9 @@ def main() -> None:
             st.caption("Volume min. por corrida (soma de pptradedvol)")
     min_total_volume = float(st.session_state.get(volume_key, 2000.0))
     volume_series = pd.to_numeric(filt.get("total_matched_volume", pd.Series(dtype=float)), errors="coerce")
-    filt = filt[volume_series.fillna(0.0) >= min_total_volume]
+    # forecast_odds usa total_matched_volume neutro (0.0); nao aplicar filtro de volume para nao zerar
+    if rule != "forecast_odds":
+        filt = filt[volume_series.fillna(0.0) >= min_total_volume]
     # Linha separada: Numero de corredores (mantém tamanho da caixa)
     st.caption("Numero de corredores")
     nr_vals = sorted([int(v) for v in pd.to_numeric(filt.get("num_runners", pd.Series(dtype=float)), errors="coerce").dropna().unique().tolist()])
@@ -967,6 +1056,75 @@ def main() -> None:
                 format="%.0f",
             )
         filt = filt[filt["leader_volume_share_pct"].fillna(0) >= float(leader_min)]
+
+    # Filtros especificos para regra forecast_odds
+    if rule == "forecast_odds":
+        if "forecast_rank" in filt.columns:
+            filt["forecast_rank"] = pd.to_numeric(filt["forecast_rank"], errors="coerce")
+        if "value_ratio" in filt.columns:
+            filt["value_ratio"] = pd.to_numeric(filt["value_ratio"], errors="coerce")
+        st.caption("Filtros Forecast Odds")
+        if "forecast_rank" in filt.columns and not filt.empty:
+            rank_vals = sorted(pd.to_numeric(filt["forecast_rank"], errors="coerce").dropna().unique().astype(int).tolist())
+            if not rank_vals:
+                rank_vals = list(range(1, 7))
+            default_ranks = st.session_state.get("forecast_rank_ms", rank_vals)
+            if not isinstance(default_ranks, list):
+                default_ranks = rank_vals
+            default_ranks = [r for r in default_ranks if r in rank_vals]
+            col_rank, _ = st.columns([2, 8])
+            with col_rank:
+                sel_ranks = st.multiselect(
+                    "Forecast rank",
+                    options=rank_vals,
+                    default=default_ranks if default_ranks else rank_vals,
+                    key="forecast_rank_ms",
+                )
+            if sel_ranks:
+                filt = filt[filt["forecast_rank"].isin(sel_ranks)]
+        if "value_ratio" in filt.columns and not filt.empty:
+            vr = pd.to_numeric(filt["value_ratio"], errors="coerce").fillna(float("nan"))
+            vmin = float(vr.min()) if vr.notna().any() else 0.0
+            vmax = float(vr.max()) if vr.notna().any() else 1.0
+            if vmin >= vmax:
+                vmin, vmax = 0.0, max(1.0, vmax)
+            # Clamp defaults ao intervalo atual (evita erro quando filtro entry_type reduz o range)
+            stored_min = float(st.session_state.get("value_ratio_min", vmin))
+            stored_max = float(st.session_state.get("value_ratio_max", vmax))
+            value_ratio_min_default = max(vmin, min(vmax, stored_min))
+            value_ratio_max_default = max(vmin, min(vmax, stored_max))
+            if value_ratio_min_default > value_ratio_max_default:
+                value_ratio_max_default = value_ratio_min_default
+            col_vr_wrapper, _ = st.columns([2, 8])
+            with col_vr_wrapper:
+                col_vr1, col_vr2 = st.columns(2)
+                with col_vr1:
+                    value_ratio_min = st.number_input(
+                        "Value ratio min",
+                        min_value=vmin,
+                        max_value=vmax,
+                        value=value_ratio_min_default,
+                        step=0.05,
+                        key="value_ratio_min",
+                    )
+                with col_vr2:
+                    value_ratio_max = st.number_input(
+                        "Value ratio max",
+                        min_value=vmin,
+                        max_value=vmax,
+                        value=value_ratio_max_default,
+                        step=0.05,
+                        key="value_ratio_max",
+                    )
+            filt = filt[filt["value_ratio"].fillna(float("nan")).between(value_ratio_min, value_ratio_max)]
+            only_value_bets = st.checkbox(
+                "Somente value bets (value_ratio >= 1.0)",
+                value=bool(st.session_state.get("only_value_bets", False)),
+                key="only_value_bets",
+            )
+            if only_value_bets:
+                filt = filt[filt["value_ratio"].fillna(0.0) >= 1.0]
+
     # Enriquecimento: categoria por corrida (A/B/D etc.)
     # Se o DataFrame ja veio com as colunas de categoria, reaproveitamos diretamente.
     if ("category" in filt.columns) and ("category_token" in filt.columns):
@@ -1099,6 +1257,11 @@ def main() -> None:
             filt = filt[filt["category_token"].isin(sel_subcats)]
         else:
             filt = filt.iloc[0:0]
+
+    # Filtro por tipo de entrada: Back -> apenas entry_type='back'; Lay -> apenas entry_type='lay';
+    # Ambos -> mantem todas as linhas (entry_type IN ('back','lay')). Nao assume duas linhas por galgo/corrida.
+    if entry_type != "both":
+        filt = filt[filt["entry_type"] == entry_type]
 
     # Seletor global do eixo X para graficos de evolucao
     x_axis_mode = st.radio(
@@ -1265,6 +1428,7 @@ def main() -> None:
         # Desempenho por dia da semana (antes da tabela)
         _render_weekday_perf(df_block, entry_kind)
         _render_trap_perf(df_block, entry_kind)
+        _render_forecast_rank_perf(df_block, entry_kind)
 
         # Relatorio mensal (entre desempenho semanal e tabela)
         _render_monthly_table(df_block, entry_kind)
@@ -1281,6 +1445,8 @@ def main() -> None:
             "second_name_by_volume", "third_name_by_volume",
             "pct_diff_second_vs_third",
         ]
+        if rule == "forecast_odds":
+            show_cols += ["forecast_rank", "forecast_odds", "forecast_name_clean", "value_ratio", "value_log"]
         stake_col = _pref("stake_ref", "stake_fixed_10")
         pnl_stake_col = _pref("pnl_stake_ref", "pnl_stake_fixed_10")
         roi_stake_col = _pref("roi_row_stake_ref", "roi_row_stake_fixed_10")
@@ -1617,6 +1783,7 @@ def main() -> None:
         # Desempenho por dia da semana (antes da tabela)
         _render_weekday_perf(filt, entry_type)
         _render_trap_perf(filt, entry_type)
+        _render_forecast_rank_perf(filt, entry_type)
 
         # Relatorio mensal (entre desempenho semanal e tabela)
         _render_monthly_table(filt, entry_type)
@@ -1671,6 +1838,8 @@ def main() -> None:
                 _pref("roi_row_exposure_ref", "roi_row_exposure_fixed_10"),
                 "pct_diff_second_vs_third",
             ]
+        if rule == "forecast_odds":
+            show_cols += ["forecast_rank", "forecast_odds", "forecast_name_clean", "value_ratio", "value_log"]
 
         missing = [c for c in show_cols if c not in filt.columns]
         for c in missing:

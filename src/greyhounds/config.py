@@ -1,4 +1,4 @@
-﻿from dataclasses import dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 from src.core.config import DATA_DIR, ensure_data_dir
@@ -18,6 +18,7 @@ SOURCE_LABELS_INV: dict[str, str] = {v: k for k, v in SOURCE_LABELS.items()}
 RULE_LABELS: dict[str, str] = {
     "lider_volume_total": "líder volume total",
     "terceiro_queda50": "terceiro_queda50",
+    "forecast_odds": "Forecast Odds (Timeform)",
 }
 RULE_LABELS_INV: dict[str, str] = {v: k for k, v in RULE_LABELS.items()}
 
@@ -62,6 +63,9 @@ class Settings:
     TIMEFORM_MAX_DELAY_SEC: float = 1.0
     CSV_ENCODING: str = "utf-8-sig"
     LOG_LEVEL: str = "INFO"
+    # forecast_odds: limites de value_ratio para gerar sinal (zona entre os dois = sem sinal)
+    FORECAST_ODDS_BACK_MIN_VALUE_RATIO: float = 1.20
+    FORECAST_ODDS_LAY_MAX_VALUE_RATIO: float = 0.80
 
 
 settings = Settings()

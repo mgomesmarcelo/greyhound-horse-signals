@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import math
+import os
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 from dateutil import parser as date_parser
@@ -47,6 +50,43 @@ def _to_iso_yyyy_mm_dd_thh_mm(value: str) -> str:
         return dt.strftime("%Y-%m-%dT%H:%M")
     except Exception:
         return ""
+
+
+_FORECAST_ITEM_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+(.+)$", re.IGNORECASE)
+
+
+def _parse_forecast_all(text: str) -> List[Dict]:
+    """Parseia o texto completo do TimeformForecast e retorna lista de itens com odds e rank.
+
+    Formato esperado: "TimeformForecast : 2.88 Coolruss Izzy, 5.00 Day Tripper, ..."
+    Nao ha trap no forecast. Itens malformados sao ignorados (apenas o item, nao a corrida).
+    """
+    if not isinstance(text, str):
+        return []
+    stripped = re.sub(r"(?i)\btimeformforecast\s*:\s*", "", text.strip())
+    parts = [part.strip() for part in stripped.split(",") if isinstance(part, str) and part.strip()]
+    items: List[Dict] = []
+    for rank, part in enumerate(parts, start=1):
+        match = _FORECAST_ITEM_RE.match(part)
+        if not match:
+            continue
+        try:
+            odds_val = float(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        name_raw = (match.group(2) or "").strip()
+        if not name_raw:
+            continue
+        name_clean = clean_greyhound_name(name_raw)
+        if not name_clean:
+            continue
+        items.append({
+            "forecast_rank": rank,
+            "forecast_odds": odds_val,
+            "forecast_name_clean": name_clean,
+            "forecast_name_raw": name_raw,
+        })
+    return items
 
 
 def _parse_forecast_top3(text: str) -> List[str]:
@@ -319,6 +359,339 @@ def load_timeform_forecast_top3() -> List[dict]:
     return rows
 
 
+def load_timeform_forecast_all() -> pd.DataFrame:
+    """Carrega TimeformForecast (parquet preferencial, csv fallback), parseia o campo textual
+    TimeformForecast e retorna um DataFrame com track_key, race_iso e forecast_items (list de
+    dicts por corrida: forecast_rank, forecast_odds, forecast_name_clean, forecast_name_raw).
+    """
+    tf_dir = settings.PROCESSED_TIMEFORM_FORECAST_DIR
+    parquet_paths = sorted(tf_dir.glob("TimeformForecast_*.parquet"))
+    if parquet_paths:
+        sources = parquet_paths
+        use_parquet = True
+    else:
+        csv_dir = settings.RAW_TIMEFORM_FORECAST_DIR
+        sources = sorted(csv_dir.glob("TimeformForecast_*.csv"))
+        use_parquet = False
+
+    rows: List[dict] = []
+    for path in sources:
+        try:
+            if use_parquet:
+                df = pd.read_parquet(path)
+            else:
+                df = pd.read_csv(
+                    path,
+                    encoding=settings.CSV_ENCODING,
+                    engine="python",
+                    on_bad_lines="skip",
+                )
+        except Exception as exc:
+            logger.error("Falha ao ler {}: {}", path.name, exc)
+            continue
+
+        for col in ["track_name", "race_time_iso", "TimeformForecast"]:
+            if col not in df.columns:
+                df[col] = pd.NA
+
+        for _, row in df.iterrows():
+            track = normalize_track_name(str(row.get("track_name", "")))
+            race_iso = str(row.get("race_time_iso", ""))
+            if not track or not race_iso:
+                continue
+            forecast_items = _parse_forecast_all(str(row.get("TimeformForecast", "")))
+            if not forecast_items:
+                continue # evita carregar/iterar corrida sem itens
+            rows.append({
+                "track_key": track,
+                "race_iso": race_iso,
+                "forecast_items": forecast_items,
+            })
+
+    logger.info("Timeform Forecast (all) carregado: {} corridas", len(rows))
+    return pd.DataFrame(rows)
+
+
+def _forecast_all_df_to_tf_rows(df: pd.DataFrame) -> List[dict]:
+    """Converte o DataFrame de load_timeform_forecast_all() para lista de dicts no formato
+    esperado por _calc_signals_forecast_odds_for_race: track_key, race_iso, forecast_items, raw.
+    """
+    if df.empty:
+        return []
+    rows: List[dict] = []
+    for _, row in df.iterrows():
+        track_key = row.get("track_key", "")
+        race_iso = row.get("race_iso", "")
+        forecast_items = row.get("forecast_items") or []
+        raw = {
+            "track_name": track_key,
+            "race_time_iso": race_iso,
+        }
+        rows.append({
+            "track_key": track_key,
+            "race_iso": race_iso,
+            "forecast_items": forecast_items,
+            "raw": raw,
+        })
+    return rows
+
+
+def _signal_race_selection_key(row: dict) -> Tuple[str, str, str]:
+    """Chave (race_id, selection_id) para um sinal: race_time_iso, track_name, nome do galgo."""
+    race_iso = row.get("race_time_iso") or ""
+    track = row.get("track_name") or ""
+    sel = (
+        row.get("forecast_name_clean")
+        or row.get("back_target_name")
+        or row.get("lay_target_name")
+        or ""
+    )
+    return (race_iso, track, sel)
+
+
+def _dedupe_forecast_odds_signals_by_race_selection(
+    result: List[dict], track_key: str, race_iso: str
+) -> List[dict]:
+    """Garante no maximo um sinal por (race_id, selection_id). Duplicatas: mantem o primeiro, log warning."""
+    if not result:
+        return result
+    seen: Dict[Tuple[str, str, str], bool] = {}
+    unique: List[dict] = []
+    for row in result:
+        key = _signal_race_selection_key(row)
+        if key in seen:
+            logger.warning(
+                "forecast_odds: duplicata ignorada (nao deveria haver back e lay para o mesmo galgo/corrida): race_iso={!r} track={!r} selection={!r} entry_type={!r}",
+                race_iso,
+                track_key,
+                key[2],
+                row.get("entry_type"),
+            )
+            continue
+        seen[key] = True
+        unique.append(row)
+    return unique
+
+
+def _assert_forecast_odds_unique_race_selection(df: pd.DataFrame) -> None:
+    """Valida que forecast_odds nao tem duas linhas para o mesmo (race_id, selection_id). Log error se tiver."""
+    if df.empty or "race_time_iso" not in df.columns:
+        return
+    keys: List[Tuple[str, str, str]] = []
+    for _, row in df.iterrows():
+        keys.append(_signal_race_selection_key(row))
+    if len(keys) != len(set(keys)):
+        counts = Counter(keys)
+        dupes = [k for k, c in counts.items() if c > 1]
+        logger.error(
+            "forecast_odds: violacao de unicidade (race_id, selection_id): existem {} chaves duplicadas; exemplos: {}",
+            len(dupes),
+            dupes[:5],
+        )
+
+
+def _calc_signals_forecast_odds_for_race(
+    tf_row: dict,
+    bf_win_index: Dict[Tuple[str, str], Dict[str, RunnerBF]],
+    bf_place_index: Dict[Tuple[str, str], Dict[str, RunnerBF]] | None,
+    market: str,
+    rule: str = "forecast_odds",
+) -> List[dict]:
+    """Gera sinais por runner do forecast que casou com Betfair: no maximo 1 linha por galgo/corrida.
+    value_ratio = back_target_bsp / forecast_odds. Se value_ratio >= FORECAST_ODDS_BACK_MIN_VALUE_RATIO
+    -> back; se value_ratio <= FORECAST_ODDS_LAY_MAX_VALUE_RATIO -> lay; senao nao gera sinal (zona morta).
+    PnL/ROI e schema iguais ao dashboard.
+    """
+    track_key = tf_row["track_key"]
+    race_iso = tf_row["race_iso"]
+    forecast_items = tf_row.get("forecast_items") or []
+    raw = tf_row.get("raw") or {}
+
+    if market == "place" and bf_place_index is not None:
+        group = bf_place_index.get((track_key, race_iso))
+    else:
+        group = bf_win_index.get((track_key, race_iso))
+
+    if not group:
+        return []
+
+    num_runners = len(group)
+    stake_ref = 1.0
+    liability_ref = 1.0
+    legacy_scale = 10.0
+    commission_rate = 0.02
+
+    tf_top1 = forecast_items[0].get("forecast_name_clean") or "" if len(forecast_items) >= 1 else ""
+    tf_top2 = forecast_items[1].get("forecast_name_clean") or "" if len(forecast_items) >= 2 else ""
+    tf_top3 = forecast_items[2].get("forecast_name_clean") or "" if len(forecast_items) >= 3 else ""
+
+    base_neutral = {
+        "date": race_iso.split("T")[0] if race_iso else "",
+        "track_name": raw.get("track_name", track_key),
+        "race_time_iso": race_iso,
+        "tf_top1": tf_top1,
+        "tf_top2": tf_top2,
+        "tf_top3": tf_top3,
+        "vol_top1": 0.0,
+        "vol_top2": 0.0,
+        "vol_top3": 0.0,
+        "second_name_by_volume": "",
+        "third_name_by_volume": "",
+        "ratio_second_over_third": 0.0,
+        "pct_diff_second_vs_third": 0.0,
+        "leader_name_by_volume": "",
+        "leader_volume_share_pct": 0.0,
+        "num_runners": int(num_runners),
+        "market": market,
+        "rule": rule,
+        "rule_label": RULE_LABELS.get(rule, rule),
+        "total_matched_volume": 0.0,
+    }
+
+    result: List[dict] = []
+    for item in forecast_items:
+        name_clean = item.get("forecast_name_clean")
+        if not name_clean:
+            continue
+        forecast_odds_val = item.get("forecast_odds")
+        if forecast_odds_val is None or (isinstance(forecast_odds_val, float) and (forecast_odds_val <= 0 or pd.isna(forecast_odds_val))):
+            continue
+        forecast_odds_val = float(forecast_odds_val)
+        forecast_rank = item.get("forecast_rank")
+        if forecast_rank is None:
+            continue
+        forecast_rank = int(forecast_rank)
+
+        runner = group.get(name_clean) if isinstance(group, dict) else None
+        if not runner or pd.isna(runner.bsp):
+            continue
+
+        odd = float(runner.bsp)
+        target_win_lose = int(runner.win_lose)
+        trap_number = runner.trap_number
+
+        value_ratio = odd / forecast_odds_val if forecast_odds_val > 0 else float("nan")
+        value_log = math.log(value_ratio) if value_ratio > 0 else float("nan")
+
+        # P&L por linha (nao assume back+lay para o mesmo galgo). Back: stake fixa; lucro vitoria =
+        # (odds-1)*stake*(1-comissao), perda derrota = -stake. Lay: liability fixa; stake = liability/(odds-1);
+        # perda na vitoria do cavalo = -liability; lucro na derrota = stake*(1-comissao).
+        back_is_green = target_win_lose == 1
+        if back_is_green:
+            back_pnl_stake_ref = stake_ref * max(0.0, odd - 1.0) * (1.0 - commission_rate)
+        else:
+            back_pnl_stake_ref = -stake_ref
+
+        liability_from_stake_ref = stake_ref * max(0.0, odd - 1.0)
+        stake_from_liab_ref = liability_ref / max(0.001, odd - 1.0)
+        if target_win_lose == 1:
+            lay_pnl_stake_ref = -liability_from_stake_ref
+            lay_pnl_liab_ref = -liability_ref
+            lay_is_green = False
+        else:
+            lay_pnl_stake_ref = stake_ref * (1.0 - commission_rate)
+            lay_pnl_liab_ref = stake_from_liab_ref * (1.0 - commission_rate)
+            lay_is_green = True
+
+        stake_fix10 = stake_ref * legacy_scale
+        liability_fix10 = liability_ref * legacy_scale
+        liability_from_stake10 = liability_from_stake_ref * legacy_scale
+        stake_from_liab10 = stake_from_liab_ref * legacy_scale
+        back_pnl_stake10 = back_pnl_stake_ref * legacy_scale
+        lay_pnl_stake10 = lay_pnl_stake_ref * legacy_scale
+        lay_pnl_liab10 = lay_pnl_liab_ref * legacy_scale
+
+        extra = {
+            "forecast_rank": forecast_rank,
+            "forecast_odds": forecast_odds_val,
+            "forecast_name_clean": name_clean,
+            "value_ratio": value_ratio,
+            "value_log": value_log,
+        }
+
+        out_back = {
+            **base_neutral,
+            **extra,
+            "entry_type": "back",
+            "back_target_name": name_clean,
+            "back_target_bsp": round(odd, 2),
+            "trap_number": trap_number if trap_number is not None else pd.NA,
+            "lay_target_name": "",
+            "lay_target_bsp": float("nan"),
+            "stake_ref": round(stake_ref, 2),
+            "liability_from_stake_ref": 0.0,
+            "stake_for_liability_ref": 0.0,
+            "liability_ref": 0.0,
+            "pnl_stake_ref": round(back_pnl_stake_ref, 4),
+            "pnl_liability_ref": 0.0,
+            "roi_row_stake_ref": round(back_pnl_stake_ref / stake_ref if stake_ref > 0 else 0.0, 4),
+            "roi_row_liability_ref": 0.0,
+            "roi_row_exposure_ref": 0.0,
+            "stake_fixed_10": round(stake_fix10, 2),
+            "liability_from_stake_fixed_10": 0.0,
+            "stake_for_liability_10": 0.0,
+            "liability_fixed_10": 0.0,
+            "win_lose": target_win_lose,
+            "is_green": back_is_green,
+            "pnl_stake_fixed_10": round(back_pnl_stake10, 2),
+            "pnl_liability_fixed_10": 0.0,
+            "roi_row_stake_fixed_10": round(back_pnl_stake10 / stake_fix10 if stake_fix10 > 0 else 0.0, 4),
+            "roi_row_liability_fixed_10": 0.0,
+            "roi_row_exposure_fixed_10": 0.0,
+        }
+
+        out_lay = {
+            **base_neutral,
+            **extra,
+            "entry_type": "lay",
+            "back_target_name": "",
+            "back_target_bsp": float("nan"),
+            "lay_target_name": name_clean,
+            "lay_target_bsp": round(odd, 2),
+            "trap_number": trap_number if trap_number is not None else pd.NA,
+            "stake_ref": round(stake_ref, 2),
+            "liability_from_stake_ref": round(liability_from_stake_ref, 4),
+            "stake_for_liability_ref": round(stake_from_liab_ref, 4),
+            "liability_ref": round(liability_ref, 2),
+            "pnl_stake_ref": round(lay_pnl_stake_ref, 4),
+            "pnl_liability_ref": round(lay_pnl_liab_ref, 4),
+            "roi_row_stake_ref": round(lay_pnl_stake_ref / stake_ref if stake_ref > 0 else 0.0, 4),
+            "roi_row_liability_ref": round(lay_pnl_liab_ref / liability_ref if liability_ref > 0 else 0.0, 4),
+            "roi_row_exposure_ref": round(
+                lay_pnl_stake_ref / liability_from_stake_ref if liability_from_stake_ref > 0 else 0.0,
+                4,
+            ),
+            "stake_fixed_10": round(stake_fix10, 2),
+            "liability_from_stake_fixed_10": round(liability_from_stake10, 2),
+            "stake_for_liability_10": round(stake_from_liab10, 2),
+            "liability_fixed_10": round(liability_fix10, 2),
+            "win_lose": target_win_lose,
+            "is_green": lay_is_green,
+            "pnl_stake_fixed_10": round(lay_pnl_stake10, 2),
+            "pnl_liability_fixed_10": round(lay_pnl_liab10, 2),
+            "roi_row_stake_fixed_10": round(lay_pnl_stake10 / stake_fix10 if stake_fix10 > 0 else 0.0, 4),
+            "roi_row_liability_fixed_10": round(lay_pnl_liab10 / liability_fix10 if liability_fix10 > 0 else 0.0, 4),
+            "roi_row_exposure_fixed_10": round(
+                lay_pnl_stake10 / liability_from_stake10 if liability_from_stake10 > 0 else 0.0,
+                4,
+            ),
+        }
+
+        # Direcao por value_ratio (back_target_bsp / forecast_odds): acima do minimo -> back;
+        # abaixo do maximo -> lay; entre os dois -> sem sinal
+        if pd.isna(value_ratio):
+            continue
+        if value_ratio >= settings.FORECAST_ODDS_BACK_MIN_VALUE_RATIO:
+            result.append(out_back)
+        elif value_ratio <= settings.FORECAST_ODDS_LAY_MAX_VALUE_RATIO:
+            result.append(out_lay)
+        # else: zona morta (entre lay_max e back_min), nao gera sinal
+
+    # Garantia: no maximo um sinal por (race_id, selection_id) para forecast_odds
+    result = _dedupe_forecast_odds_signals_by_race_selection(result, track_key, race_iso)
+    return result
+
+
 def _build_betfair_direct_rows(
     bf_win_index: Dict[Tuple[str, str], Dict[str, RunnerBF]]
 ) -> List[dict]:
@@ -589,28 +962,42 @@ def generate_signals(
     bf_win_index = load_betfair_win()
     bf_place_index = load_betfair_place() if market == "place" else None
 
-    if source == "forecast":
+    if source == "forecast" and rule == "forecast_odds":
+        df_forecast = load_timeform_forecast_all()
+        tf_rows = _forecast_all_df_to_tf_rows(df_forecast)
+        use_forecast_odds = True
+    elif source == "forecast":
         tf_rows = load_timeform_forecast_top3()
+        use_forecast_odds = False
     elif source == "betfair_resultado":
         tf_rows = _build_betfair_direct_rows(bf_win_index)
+        use_forecast_odds = False
     else:
         tf_rows = load_timeform_top3()
+        use_forecast_odds = False
 
     signals_rows: List[dict] = []
     for row in tf_rows:
-        results = _calc_signals_for_race(
-            row,
-            bf_win_index,
-            bf_place_index,
-            market=market,
-            rule=rule,
-            leader_share_min=leader_share_min,
-        )
+        if use_forecast_odds:
+            results = _calc_signals_forecast_odds_for_race(
+                row, bf_win_index, bf_place_index, market=market, rule=rule
+            )
+        else:
+            results = _calc_signals_for_race(
+                row,
+                bf_win_index,
+                bf_place_index,
+                market=market,
+                rule=rule,
+                leader_share_min=leader_share_min,
+            )
         for result in results:
             if entry_type in ("both", result.get("entry_type")):
                 signals_rows.append(result)
 
     df = pd.DataFrame(signals_rows)
+    if rule == "forecast_odds" and not df.empty:
+        _assert_forecast_odds_unique_race_selection(df)
     logger.info(
         "Sinais encontrados (source={}, market={}, rule={}, leader_share_min={}, entry_type={}): {}",
         source,
@@ -688,6 +1075,11 @@ def write_signals_csv(
                 "roi_row_stake_fixed_10",
                 "roi_row_liability_fixed_10",
                 "roi_row_exposure_fixed_10",
+                "forecast_rank",
+                "forecast_odds",
+                "forecast_name_clean",
+                "value_ratio",
+                "value_log",
                 "source",
                 "market",
                 "rule",
@@ -712,11 +1104,75 @@ def write_signals_csv(
 
 __all__ = [
     "RunnerBF",
+    "_signal_race_selection_key",
     "generate_signals",
     "load_betfair_place",
     "load_betfair_win",
+    "load_timeform_forecast_all",
     "load_timeform_forecast_top3",
     "load_timeform_top3",
     "write_signals_csv",
 ]
+
+
+def _debug_load_timeform_forecast_all() -> None:
+    """Teste rapido: chama load_timeform_forecast_all(), imprime quantidade de corridas,
+    distribuicao de itens por corrida e 2 exemplos de forecast_items.
+    Executar: python -m src.greyhounds.analysis.signals
+    """
+    df = load_timeform_forecast_all()
+    n = len(df)
+    print(f"Corridas carregadas: {n}")
+    if n == 0:
+        return
+    counts = df["forecast_items"].map(len)
+    print(
+        f"Distribuicao de itens por corrida: min={counts.min()}, "
+        f"median={counts.median():.0f}, max={counts.max()}"
+    )
+    for i, row in df.head(2).iterrows():
+        print(f"\nExemplo corrida {i + 1}: track_key={row['track_key']!r}, race_iso={row['race_iso']!r}")
+        print("forecast_items:", row["forecast_items"])
+
+
+def _debug_forecast_odds_small_sample() -> None:
+    """Valida geracao de sinais forecast_odds: total de linhas, entry_type, value_ratio, 5 exemplos.
+    forecast_odds gera no maximo 1 linha por galgo/corrida (back ou lay); value_counts pode ser desigual.
+    Controla tamanho via env:
+    - GREYHOUNDS_DEBUG_MAX_ROWS: limita linhas usadas nos prints (default 50000)
+    """
+    df = generate_signals(source="forecast", market="win", rule="forecast_odds", entry_type="both")
+    print(f"Total de linhas (gerado): {len(df)}")
+    if len(df) == 0:
+        return
+
+    max_rows = int(os.getenv("GREYHOUNDS_DEBUG_MAX_ROWS", "50000"))
+    if len(df) > max_rows:
+        df = df.sample(n=max_rows, random_state=42).reset_index(drop=True)
+        print(f"Amostrando {max_rows} linhas para estatísticas/prints.")
+    print("\ndf['entry_type'].value_counts():")
+    print(df["entry_type"].value_counts())
+    print("\ndf['value_ratio'].describe():")
+    print(df["value_ratio"].describe())
+    print("\nContagem NaN: forecast_odds={}, back_target_bsp={}".format(
+        df["forecast_odds"].isna().sum(), df["back_target_bsp"].isna().sum()
+    ))
+    cols = [
+        "track_name", "race_time_iso", "entry_type", "forecast_rank", "forecast_odds",
+        "back_target_bsp", "lay_target_bsp", "value_ratio", "win_lose", "pnl_stake_ref",
+    ]
+    available = [c for c in cols if c in df.columns]
+    print("\n5 linhas (colunas: {}):".format(available))
+    print(df[available].head(5).to_string())
+
+
+if __name__ == "__main__":
+    # Debug leve sempre ok
+    _debug_load_timeform_forecast_all()
+
+    # Debug pesado (gera sinais) só se habilitar explicitamente:
+    #   GREYHOUNDS_DEBUG_FORECAST_ODDS=1 python -m src.greyhounds.analysis.signals
+    if os.getenv("GREYHOUNDS_DEBUG_FORECAST_ODDS", "").strip() in ("1", "true", "yes", "y"):
+        print("\n--- forecast_odds ---")
+        _debug_forecast_odds_small_sample()
 
