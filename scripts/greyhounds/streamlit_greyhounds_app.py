@@ -1553,9 +1553,34 @@ def main() -> None:
                     axis=1,
                 )
             monthly_df = monthly_df.drop(columns=["_period"], errors="ignore")
+            # Nomes mais claros para colunas de tendencia
+            monthly_df = monthly_df.rename(columns={
+                "base_cum": "Base acum.",
+                "pnl_cum": "PnL acum.",
+                "ROI Stake (acum)": "ROI acum.",
+                "base_3m": "Base (3M)",
+                "pnl_3m": "PnL (3M)",
+                "ROI Stake (3M)": "ROI (3M)",
+                "base_liab_cum": "Base acum. (Liab)",
+                "pnl_liab_cum": "PnL acum. (Liab)",
+                "ROI Liability (acum)": "ROI acum. (Liab)",
+                "base_liab_3m": "Base (3M Liab)",
+                "pnl_liab_3m": "PnL (3M Liab)",
+                "ROI Liability (3M)": "ROI (3M Liab)",
+            })
         month_order = monthly_df["Mes/Ano"].tolist() if not monthly_df.empty else []
         with st.expander(f"Relatorio mensal ({entry_kind.upper()})", expanded=False):
-            st.dataframe(monthly_df.style.format({"Assertividade": "{:.2%}"}), use_container_width=True)
+            _fmt_monthly = {}
+            for c in monthly_df.columns:
+                if c == "Mes/Ano":
+                    continue
+                if c in ("Assertividade", "ROI Stake", "ROI acum.", "ROI (3M)") or "ROI" in c:
+                    _fmt_monthly[c] = "{:.2%}"
+                elif c in ("Pistas", "Sinais", "Greens", "Reds"):
+                    _fmt_monthly[c] = "{:.0f}"
+                else:
+                    _fmt_monthly[c] = "{:.2f}"
+            st.dataframe(monthly_df.style.format(_fmt_monthly), use_container_width=True)
             chart_data = working.copy()
             chart_data["date_only"] = chart_data["race_ts"].dt.date
             chart_data["_pnl_stake"] = get_col(chart_data, "pnl_stake_ref", "pnl_stake_fixed_10")
