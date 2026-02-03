@@ -1437,14 +1437,16 @@ def main() -> None:
         def _pref(ref_name: str, legacy_name: str) -> str:
             return ref_name if ref_name in df_block.columns else legacy_name
 
+        _volume_cols = [
+            "total_matched_volume", "vol_top1", "vol_top2", "vol_top3",
+            "second_name_by_volume", "third_name_by_volume", "pct_diff_second_vs_third",
+        ]
         show_cols = [
             "date", "track_name", "category_token", "race_time_iso",
-            "num_runners", "total_matched_volume",
-            "tf_top1", "tf_top2", "tf_top3",
-            "vol_top1", "vol_top2", "vol_top3",
-            "second_name_by_volume", "third_name_by_volume",
-            "pct_diff_second_vs_third",
+            "num_runners", "tf_top1", "tf_top2", "tf_top3",
         ]
+        if rule != "forecast_odds":
+            show_cols += _volume_cols
         if rule == "forecast_odds":
             show_cols += ["forecast_rank", "forecast_odds", "forecast_name_clean", "value_ratio", "value_log"]
         stake_col = _pref("stake_ref", "stake_fixed_10")
@@ -1835,36 +1837,42 @@ def main() -> None:
         for c in missing:
             filt[c] = ""
 
+        _vol_cols = [
+            "total_matched_volume", "vol_top1", "vol_top2", "vol_top3",
+            "second_name_by_volume", "third_name_by_volume", "pct_diff_second_vs_third",
+        ]
         if entry_type == "back":
             show_cols = [
                 "date", "track_name", "category_token", "race_time_iso",
-                "num_runners", "total_matched_volume",
-                "tf_top1", "tf_top2", "tf_top3",
-                "vol_top1", "vol_top2", "vol_top3",
-                "second_name_by_volume", "third_name_by_volume",
+                "num_runners", "tf_top1", "tf_top2", "tf_top3",
+            ]
+            if rule != "forecast_odds":
+                show_cols += _vol_cols
+            show_cols += [
                 "back_target_name", "back_target_bsp",
                 _pref("stake_ref", "stake_fixed_10"),
                 "win_lose", "is_green", _pref("pnl_stake_ref", "pnl_stake_fixed_10"),
                 _pref("roi_row_stake_ref", "roi_row_stake_fixed_10"),
-                "pct_diff_second_vs_third",
             ]
+            if rule == "forecast_odds":
+                show_cols += ["forecast_rank", "forecast_odds", "forecast_name_clean", "value_ratio", "value_log"]
         else:
             show_cols = [
                 "date", "track_name", "category_token", "race_time_iso",
-                "num_runners", "total_matched_volume",
-                "tf_top1", "tf_top2", "tf_top3",
-                "vol_top1", "vol_top2", "vol_top3",
-                "second_name_by_volume", "third_name_by_volume",
+                "num_runners", "tf_top1", "tf_top2", "tf_top3",
+            ]
+            if rule != "forecast_odds":
+                show_cols += _vol_cols
+            show_cols += [
                 "lay_target_name", "lay_target_bsp",
                 _pref("stake_ref", "stake_fixed_10"), _pref("liability_from_stake_ref", "liability_from_stake_fixed_10"),
                 _pref("stake_for_liability_ref", "stake_for_liability_10"), _pref("liability_ref", "liability_fixed_10"),
                 "win_lose", "is_green", _pref("pnl_stake_ref", "pnl_stake_fixed_10"), _pref("pnl_liability_ref", "pnl_liability_fixed_10"),
                 _pref("roi_row_stake_ref", "roi_row_stake_fixed_10"), _pref("roi_row_liability_ref", "roi_row_liability_fixed_10"),
                 _pref("roi_row_exposure_ref", "roi_row_exposure_fixed_10"),
-                "pct_diff_second_vs_third",
             ]
-        if rule == "forecast_odds":
-            show_cols += ["forecast_rank", "forecast_odds", "forecast_name_clean", "value_ratio", "value_log"]
+            if rule == "forecast_odds":
+                show_cols += ["forecast_rank", "forecast_odds", "forecast_name_clean", "value_ratio", "value_log"]
 
         missing = [c for c in show_cols if c not in filt.columns]
         for c in missing:
