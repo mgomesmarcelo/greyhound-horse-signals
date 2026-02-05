@@ -52,6 +52,19 @@ def _to_iso_yyyy_mm_dd_thh_mm(value: str) -> str:
         return ""
 
 
+def _extract_category_letter(event_name: str) -> str:
+    txt = str(event_name or "").strip()
+    m = re.match(r"^([A-Za-z]+)", txt)
+    token = m.group(1).upper() if m else ""
+    return token[:1] if token else ""
+
+
+def _extract_category_token(event_name: str) -> str:
+    txt = str(event_name or "").strip()
+    m = re.match(r"^([A-Za-z]+\d*)", txt)
+    return m.group(1).upper() if m else ""
+
+
 _FORECAST_ITEM_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+(.+)$", re.IGNORECASE)
 
 
@@ -237,6 +250,56 @@ def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
 
     logger.info("Betfair PLACE index criado: {} corridas", len(index))
     return index
+
+
+def build_category_index_from_results() -> Dict[Tuple[str, str], Dict[str, str]]:
+    """
+    Constroi indice (track_key, race_iso) -> {"letter": ..., "token": ...} a partir dos
+    arquivos de resultado Betfair WIN (dwbfgreyhoundwin*). Parquet preferencial, csv fallback.
+    Usado uma vez por execucao em generate_signals() para enriquecer e persistir no Parquet.
+    """
+    all_files = _iter_result_paths("dwbfgreyhoundwin*")
+    mapping: Dict[Tuple[str, str], Dict[str, str]] = {}
+    columns = ("menu_hint", "event_dt", "event_name")
+
+    for path in all_files:
+        try:
+            if path.suffix.lower() == ".parquet":
+                df = pd.read_parquet(path)
+            else:
+                df = pd.read_csv(
+                    path,
+                    encoding=settings.CSV_ENCODING,
+                    engine="python",
+                    on_bad_lines="skip",
+                )
+        except Exception as exc:
+            logger.warning("build_category_index: falha ao ler {}: {}", path.name, exc)
+            continue
+        for col in columns:
+            if col not in df.columns:
+                df[col] = ""
+        if df.empty:
+            continue
+        df["track_key"] = df["menu_hint"].astype(str).map(_extract_track_from_menu_hint)
+        df["race_iso"] = df["event_dt"].astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
+        df["cat_letter"] = df["event_name"].astype(str).map(_extract_category_letter)
+        df["cat_token"] = df["event_name"].astype(str).map(_extract_category_token)
+        mask = (df["track_key"].astype(str) != "") & (df["race_iso"].astype(str) != "")
+        df = df.loc[mask].drop_duplicates(subset=["track_key", "race_iso"], keep="first")
+        if df.empty:
+            continue
+        keys = list(zip(df["track_key"].astype(str), df["race_iso"].astype(str)))
+        values = [
+            {"letter": str(a), "token": str(b)}
+            for a, b in zip(df["cat_letter"], df["cat_token"])
+        ]
+        for k, v in zip(keys, values):
+            if k not in mapping:
+                mapping[k] = v
+
+    logger.info("Indice de categoria (WIN) criado: {} corridas", len(mapping))
+    return mapping
 
 
 def load_timeform_top3() -> List[dict]:
@@ -496,6 +559,7 @@ def _calc_signals_forecast_odds_for_race(
     bf_place_index: Dict[Tuple[str, str], Dict[str, RunnerBF]] | None,
     market: str,
     rule: str = "forecast_odds",
+    cat_index: Dict[Tuple[str, str], Dict[str, str]] | None = None,
 ) -> List[dict]:
     """Gera sinais por runner do forecast que casou com Betfair: no maximo 1 linha por galgo/corrida.
     value_ratio = back_target_bsp / forecast_odds. Se value_ratio >= FORECAST_ODDS_BACK_MIN_VALUE_RATIO
@@ -525,6 +589,10 @@ def _calc_signals_forecast_odds_for_race(
     tf_top2 = forecast_items[1].get("forecast_name_clean") or "" if len(forecast_items) >= 2 else ""
     tf_top3 = forecast_items[2].get("forecast_name_clean") or "" if len(forecast_items) >= 3 else ""
 
+    _cat = (cat_index or {}).get((track_key, race_iso), {}) or {}
+    category = _cat.get("letter", "") or ""
+    category_token = _cat.get("token", "") or ""
+
     base_neutral = {
         "date": race_iso.split("T")[0] if race_iso else "",
         "track_name": raw.get("track_name", track_key),
@@ -542,6 +610,8 @@ def _calc_signals_forecast_odds_for_race(
         "leader_name_by_volume": "",
         "leader_volume_share_pct": 0.0,
         "num_runners": int(num_runners),
+        "category": category,
+        "category_token": category_token,
         "market": market,
         "rule": rule,
         "rule_label": RULE_LABELS.get(rule, rule),
@@ -736,6 +806,7 @@ def _calc_signals_for_race(
     market: str = "win",
     rule: str = "terceiro_queda50",
     leader_share_min: float = 0.5,
+    cat_index: Dict[Tuple[str, str], Dict[str, str]] | None = None,
 ) -> List[dict]:
     track_key = tf_row["track_key"]
     race_iso = tf_row["race_iso"]
@@ -840,6 +911,10 @@ def _calc_signals_for_race(
 
     raw = tf_row["raw"]
 
+    _cat = (cat_index or {}).get((track_key, race_iso), {}) or {}
+    category = _cat.get("letter", "") or ""
+    category_token = _cat.get("token", "") or ""
+
     def _vol_for(name_raw: object) -> float:
         name = clean_greyhound_name(str(name_raw)) if isinstance(name_raw, str) else ""
         return next((vol for runner_name, vol, _ in triples if runner_name == name), 0.0)
@@ -861,6 +936,8 @@ def _calc_signals_for_race(
         "leader_name_by_volume": first[0],
         "leader_volume_share_pct": round(leader_share * 100.0, 2),
         "num_runners": int(num_runners),
+        "category": category,
+        "category_token": category_token,
         "market": market,
         "rule": rule,
         "rule_label": RULE_LABELS.get(rule, rule),
@@ -961,6 +1038,7 @@ def generate_signals(
 ) -> pd.DataFrame:
     bf_win_index = load_betfair_win()
     bf_place_index = load_betfair_place() if market == "place" else None
+    cat_index = build_category_index_from_results()
 
     if source == "forecast" and rule == "forecast_odds":
         df_forecast = load_timeform_forecast_all()
@@ -980,7 +1058,7 @@ def generate_signals(
     for row in tf_rows:
         if use_forecast_odds:
             results = _calc_signals_forecast_odds_for_race(
-                row, bf_win_index, bf_place_index, market=market, rule=rule
+                row, bf_win_index, bf_place_index, market=market, rule=rule, cat_index=cat_index
             )
         else:
             results = _calc_signals_for_race(
@@ -990,6 +1068,7 @@ def generate_signals(
                 market=market,
                 rule=rule,
                 leader_share_min=leader_share_min,
+                cat_index=cat_index,
             )
         for result in results:
             if entry_type in ("both", result.get("entry_type")):
@@ -1047,6 +1126,8 @@ def write_signals_csv(
                 "ratio_second_over_third",
                 "pct_diff_second_vs_third",
                 "num_runners",
+                "category",
+                "category_token",
                 "trap_number",
                 "lay_target_name",
                 "lay_target_bsp",
@@ -1088,9 +1169,20 @@ def write_signals_csv(
             ],
         )
     else:
+        if "category" not in df.columns:
+            df["category"] = ""
+        if "category_token" not in df.columns:
+            df["category_token"] = ""
         df_sorted = df.sort_values(
             ["date", "track_name", "race_time_iso", "entry_type"]
         ).reset_index(drop=True)
+
+    if "num_runners" not in df_sorted.columns:
+        df_sorted["num_runners"] = pd.Series(dtype="Int64") if df_sorted.empty else pd.array([pd.NA] * len(df_sorted), dtype="Int64")
+    if "category" not in df_sorted.columns:
+        df_sorted["category"] = ""
+    if "category_token" not in df_sorted.columns:
+        df_sorted["category_token"] = ""
 
     write_dataframe_snapshots(df_sorted, raw_path=raw_path, parquet_path=parquet_path)
     logger.info(
@@ -1105,6 +1197,7 @@ def write_signals_csv(
 __all__ = [
     "RunnerBF",
     "_signal_race_selection_key",
+    "build_category_index_from_results",
     "generate_signals",
     "load_betfair_place",
     "load_betfair_win",

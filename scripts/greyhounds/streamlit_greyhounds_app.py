@@ -82,15 +82,18 @@ def _cached_category_index(
         df_r["race_iso"] = df_r["event_dt"].astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
         df_r["cat_letter"] = df_r["event_name"].astype(str).map(_extract_category_letter)
         df_r["cat_token"] = df_r["event_name"].astype(str).map(_extract_category_token)
-        for _, r in df_r.iterrows():
-            key = (str(r["track_key"]), str(r["race_iso"]))
-            if not key[0] or not key[1]:
-                continue
-            if key not in mapping:
-                mapping[key] = {
-                    "letter": str(r.get("cat_letter", "")),
-                    "token": str(r.get("cat_token", "")),
-                }
+        mask = (df_r["track_key"].astype(str) != "") & (df_r["race_iso"].astype(str) != "")
+        df_r = df_r.loc[mask].drop_duplicates(subset=["track_key", "race_iso"], keep="first")
+        if df_r.empty:
+            continue
+        keys = list(zip(df_r["track_key"].astype(str), df_r["race_iso"].astype(str)))
+        values = [
+            {"letter": str(a), "token": str(b)}
+            for a, b in zip(df_r["cat_letter"], df_r["cat_token"])
+        ]
+        for k, v in zip(keys, values):
+            if k not in mapping:
+                mapping[k] = v
     return mapping
 
 
@@ -109,10 +112,10 @@ def _cached_num_runners_index(
             continue
         df_r["track_key"] = df_r["menu_hint"].astype(str).map(_extract_track_from_menu_hint)
         df_r["race_iso"] = df_r["event_dt"].astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
-        grp = df_r.groupby(["track_key", "race_iso"], dropna=False).size()
-        for (tk, ri), n in grp.items():
-            if isinstance(tk, str) and tk and isinstance(ri, str) and ri:
-                counts[(tk, ri)] = int(n)
+        mask = (df_r["track_key"].astype(str) != "") & (df_r["race_iso"].astype(str) != "")
+        df_r = df_r.loc[mask]
+        grp = df_r.groupby(["track_key", "race_iso"]).size()
+        counts.update(((str(k[0]), str(k[1])), int(v)) for k, v in grp.items())
     return counts
 
 
@@ -342,25 +345,22 @@ def load_signals_enriched(
         df["_key_track"] = df["track_name"].astype(str).map(normalize_track_name)
         df["_key_race"] = df["race_time_iso"].astype(str)
 
-    # Enriquecimento: numero de corredores (fallback se ausente no parquet)
-    if "num_runners" not in df.columns:
-        num_index = _build_num_runners_index()
-        df["num_runners"] = df.apply(
-            lambda r: num_index.get((str(r.get("_key_track", "")), str(r.get("_key_race", ""))), pd.NA),
-            axis=1,
-        )
+    if "_key_track" in df.columns and "_key_race" in df.columns:
+        keys = list(zip(df["_key_track"].astype(str), df["_key_race"].astype(str)))
+        keys_series = pd.Series(keys, index=df.index)
 
-    # Enriquecimento: categoria por corrida (A/B/D etc.) somente se faltar
-    if ("category" not in df.columns) or ("category_token" not in df.columns):
-        cat_index = _build_category_index()
-        df["category"] = df.apply(
-            lambda r: (cat_index.get((str(r.get("_key_track", "")), str(r.get("_key_race", ""))), {}) or {}).get("letter", ""),
-            axis=1,
-        )
-        df["category_token"] = df.apply(
-            lambda r: (cat_index.get((str(r.get("_key_track", "")), str(r.get("_key_race", ""))), {}) or {}).get("token", ""),
-            axis=1,
-        )
+        # Enriquecimento: numero de corredores (fallback se ausente no parquet)
+        if "num_runners" not in df.columns:
+            num_index = _build_num_runners_index()
+            df["num_runners"] = keys_series.map(num_index).astype("Int64")
+
+        # Enriquecimento: categoria por corrida (A/B/D etc.) somente se faltar
+        if ("category" not in df.columns) or ("category_token" not in df.columns):
+            cat_index = _build_category_index()
+            cat_letter = {k: v.get("letter", "") for k, v in cat_index.items()}
+            cat_token = {k: v.get("token", "") for k, v in cat_index.items()}
+            df["category"] = keys_series.map(cat_letter).fillna("").astype(str)
+            df["category_token"] = keys_series.map(cat_token).fillna("").astype(str)
 
     return df
 
@@ -968,14 +968,6 @@ def main() -> None:
             st.caption("BSP max.")
 
         # (campo movido para a frente do cabecalho de Stake)
-
-    # Enriquecimento: num_runners (fallback se ausente)
-    if "num_runners" not in df_filtered.columns:
-        num_index = _build_num_runners_index()
-        if not df_filtered.empty:
-            df_filtered["_key_track"] = df_filtered["track_name"].astype(str).map(normalize_track_name)
-            df_filtered["_key_race"] = df_filtered["race_time_iso"].astype(str)
-            df_filtered["num_runners"] = df_filtered.apply(lambda r: num_index.get((str(r["_key_track"]), str(r["_key_race"])), pd.NA), axis=1)
 
     filt = df_filtered.copy()
 
