@@ -251,7 +251,6 @@ def _render_base_amount_input() -> float:
             "Unidades por aposta (% da banca)",
             min_value=0.01,
             max_value=100000.0,
-            value=float(st.session_state["base_amount"]),
             step=0.50,
             format="%.2f",
             key="base_amount",
@@ -753,7 +752,6 @@ def main() -> None:
             with start_col:
                 start_selected = st.date_input(
                     "Data inicial",
-                    value=sanitized_start,
                     min_value=min_date,
                     max_value=max_date,
                     key=date_start_key,
@@ -762,7 +760,6 @@ def main() -> None:
             with end_col:
                 end_selected = st.date_input(
                     "Data final",
-                    value=sanitized_end,
                     min_value=min_date,
                     max_value=max_date,
                     key=date_end_key,
@@ -781,7 +778,7 @@ def main() -> None:
                 datetime.datetime.combine(range_end, datetime.time.min),
             )
 
-            # Valor inicial do slider (clamp), sem sobrescrever após renderizar
+            # Valor do slider: session_state como unica fonte; clamp antes do widget
             current_slider_value = st.session_state.get(slider_key, default_slider_value)
             if not isinstance(current_slider_value, (tuple, list)) or len(current_slider_value) != 2:
                 current_slider_value = default_slider_value
@@ -805,12 +802,12 @@ def main() -> None:
                 if start_norm > end_norm:
                     end_norm = start_norm
                 current_slider_value = (start_norm, end_norm)
+            st.session_state[slider_key] = current_slider_value
 
             slider_start_dt, slider_end_dt = st.slider(
                 "Intervalo de datas (barra)",
                 min_value=slider_min_dt,
                 max_value=slider_max_dt,
-                value=current_slider_value,
                 format="YYYY-MM-DD",
                 key=slider_key,
                 disabled=active_mode == "Calendário",
@@ -856,15 +853,15 @@ def main() -> None:
                 key="tracks_none",
                 on_click=lambda: st.session_state.update({"tracks_ms": []}),
             )
-        existing_tracks = st.session_state.get("tracks_ms")
-        if existing_tracks is None:
-            sanitized_tracks = list(tracks)
+        if "tracks_ms" not in st.session_state:
+            st.session_state["tracks_ms"] = list(tracks)
         else:
+            existing_tracks = st.session_state["tracks_ms"]
             sanitized_tracks = [t for t in existing_tracks if t in tracks]
             if not sanitized_tracks and existing_tracks:
                 sanitized_tracks = list(tracks)
-        st.session_state["tracks_ms"] = sanitized_tracks
-        sel_tracks = st.multiselect("Pistas", tracks, default=sanitized_tracks, key="tracks_ms")
+            st.session_state["tracks_ms"] = sanitized_tracks
+        sel_tracks = st.multiselect("Pistas", tracks, key="tracks_ms")
     with col_f3:
         if entry_type == "lay":
             bsp_col = "lay_target_bsp"
@@ -901,18 +898,19 @@ def main() -> None:
             bsp_max = max(bsp_min, 100.0)
         bsp_min = max(1.01, round(bsp_min, 2))
         bsp_max = max(bsp_min, round(bsp_max, 2))
-        # Inicializa defaults/clamp atuais em session_state
+        # Garante bsp_low/bsp_high existem; sanitiza e sincroniza bsp_slider antes do widget
         if "bsp_low" not in st.session_state or "bsp_high" not in st.session_state:
             st.session_state["bsp_low"] = float(bsp_min)
             st.session_state["bsp_high"] = float(bsp_max)
-        else:
-            st.session_state["bsp_low"] = max(bsp_min, min(bsp_max, float(st.session_state["bsp_low"])))
-            st.session_state["bsp_high"] = max(bsp_min, min(bsp_max, float(st.session_state["bsp_high"])))
-            if st.session_state["bsp_low"] > st.session_state["bsp_high"]:
-                st.session_state["bsp_high"] = st.session_state["bsp_low"]
-
-        if "bsp_slider" not in st.session_state:
-            st.session_state["bsp_slider"] = (float(st.session_state["bsp_low"]), float(st.session_state["bsp_high"]))
+        low = float(st.session_state["bsp_low"])
+        high = float(st.session_state["bsp_high"])
+        low = max(bsp_min, min(bsp_max, low))
+        high = max(bsp_min, min(bsp_max, high))
+        if low > high:
+            high = low
+        st.session_state["bsp_low"] = low
+        st.session_state["bsp_high"] = high
+        st.session_state["bsp_slider"] = (low, high)
 
         def _sync_bsp_from_slider() -> None:
             low, high = st.session_state["bsp_slider"]
@@ -939,9 +937,9 @@ def main() -> None:
             "Faixa BSP alvo",
             min_value=float(bsp_min),
             max_value=float(bsp_max),
-            value=(float(st.session_state["bsp_low"]), float(st.session_state["bsp_high"])),
             step=0.01,
-            key="bsp_slider", on_change=_sync_bsp_from_slider,
+            key="bsp_slider",
+            on_change=_sync_bsp_from_slider,
         )
         c41, c42, _ = st.columns([1, 1, 2])
         with c41:
@@ -949,7 +947,6 @@ def main() -> None:
                 "BSP minimo",
                 min_value=float(bsp_min),
                 max_value=float(bsp_max),
-                value=float(st.session_state["bsp_low"]),
                 step=0.01,
                 format="%.2f",
                 key="bsp_low",
@@ -962,7 +959,6 @@ def main() -> None:
                 "BSP maximo",
                 min_value=float(bsp_min),
                 max_value=float(bsp_max),
-                value=float(st.session_state["bsp_high"]),
                 step=0.01,
                 format="%.2f",
                 key="bsp_high",
@@ -995,7 +991,6 @@ def main() -> None:
                 "Volume total negociado mínimo",
                 min_value=0.0,
                 max_value=1_000_000.0,
-                value=float(st.session_state[volume_key]),
                 step=100.0,
                 format="%.0f",
                 key=volume_key,
@@ -1027,12 +1022,17 @@ def main() -> None:
         # Caixa mais curta abaixo dos botoes (agora menor)
         col_ms, _ = st.columns([2, 8])
         with col_ms:
-            prev_nr = st.session_state.get("sel_num_runners", nr_vals.copy())
-            default_nr = [v for v in prev_nr if v in nr_vals]
+            if "num_runners_ms" not in st.session_state:
+                st.session_state["num_runners_ms"] = list(nr_vals)
+            else:
+                existing_nr = st.session_state["num_runners_ms"]
+                sanitized_nr = [v for v in existing_nr if v in nr_vals]
+                if not sanitized_nr and existing_nr:
+                    sanitized_nr = list(nr_vals)
+                st.session_state["num_runners_ms"] = sanitized_nr
             sel_nr = st.multiselect(
                 "Numero de corredores",
                 nr_vals,
-                default=default_nr if default_nr else nr_vals,
                 key="num_runners_ms",
                 label_visibility="collapsed",
             )
@@ -1068,16 +1068,21 @@ def main() -> None:
             rank_vals = sorted(pd.to_numeric(filt["forecast_rank"], errors="coerce").dropna().unique().astype(int).tolist())
             if not rank_vals:
                 rank_vals = list(range(1, 7))
-            default_ranks = st.session_state.get("forecast_rank_ms", rank_vals)
-            if not isinstance(default_ranks, list):
-                default_ranks = rank_vals
-            default_ranks = [r for r in default_ranks if r in rank_vals]
+            if "forecast_rank_ms" not in st.session_state:
+                st.session_state["forecast_rank_ms"] = list(rank_vals)
+            else:
+                existing_ranks = st.session_state["forecast_rank_ms"]
+                if not isinstance(existing_ranks, list):
+                    existing_ranks = rank_vals
+                sanitized_ranks = [r for r in existing_ranks if r in rank_vals]
+                if not sanitized_ranks and existing_ranks:
+                    sanitized_ranks = list(rank_vals)
+                st.session_state["forecast_rank_ms"] = sanitized_ranks
             col_rank, _ = st.columns([2, 8])
             with col_rank:
                 sel_ranks = st.multiselect(
                     "Forecast rank",
                     options=rank_vals,
-                    default=default_ranks if default_ranks else rank_vals,
                     key="forecast_rank_ms",
                 )
             if sel_ranks:
@@ -1088,13 +1093,19 @@ def main() -> None:
             vmax = float(vr.max()) if vr.notna().any() else 1.0
             if vmin >= vmax:
                 vmin, vmax = 0.0, max(1.0, vmax)
-            # Clamp defaults ao intervalo atual (evita erro quando filtro entry_type reduz o range)
-            stored_min = float(st.session_state.get("value_ratio_min", vmin))
-            stored_max = float(st.session_state.get("value_ratio_max", vmax))
-            value_ratio_min_default = max(vmin, min(vmax, stored_min))
-            value_ratio_max_default = max(vmin, min(vmax, stored_max))
-            if value_ratio_min_default > value_ratio_max_default:
-                value_ratio_max_default = value_ratio_min_default
+            # Session state como unica fonte; clamp ao intervalo atual
+            if "value_ratio_min" not in st.session_state:
+                st.session_state["value_ratio_min"] = float(vmin)
+            if "value_ratio_max" not in st.session_state:
+                st.session_state["value_ratio_max"] = float(vmax)
+            vr_low = max(vmin, min(vmax, float(st.session_state["value_ratio_min"])))
+            vr_high = max(vmin, min(vmax, float(st.session_state["value_ratio_max"])))
+            if vr_low > vr_high:
+                vr_high = vr_low
+            st.session_state["value_ratio_min"] = vr_low
+            st.session_state["value_ratio_max"] = vr_high
+            if "only_value_bets" not in st.session_state:
+                st.session_state["only_value_bets"] = False
             col_vr_wrapper, _ = st.columns([2, 8])
             with col_vr_wrapper:
                 col_vr1, col_vr2 = st.columns(2)
@@ -1103,7 +1114,6 @@ def main() -> None:
                         "Value ratio min",
                         min_value=vmin,
                         max_value=vmax,
-                        value=value_ratio_min_default,
                         step=0.05,
                         key="value_ratio_min",
                     )
@@ -1112,14 +1122,12 @@ def main() -> None:
                         "Value ratio max",
                         min_value=vmin,
                         max_value=vmax,
-                        value=value_ratio_max_default,
                         step=0.05,
                         key="value_ratio_max",
                     )
             filt = filt[filt["value_ratio"].fillna(float("nan")).between(value_ratio_min, value_ratio_max)]
             only_value_bets = st.checkbox(
                 "Somente value bets (value_ratio >= 1.0)",
-                value=bool(st.session_state.get("only_value_bets", False)),
                 key="only_value_bets",
             )
             if only_value_bets:
@@ -1197,12 +1205,17 @@ def main() -> None:
         # Caixa mais curta abaixo dos botoes
         col_ms, _ = st.columns([3, 7])
         with col_ms:
-            prev = st.session_state.get("sel_cats", cat_letters.copy())
-            default_cats = [c for c in prev if c in cat_letters]
+            if "cats_ms" not in st.session_state:
+                st.session_state["cats_ms"] = list(cat_letters)
+            else:
+                existing_cats = st.session_state["cats_ms"]
+                sanitized_cats = [c for c in existing_cats if c in cat_letters]
+                if not sanitized_cats and existing_cats:
+                    sanitized_cats = list(cat_letters)
+                st.session_state["cats_ms"] = sanitized_cats
             sel_cats = st.multiselect(
                 "Categoria (A/B/D...)",
                 cat_letters,
-                default=default_cats,
                 key="cats_ms",
                 label_visibility="collapsed",
             )
@@ -1242,12 +1255,17 @@ def main() -> None:
                     key="subcats_none",
                     on_click=lambda: st.session_state.update({"subcats_ms": []}),
                 )
-            prev_sc = st.session_state.get("sel_subcats", sub_tokens.copy())
-            default_sc = [t for t in prev_sc if t in sub_tokens]
+            if "subcats_ms" not in st.session_state:
+                st.session_state["subcats_ms"] = list(sub_tokens)
+            else:
+                existing_sc = st.session_state["subcats_ms"]
+                sanitized_sc = [t for t in existing_sc if t in sub_tokens]
+                if not sanitized_sc and existing_sc:
+                    sanitized_sc = list(sub_tokens)
+                st.session_state["subcats_ms"] = sanitized_sc
             sel_subcats = st.multiselect(
                 "Subcategorias (A1/A2/D1/OR3/...)",
                 sub_tokens,
-                default=default_sc,
                 key="subcats_ms",
                 label_visibility="collapsed",
             )
