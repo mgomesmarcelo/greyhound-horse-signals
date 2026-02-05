@@ -11,7 +11,12 @@ if __package__ in (None, ""):
     if str(project_root) not in sys.path:
         sys.path.append(str(project_root))
 
-from src.greyhounds.analysis.signals import generate_signals, write_signals_csv
+from src.greyhounds.analysis.signals import (
+    generate_signals,
+    load_betfair_place,
+    load_betfair_win,
+    write_signals_csv,
+)
 from src.greyhounds.config import RULE_LABELS, settings
 
 
@@ -38,13 +43,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    def _run_for(source_value: str, market_value: str, rule_value: str) -> None:
+    markets = [args.market] if args.market != "both" else ["win", "place"]
+    bf_win_index = load_betfair_win()
+    bf_place_index = load_betfair_place() if "place" in markets else None
+
+    def _run_for(
+        source_value: str,
+        market_value: str,
+        rule_value: str,
+        bf_win: "dict",
+        bf_place: "dict | None",
+    ) -> None:
         df = generate_signals(
             source=source_value,
             market=market_value,
             rule=rule_value,
             leader_share_min=args.leader_share_min,
             entry_type=args.entry_type,
+            bf_win_index=bf_win,
+            bf_place_index=bf_place,
         )
         out_path = write_signals_csv(df, source=source_value, market=market_value, rule=rule_value)
         rule_label = RULE_LABELS.get(rule_value, rule_value)
@@ -64,7 +81,6 @@ def main(argv: list[str] | None = None) -> int:
     else:
         sources = [args.source]
 
-    markets = [args.market] if args.market != "both" else ["win", "place"]
     rules = (
         [args.rule]
         if args.rule != "both"
@@ -82,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
                         rule_value,
                     )
                     continue
-                _run_for(source_value, market_value, rule_value)
+                _run_for(source_value, market_value, rule_value, bf_win_index, bf_place_index)
 
     return 0
 

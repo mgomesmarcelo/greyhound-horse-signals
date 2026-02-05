@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import math
 import os
+import pickle
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -140,6 +142,31 @@ def _iter_result_paths(pattern: str) -> List[Path]:
     return sorted(settings.RAW_RESULT_DIR.glob(f"{pattern}.csv"))
 
 
+def _result_current_files(pattern: str) -> Tuple[List[Path], Dict[str, float]]:
+    """Retorna (lista de paths, dict path_str -> mtime) para os arquivos encontrados por pattern."""
+    paths = _iter_result_paths(pattern)
+    current_files: Dict[str, float] = {}
+    for p in paths:
+        try:
+            current_files[str(p)] = p.stat().st_mtime
+        except OSError:
+            pass
+    return paths, current_files
+
+
+def _cache_dir() -> Path:
+    d = Path(settings.PROCESSED_DIR) / "cache"
+    _ensure_dir(d)
+    probe = d / ".write_check"
+    try:
+        probe.touch()
+        probe.unlink()
+    except OSError as e:
+        logger.warning("Cache dir existe mas nao e gravavel: {} ({})", d, e)
+        raise
+    return d
+
+
 def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
     all_files = _iter_result_paths("dwbfgreyhoundwin*")
     index: Dict[Tuple[str, str], Dict[str, RunnerBF]] = {}
@@ -252,54 +279,193 @@ def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
     return index
 
 
-def build_category_index_from_results() -> Dict[Tuple[str, str], Dict[str, str]]:
-    """
-    Constroi indice (track_key, race_iso) -> {"letter": ..., "token": ...} a partir dos
-    arquivos de resultado Betfair WIN (dwbfgreyhoundwin*). Parquet preferencial, csv fallback.
-    Usado uma vez por execucao em generate_signals() para enriquecer e persistir no Parquet.
-    """
-    all_files = _iter_result_paths("dwbfgreyhoundwin*")
-    mapping: Dict[Tuple[str, str], Dict[str, str]] = {}
-    columns = ("menu_hint", "event_dt", "event_name")
-
-    for path in all_files:
+def _read_category_partial(path: Path, columns: Tuple[str, ...], columns_list: List[str]) -> Dict[Tuple[str, str], Dict[str, str]]:
+    """Le um unico arquivo e retorna mapping parcial (track_key, race_iso) -> {"letter", "token"}."""
+    partial: Dict[Tuple[str, str], Dict[str, str]] = {}
+    try:
+        if path.suffix.lower() == ".parquet":
+            df = pd.read_parquet(path, columns=columns_list)
+        else:
+            df = pd.read_csv(
+                path,
+                usecols=columns_list,
+                dtype=str,
+                low_memory=False,
+                encoding=settings.CSV_ENCODING,
+                engine="python",
+                on_bad_lines="skip",
+            )
+    except Exception:
         try:
             if path.suffix.lower() == ".parquet":
                 df = pd.read_parquet(path)
             else:
                 df = pd.read_csv(
                     path,
+                    dtype=str,
+                    low_memory=False,
                     encoding=settings.CSV_ENCODING,
                     engine="python",
                     on_bad_lines="skip",
                 )
-        except Exception as exc:
-            logger.warning("build_category_index: falha ao ler {}: {}", path.name, exc)
-            continue
-        for col in columns:
-            if col not in df.columns:
-                df[col] = ""
-        if df.empty:
-            continue
-        df["track_key"] = df["menu_hint"].astype(str).map(_extract_track_from_menu_hint)
-        df["race_iso"] = df["event_dt"].astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
-        df["cat_letter"] = df["event_name"].astype(str).map(_extract_category_letter)
-        df["cat_token"] = df["event_name"].astype(str).map(_extract_category_token)
-        mask = (df["track_key"].astype(str) != "") & (df["race_iso"].astype(str) != "")
-        df = df.loc[mask].drop_duplicates(subset=["track_key", "race_iso"], keep="first")
-        if df.empty:
-            continue
-        keys = list(zip(df["track_key"].astype(str), df["race_iso"].astype(str)))
-        values = [
-            {"letter": str(a), "token": str(b)}
-            for a, b in zip(df["cat_letter"], df["cat_token"])
-        ]
-        for k, v in zip(keys, values):
-            if k not in mapping:
-                mapping[k] = v
+        except Exception:
+            return partial
+    for col in columns:
+        if col not in df.columns:
+            df[col] = ""
+    if df.empty:
+        return partial
+    df["track_key"] = df["menu_hint"].astype(str).map(_extract_track_from_menu_hint)
+    df["race_iso"] = df["event_dt"].astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
+    df["cat_letter"] = df["event_name"].astype(str).map(_extract_category_letter)
+    df["cat_token"] = df["event_name"].astype(str).map(_extract_category_token)
+    mask = (df["track_key"].astype(str) != "") & (df["race_iso"].astype(str) != "")
+    df = df.loc[mask].drop_duplicates(subset=["track_key", "race_iso"], keep="first")
+    if df.empty:
+        return partial
+    keys = list(zip(df["track_key"].astype(str), df["race_iso"].astype(str)))
+    values = [{"letter": str(a), "token": str(b)} for a, b in zip(df["cat_letter"], df["cat_token"])]
+    for k, v in zip(keys, values):
+        partial[k] = v
+    return partial
+
+
+def build_category_index_from_results() -> Dict[Tuple[str, str], Dict[str, str]]:
+    """
+    Constroi indice (track_key, race_iso) -> {"letter": ..., "token": ...} a partir dos
+    arquivos de resultado Betfair WIN (dwbfgreyhoundwin*). Cache incremental em
+    processed/cache/category_index.pkl. Mais novo ganha ao mesclar.
+    """
+    paths, current_files = _result_current_files("dwbfgreyhoundwin*")
+    cache_path = _cache_dir() / "category_index.pkl"
+    cached_data: Dict[Tuple[str, str], Dict[str, str]] | None = None
+    try:
+        with open(cache_path, "rb") as f:
+            cache = pickle.load(f)
+        cached_files = cache.get("files") or {}
+        cached_data = cache.get("data") or {}
+        if set(cached_files.keys()) != set(current_files.keys()):
+            removed = set(cached_files.keys()) - set(current_files.keys())
+            if removed:
+                new_or_changed = list(current_files.keys())
+                cached_data = {}
+            else:
+                new_or_changed = [p for p in current_files if p not in cached_files]
+        else:
+            new_or_changed = [p for p in current_files if cached_files.get(p) != current_files.get(p)]
+        if not new_or_changed and cached_data is not None:
+            logger.info("Indice de categoria (WIN) carregado do cache: {} corridas", len(cached_data))
+            return cached_data
+    except Exception:
+        new_or_changed = list(current_files.keys())
+        cached_data = {}
+
+    mapping = dict(cached_data) if cached_data else {}
+    columns = ("menu_hint", "event_dt", "event_name")
+    columns_list = list(columns)
+    paths_to_read = [p for p in paths if str(p) in new_or_changed]
+    for path in paths_to_read:
+        partial = _read_category_partial(path, columns, columns_list)
+        mapping.update(partial)
 
     logger.info("Indice de categoria (WIN) criado: {} corridas", len(mapping))
+    try:
+        with open(cache_path, "wb") as f:
+            pickle.dump({"files": current_files, "data": mapping}, f)
+    except Exception as exc:
+        logger.warning("build_category_index: falha ao salvar cache: {}", exc)
     return mapping
+
+
+def _read_num_runners_partial(path: Path, columns: Tuple[str, ...], columns_list: List[str]) -> Dict[Tuple[str, str], int]:
+    """Le um unico arquivo e retorna mapping parcial (track_key, race_iso) -> count."""
+    partial: Dict[Tuple[str, str], int] = {}
+    try:
+        if path.suffix.lower() == ".parquet":
+            df = pd.read_parquet(path, columns=columns_list)
+        else:
+            df = pd.read_csv(
+                path,
+                usecols=columns_list,
+                dtype=str,
+                low_memory=False,
+                encoding=settings.CSV_ENCODING,
+                engine="python",
+                on_bad_lines="skip",
+            )
+    except Exception:
+        try:
+            if path.suffix.lower() == ".parquet":
+                df = pd.read_parquet(path)
+            else:
+                df = pd.read_csv(
+                    path,
+                    dtype=str,
+                    low_memory=False,
+                    encoding=settings.CSV_ENCODING,
+                    engine="python",
+                    on_bad_lines="skip",
+                )
+        except Exception:
+            return partial
+    for col in columns:
+        if col not in df.columns:
+            df[col] = ""
+    if df.empty:
+        return partial
+    df["track_key"] = df["menu_hint"].astype(str).map(_extract_track_from_menu_hint)
+    df["race_iso"] = df["event_dt"].astype(str).map(_to_iso_yyyy_mm_dd_thh_mm)
+    mask = (df["track_key"].astype(str) != "") & (df["race_iso"].astype(str) != "")
+    df = df.loc[mask]
+    grp = df.groupby(["track_key", "race_iso"]).size()
+    partial.update(((str(k[0]), str(k[1])), int(v)) for k, v in grp.items())
+    return partial
+
+
+def build_num_runners_index() -> Dict[Tuple[str, str], int]:
+    """
+    Constroi indice (track_key, race_iso) -> numero de corredores a partir dos arquivos
+    Betfair WIN (dwbfgreyhoundwin*). Cache incremental em processed/cache/num_runners_index.pkl.
+    """
+    paths, current_files = _result_current_files("dwbfgreyhoundwin*")
+    cache_path = _cache_dir() / "num_runners_index.pkl"
+    cached_data: Dict[Tuple[str, str], int] | None = None
+    try:
+        with open(cache_path, "rb") as f:
+            cache = pickle.load(f)
+        cached_files = cache.get("files") or {}
+        cached_data = cache.get("data") or {}
+        if set(cached_files.keys()) != set(current_files.keys()):
+            removed = set(cached_files.keys()) - set(current_files.keys())
+            if removed:
+                new_or_changed = list(current_files.keys())
+                cached_data = {}
+            else:
+                new_or_changed = [p for p in current_files if p not in cached_files]
+        else:
+            new_or_changed = [p for p in current_files if cached_files.get(p) != current_files.get(p)]
+        if not new_or_changed and cached_data is not None:
+            logger.info("Indice num_runners (WIN) carregado do cache: {} corridas", len(cached_data))
+            return cached_data
+    except Exception:
+        new_or_changed = list(current_files.keys())
+        cached_data = {}
+
+    counts = dict(cached_data) if cached_data else {}
+    columns = ("menu_hint", "event_dt")
+    columns_list = list(columns)
+    paths_to_read = [p for p in paths if str(p) in new_or_changed]
+    for path in paths_to_read:
+        partial = _read_num_runners_partial(path, columns, columns_list)
+        counts.update(partial)
+
+    logger.info("Indice num_runners (WIN) criado: {} corridas", len(counts))
+    try:
+        with open(cache_path, "wb") as f:
+            pickle.dump({"files": current_files, "data": counts}, f)
+    except Exception as exc:
+        logger.warning("build_num_runners_index: falha ao salvar cache: {}", exc)
+    return counts
 
 
 def load_timeform_top3() -> List[dict]:
@@ -1035,10 +1201,23 @@ def generate_signals(
     rule: str = "terceiro_queda50",
     leader_share_min: float = 0.5,
     entry_type: str = "both",
+    bf_win_index: Dict[Tuple[str, str], Dict[str, RunnerBF]] | None = None,
+    bf_place_index: Dict[Tuple[str, str], Dict[str, RunnerBF]] | None = None,
 ) -> pd.DataFrame:
-    bf_win_index = load_betfair_win()
-    bf_place_index = load_betfair_place() if market == "place" else None
+    timings: Dict[str, float] = {}
+
+    if bf_win_index is None:
+        bf_win_index = load_betfair_win()
+    if bf_place_index is None and market == "place":
+        bf_place_index = load_betfair_place()
+
+    t0 = time.perf_counter()
     cat_index = build_category_index_from_results()
+    timings["build_category_index"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    num_index = build_num_runners_index()
+    timings["build_num_runners_index"] = time.perf_counter() - t0
 
     if source == "forecast" and rule == "forecast_odds":
         df_forecast = load_timeform_forecast_all()
@@ -1054,6 +1233,7 @@ def generate_signals(
         tf_rows = load_timeform_top3()
         use_forecast_odds = False
 
+    t0 = time.perf_counter()
     signals_rows: List[dict] = []
     for row in tf_rows:
         if use_forecast_odds:
@@ -1073,8 +1253,32 @@ def generate_signals(
         for result in results:
             if entry_type in ("both", result.get("entry_type")):
                 signals_rows.append(result)
+    timings["signals_rows"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     df = pd.DataFrame(signals_rows)
+    timings["DataFrame"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    if not df.empty and "track_name" in df.columns and "race_time_iso" in df.columns:
+        keys_series = pd.Series(
+            list(zip(
+                df["track_name"].astype(str).map(normalize_track_name),
+                df["race_time_iso"].astype(str),
+            )),
+            index=df.index,
+        )
+        if "num_runners" not in df.columns:
+            df["num_runners"] = keys_series.map(num_index).astype("Int64")
+        if "category" not in df.columns or "category_token" not in df.columns:
+            cat_letter_d = {k: v.get("letter", "") for k, v in cat_index.items()}
+            cat_token_d = {k: v.get("token", "") for k, v in cat_index.items()}
+            if "category" not in df.columns:
+                df["category"] = keys_series.map(cat_letter_d).fillna("").astype(str)
+            if "category_token" not in df.columns:
+                df["category_token"] = keys_series.map(cat_token_d).fillna("").astype(str)
+    timings["enrich"] = time.perf_counter() - t0
+
     if rule == "forecast_odds" and not df.empty:
         _assert_forecast_odds_unique_race_selection(df)
     logger.info(
@@ -1086,6 +1290,17 @@ def generate_signals(
         entry_type,
         len(df),
     )
+    total = sum(timings.values())
+    logger.info(
+        "Tempos generate_signals: build_category_index={:.3f}s build_num_runners_index={:.3f}s "
+        "signals_rows={:.3f}s DataFrame={:.3f}s enrich={:.3f}s total={:.3f}s",
+        timings["build_category_index"],
+        timings["build_num_runners_index"],
+        timings["signals_rows"],
+        timings["DataFrame"],
+        timings["enrich"],
+        total,
+    )
     return df
 
 
@@ -1095,6 +1310,7 @@ def write_signals_csv(
     market: str = "win",
     rule: str = "terceiro_queda50",
 ) -> Path:
+    t0 = time.perf_counter()
     raw_dir = settings.RAW_SIGNALS_DIR
     processed_dir = settings.PROCESSED_SIGNALS_DIR
     _ensure_dir(raw_dir)
@@ -1185,11 +1401,13 @@ def write_signals_csv(
         df_sorted["category_token"] = ""
 
     write_dataframe_snapshots(df_sorted, raw_path=raw_path, parquet_path=parquet_path)
+    elapsed = time.perf_counter() - t0
     logger.info(
-        "Sinais gerados. CSV bruto: {} | Parquet: {} ({} linhas)",
+        "Sinais gerados. CSV bruto: {} | Parquet: {} ({} linhas) | write_signals_csv={:.3f}s",
         raw_path,
         parquet_path,
         len(df_sorted),
+        elapsed,
     )
     return parquet_path
 
@@ -1198,6 +1416,7 @@ __all__ = [
     "RunnerBF",
     "_signal_race_selection_key",
     "build_category_index_from_results",
+    "build_num_runners_index",
     "generate_signals",
     "load_betfair_place",
     "load_betfair_win",
