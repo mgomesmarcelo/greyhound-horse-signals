@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -29,11 +30,19 @@ DATASETS: list[DatasetConfig] = [
 ]
 
 
-def convert_file(csv_path: Path, parquet_path: Path, *, force: bool, compression: str) -> int:
-    if parquet_path.exists() and not force:
-        logger.debug("Parquet já existe, pulando: {}", parquet_path)
-        return 0
-
+def convert_file(csv_path: Path, parquet_path: Path, *, force: bool, compression: str) -> tuple[int, str]:
+    if not parquet_path.exists():
+        action_on_success = "convert"
+    elif force:
+        action_on_success = "reconvert_force"
+    else:
+        csv_mtime = os.path.getmtime(csv_path)
+        parquet_mtime = os.path.getmtime(parquet_path)
+        if parquet_mtime >= csv_mtime:
+            logger.debug("Parquet já existe e está atualizado, pulando: {}", parquet_path)
+            return 0, "skip"
+        logger.debug("CSV mais novo que parquet, reconvertendo: {}", csv_path)
+        action_on_success = "reconvert"
     try:
         df = pd.read_csv(
             csv_path,
@@ -43,7 +52,7 @@ def convert_file(csv_path: Path, parquet_path: Path, *, force: bool, compression
         )
     except Exception as exc:
         logger.error("Falha ao ler {}: {}", csv_path, exc)
-        return 0
+        return 0, "error"
 
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(parquet_path, index=False, compression=compression)
@@ -53,7 +62,7 @@ def convert_file(csv_path: Path, parquet_path: Path, *, force: bool, compression
         parquet_path.name,
         len(df),
     )
-    return len(df)
+    return len(df), action_on_success
 
 
 def convert_dataset(dataset: DatasetConfig, *, force: bool, compression: str) -> int:
@@ -69,10 +78,25 @@ def convert_dataset(dataset: DatasetConfig, *, force: bool, compression: str) ->
         logger.info("Nenhum arquivo encontrado para {} em {}", name, raw_dir)
         return 0
 
+    skipped = reconverted = converted = 0
     for csv_path in sorted(matched):
         parquet_path = processed_dir / f"{csv_path.stem}.parquet"
-        total_rows += convert_file(csv_path, parquet_path, force=force, compression=compression)
+        lines, action = convert_file(csv_path, parquet_path, force=force, compression=compression)
+        total_rows += lines
+        if action == "skip":
+            skipped += 1
+        elif action == "reconvert":
+            reconverted += 1
+        elif action == "convert":
+            converted += 1
+        # "reconvert_force" e "error" não entram no resumo
     logger.success("Conversão {} concluída. Total de linhas: {}", name, total_rows)
+    logger.debug(
+        "Arquivos pulados: {} | Reconversões por CSV mais novo: {} | Convertidos do zero: {}",
+        skipped,
+        reconverted,
+        converted,
+    )
     return total_rows
 
 
