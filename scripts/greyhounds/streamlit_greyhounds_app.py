@@ -22,6 +22,9 @@ from scripts.greyhounds.units_helper import get_ref_factor, get_scale, get_col, 
 # Fator de referência global (definido em tempo de execução com base no dataset carregado).
 _REF_FACTOR: float = 10.0
 
+# Formato ISO para race_time_iso (ex: 2025-09-06T17:25 ou 2025-09-06T17:25:00).
+_RACE_TIME_ISO_FORMAT = "%Y-%m-%dT%H:%M"
+
 
 def _iter_result_paths(pattern: str) -> List[Path]:
     parquet_paths = sorted(settings.PROCESSED_RESULT_DIR.glob(f"{pattern}.parquet"))
@@ -338,7 +341,7 @@ def load_signals_enriched(
     if "date" in df.columns and "date_dt" not in df.columns:
         df["date_dt"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     if "race_time_iso" in df.columns and "race_ts" not in df.columns:
-        df["race_ts"] = pd.to_datetime(df["race_time_iso"], errors="coerce")
+        df["race_ts"] = pd.to_datetime(df["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
 
     # Chaves de corrida
     if "track_name" in df.columns and "race_time_iso" in df.columns:
@@ -383,7 +386,7 @@ def main() -> None:
         ref_factor = _REF_FACTOR
         scale_factor = get_scale(base_amount, ref_factor)
         plot = df_block.copy()
-        plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
+        plot["ts"] = pd.to_datetime(plot["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
         plot = plot.dropna(subset=["ts"]).sort_values("ts")
         if plot.empty:
             return
@@ -515,7 +518,7 @@ def main() -> None:
         plot = df_block.copy()
 
         def _bucket(series: pd.Series) -> pd.Series:
-            ts = pd.to_datetime(series, errors="coerce")
+            ts = pd.to_datetime(series, format=_RACE_TIME_ISO_FORMAT, errors="coerce")
             minutes = ts.dt.hour * 60 + ts.dt.minute
             bucket = pd.Series(index=series.index, dtype="object")
             bucket[(minutes >= 8 * 60) & (minutes <= 12 * 60)] = "08:00-12:00"
@@ -1122,7 +1125,7 @@ def main() -> None:
     sub_tokens = []
 
     def _compute_hour_bucket(series: pd.Series) -> pd.Series:
-        ts = pd.to_datetime(series, errors="coerce")
+        ts = pd.to_datetime(series, format=_RACE_TIME_ISO_FORMAT, errors="coerce")
         minutes = ts.dt.hour * 60 + ts.dt.minute
         bucket = pd.Series(index=series.index, dtype="object")
         bucket[(minutes >= 8 * 60) & (minutes <= 12 * 60)] = "08:00-12:00"
@@ -1135,7 +1138,7 @@ def main() -> None:
     with col_s1:
         if not df_filtered.empty and "race_time_iso" in df_filtered.columns:
             st.caption("Dias da semana")
-            tmp_ts = pd.to_datetime(df_filtered["race_time_iso"], errors="coerce")
+            tmp_ts = pd.to_datetime(df_filtered["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
             wd_series = tmp_ts.dt.weekday.dropna().astype(int)
             wd_unique = sorted(wd_series.unique().tolist())
             wd_names = {0: "Seg", 1: "Ter", 2: "Qua", 3: "Qui", 4: "Sex", 5: "Sab", 6: "Dom"}
@@ -1301,7 +1304,7 @@ def main() -> None:
         if sel_weekdays_nums is not None:
             if sel_weekdays_nums:
                 if "race_time_iso" in filt.columns and not filt.empty:
-                    ts_filt = pd.to_datetime(filt["race_time_iso"], errors="coerce")
+                    ts_filt = pd.to_datetime(filt["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
                     wd_filt = ts_filt.dt.weekday
                     filt = filt[wd_filt.isin(sel_weekdays_nums)]
             else:
@@ -1605,7 +1608,7 @@ def main() -> None:
         # Graficos de evolucao
         plot = df_block.copy()
         if not plot.empty:
-            plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
+            plot["ts"] = pd.to_datetime(plot["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
             plot = plot.dropna(subset=["ts"]).sort_values("ts")
             plot["_pnl_stake"] = get_col(plot, "pnl_stake_ref", "pnl_stake_fixed_10")
             plot["_pnl_liab"] = get_col(plot, "pnl_liability_ref", "pnl_liability_fixed_10")
@@ -1836,7 +1839,7 @@ def main() -> None:
         base_amount = float(st.session_state.get("base_amount", 1.0))
         working = df_block.copy()
         if "race_ts" not in working.columns:
-            working["race_ts"] = pd.to_datetime(working["race_time_iso"], errors="coerce")
+            working["race_ts"] = pd.to_datetime(working["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
         else:
             working["race_ts"] = pd.to_datetime(working["race_ts"], errors="coerce")
         working = working.dropna(subset=["race_ts"])
@@ -2087,7 +2090,7 @@ def main() -> None:
         # Graficos de evolucao (por dia ou por bet) com opcao de minimizar
         plot = filt.copy()
         if not plot.empty:
-            plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
+            plot["ts"] = pd.to_datetime(plot["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
             plot = plot.dropna(subset=["ts"]).sort_values("ts")
             # Sempre calcula agregacao diaria para uso em graficos semanais, mesmo quando o eixo X e "Bet"
             plot["date_only"] = plot["ts"].dt.date
@@ -2344,7 +2347,7 @@ def main() -> None:
         plot2 = df_block.copy()
         if plot2.empty:
             return
-        plot2["ts"] = pd.to_datetime(plot2["race_time_iso"], errors="coerce")
+        plot2["ts"] = pd.to_datetime(plot2["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
         plot2 = plot2.dropna(subset=["ts"]).sort_values("ts")
         plot2["date_only"] = plot2["ts"].dt.date
         local_scale = get_scale(float(st.session_state.get("base_amount", 1.0)), _REF_FACTOR)
@@ -2632,7 +2635,7 @@ def main() -> None:
         ref_factor = _REF_FACTOR
         scale_factor = get_scale(base_amount, ref_factor)
         plot = df_block.copy()
-        plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
+        plot["ts"] = pd.to_datetime(plot["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
         plot = plot.dropna(subset=["ts"]).sort_values("ts")
         if plot.empty:
             return
@@ -2697,7 +2700,7 @@ def main() -> None:
         plot = df_block.copy()
         if plot.empty or "num_runners" not in plot.columns or "category" not in plot.columns:
             return
-        plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
+        plot["ts"] = pd.to_datetime(plot["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
         plot = plot.dropna(subset=["ts"]).sort_values("ts")
         plot["date_only"] = plot["ts"].dt.date
         local_scale = get_scale(float(st.session_state.get("base_amount", 1.0)), _REF_FACTOR)
@@ -2755,7 +2758,7 @@ def main() -> None:
         plot = df_block.copy()
         if plot.empty or "num_runners" not in plot.columns:
             return
-        plot["ts"] = pd.to_datetime(plot["race_time_iso"], errors="coerce")
+        plot["ts"] = pd.to_datetime(plot["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
         plot = plot.dropna(subset=["ts"]).sort_values("ts")
         plot["date_only"] = plot["ts"].dt.date
         local_scale = get_scale(float(st.session_state.get("base_amount", 1.0)), _REF_FACTOR)
