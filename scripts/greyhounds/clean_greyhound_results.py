@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from loguru import logger
@@ -29,6 +31,7 @@ TARGET_COLUMNS = [
 
 _BSP_TWO_DEC_REGEX = re.compile(r"^\d+\.\d{2}$")
 _BANNED_REGEX = re.compile(r"\((?:AUS|NZL)\)")
+
 BANNED_TRACK_PREFIXES = (
     "aus ",
     "australia ",
@@ -40,6 +43,8 @@ BANNED_TRACK_NAMES = {
     "none",
     "murray bridge",
 }
+
+STATE_FILE_NAME = ".clean_state.json"
 
 
 def _canonicalize_column(name: str) -> str | None:
@@ -70,31 +75,66 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=rename_map)
 
 
+def _load_state(result_dir: Path) -> dict[str, Any]:
+    path = result_dir / STATE_FILE_NAME
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Falha ao ler {} (ignorando cache): {}", path.name, exc)
+        return {}
+
+
+def _save_state(result_dir: Path, state: dict[str, Any]) -> None:
+    path = result_dir / STATE_FILE_NAME
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _file_fingerprint(p: Path) -> dict[str, int]:
+    st = p.stat()
+    return {"mtime_ns": int(st.st_mtime_ns), "size": int(st.st_size)}
+
+
 def is_already_clean(df: pd.DataFrame) -> bool:
+    # Colunas exatamente na ordem esperada
     if df.columns.tolist() != TARGET_COLUMNS:
         return False
+
+    # BANNED_REGEX só nas colunas textuais relevantes (bem mais barato)
+    for col in ("menu_hint", "event_name", "selection_name"):
+        if col in df.columns:
+            if df[col].astype(str).str.contains(_BANNED_REGEX, na=False).any():
+                return False
+
+    # BSP precisa estar no formato X.XX (ou vazio)
     if "bsp" not in df.columns:
         return False
-    df_as_str = df.astype(str, copy=False)
-    if df_as_str.apply(lambda col: col.str.contains(_BANNED_REGEX, na=False)).any(axis=1).any():
-        return False
-    series = df["bsp"]
-    if len(series) == 0:
+
+    bsp = df["bsp"].astype(str)
+
+    # normaliza possíveis "nan" vindos de leitura ruim; aqui a leitura já é string,
+    # mas deixo robusto
+    bsp = bsp.replace({"nan": "", "None": ""})
+
+    # permite vazio; valida os não-vazios
+    non_empty = bsp.str.strip().ne("")
+    if not non_empty.any():
         return True
-    mask_notna = series.notna()
-    if not mask_notna.any():
-        return True
-    bsp_as_str = series.astype(str)
-    return _BSP_TWO_DEC_REGEX.fullmatch("0.00") is not None and bsp_as_str[mask_notna].map(
-        lambda text: bool(_BSP_TWO_DEC_REGEX.fullmatch(text))
-    ).all()
+
+    return bsp[non_empty].map(lambda t: bool(_BSP_TWO_DEC_REGEX.fullmatch(t.strip()))).all()
 
 
 def format_bsp_to_two_decimals(value) -> str:
-    if pd.isna(value):
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text == "" or text.lower() == "nan":
         return ""
     try:
-        num = float(value)
+        num = float(text)
         return f"{num:.2f}"
     except Exception:
         return ""
@@ -102,13 +142,24 @@ def format_bsp_to_two_decimals(value) -> str:
 
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
+    # garante todas as colunas
     for col in TARGET_COLUMNS:
         if col not in out.columns:
             out[col] = ""
+
+    # mantém somente as colunas alvo e na ordem
     out = out[TARGET_COLUMNS]
-    mask_banned = out.astype(str).apply(lambda col: col.str.contains(_BANNED_REGEX, na=False)).any(axis=1)
-    if mask_banned.any():
+
+    # remove linhas com (AUS|NZL) em campos textuais
+    mask_banned = False
+    for col in ("menu_hint", "event_name", "selection_name"):
+        mask_banned_col = out[col].astype(str).str.contains(_BANNED_REGEX, na=False)
+        mask_banned = mask_banned_col if isinstance(mask_banned, bool) else (mask_banned | mask_banned_col)
+
+    if not isinstance(mask_banned, bool) and mask_banned.any():
         out = out.loc[~mask_banned].reset_index(drop=True)
+
     def _is_banned_track(menu_hint: str) -> bool:
         text = str(menu_hint or "").strip()
         lower = text.lower()
@@ -116,25 +167,45 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             return True
         normalized = normalize_track_name(text)
         return normalized.lower() in BANNED_TRACK_NAMES
+
     track_mask = out["menu_hint"].apply(_is_banned_track)
     if track_mask.any():
         out = out.loc[~track_mask].reset_index(drop=True)
+
+    # formata BSP como texto X.XX
     out["bsp"] = out["bsp"].map(format_bsp_to_two_decimals)
+
     return out
 
 
 def clean_results_dir(result_dir: Path, force: bool = False) -> int:
     changed = 0
-    for csv_path in sorted(result_dir.glob("*.csv")):
+    state = _load_state(result_dir)
+
+    csv_paths = sorted(result_dir.glob("*.csv"))
+    for csv_path in csv_paths:
+        name = csv_path.name
+
+        # FAST SKIP: se arquivo não mudou desde a última vez, nem abre.
+        if not force and name in state:
+            fp_now = _file_fingerprint(csv_path)
+            fp_old = state.get(name, {})
+            if fp_old.get("mtime_ns") == fp_now["mtime_ns"] and fp_old.get("size") == fp_now["size"]:
+                logger.debug("Pulado (cache, sem mudanças): {}", name)
+                continue
+
         try:
+            # MUITO IMPORTANTE: ler como string para não destruir "2.00" -> 2.0
             df = pd.read_csv(
                 csv_path,
                 encoding=settings.CSV_ENCODING,
                 engine="python",
                 on_bad_lines="skip",
+                dtype=str,
+                keep_default_na=False,  # mantém "" como ""
             )
         except Exception as exc:
-            logger.error("Falha ao ler {}: {}", csv_path.name, exc)
+            logger.error("Falha ao ler {}: {}", name, exc)
             continue
 
         df = normalize_columns(df)
@@ -143,31 +214,39 @@ def clean_results_dir(result_dir: Path, force: bool = False) -> int:
         if missing:
             logger.error(
                 "Pulado {}: colunas ausentes após normalização ({})",
-                csv_path.name,
+                name,
                 ", ".join(missing),
             )
             continue
 
         if not force and is_already_clean(df):
-            logger.debug("Pulado (já limpo): {}", csv_path.name)
+            logger.debug("Pulado (já limpo): {}", name)
+            # mesmo assim atualiza cache (caso ele tenha sido criado fora do script)
+            state[name] = _file_fingerprint(csv_path)
             continue
 
         clean_df = clean_dataframe(df)
+
         try:
             clean_df.to_csv(csv_path, index=False, encoding=settings.CSV_ENCODING)
             changed += 1
-            logger.info("Arquivo limpo: {} ({} linhas)", csv_path.name, len(clean_df))
+            logger.info("Arquivo limpo: {} ({} linhas)", name, len(clean_df))
+            state[name] = _file_fingerprint(csv_path)
         except Exception as exc:
-            logger.error("Falha ao escrever {}: {}", csv_path.name, exc)
+            logger.error("Falha ao escrever {}: {}", name, exc)
+
+    # salva cache no final (bem mais rápido que salvar a cada arquivo)
+    try:
+        _save_state(result_dir, state)
+    except Exception as exc:
+        logger.warning("Falha ao salvar {}: {}", STATE_FILE_NAME, exc)
 
     return changed
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv or sys.argv[1:]
-    force = False
-    if "--force" in argv:
-        force = True
+    force = "--force" in argv
 
     logger.remove()
     logger.add(sys.stderr, level=settings.LOG_LEVEL)
@@ -185,4 +264,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -64,8 +64,8 @@ class Settings:
     CSV_ENCODING: str = "utf-8-sig"
     LOG_LEVEL: str = "INFO"
     # forecast_odds: limites de value_ratio para gerar sinal (zona entre os dois = sem sinal)
-    FORECAST_ODDS_BACK_MIN_VALUE_RATIO: float = 1.20
-    FORECAST_ODDS_LAY_MAX_VALUE_RATIO: float = 0.80
+    FORECAST_ODDS_BACK_MIN_VALUE_RATIO: float = 1.00
+    FORECAST_ODDS_LAY_MAX_VALUE_RATIO: float = 1.00
 
 
 settings = Settings()
