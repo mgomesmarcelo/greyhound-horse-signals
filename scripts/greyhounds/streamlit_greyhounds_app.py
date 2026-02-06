@@ -505,6 +505,78 @@ def main() -> None:
                     use_container_width=True,
                 )
 
+    def _render_hour_bucket_perf(df_block: pd.DataFrame, entry_kind: str) -> None:
+        """Barra por faixa de horario (mesmos buckets do filtro)."""
+        if df_block.empty or "race_time_iso" not in df_block.columns:
+            return
+        base_amount = float(st.session_state.get("base_amount", 1.0))
+        ref_factor = _REF_FACTOR
+        scale_factor = get_scale(base_amount, ref_factor)
+        plot = df_block.copy()
+
+        def _bucket(series: pd.Series) -> pd.Series:
+            ts = pd.to_datetime(series, errors="coerce")
+            minutes = ts.dt.hour * 60 + ts.dt.minute
+            bucket = pd.Series(index=series.index, dtype="object")
+            bucket[(minutes >= 8 * 60) & (minutes <= 12 * 60)] = "08:00-12:00"
+            bucket[(minutes >= 12 * 60 + 1) & (minutes <= 16 * 60)] = "12:01-16:00"
+            bucket[(minutes >= 16 * 60 + 1) & (minutes <= 20 * 60)] = "16:01-20:00"
+            bucket[(minutes >= 20 * 60 + 1)] = "20:01-23:59"
+            return bucket
+
+        bucket_order = ["08:00-12:00", "12:01-16:00", "16:01-20:00", "20:01-23:59"]
+        plot["hour_bucket"] = _bucket(plot["race_time_iso"])
+        plot = plot.dropna(subset=["hour_bucket"])
+        if plot.empty:
+            return
+        plot["_pnl_stake"] = get_col(plot, "pnl_stake_ref", "pnl_stake_fixed_10")
+        plot["_pnl_liab"] = get_col(plot, "pnl_liability_ref", "pnl_liability_fixed_10")
+        by_bucket = plot.groupby("hour_bucket", as_index=False)[["_pnl_stake", "_pnl_liab"]].sum()
+        by_bucket = by_bucket[by_bucket["hour_bucket"].isin(bucket_order)]
+        if by_bucket.empty:
+            return
+        by_bucket["hour_bucket"] = pd.Categorical(by_bucket["hour_bucket"], categories=bucket_order, ordered=True)
+        by_bucket["pnl_stake"] = by_bucket["_pnl_stake"] * scale_factor
+        if entry_kind == "lay":
+            by_bucket["pnl_liab"] = by_bucket["_pnl_liab"] * scale_factor
+
+        zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+        bar_stake = (
+            alt.Chart(by_bucket)
+            .mark_bar()
+            .encode(
+                x=alt.X("hour_bucket:N", sort=bucket_order, title=""),
+                y=alt.Y("pnl_stake:Q", title="PnL"),
+            )
+            .properties(width=small_width * 2, height=small_height)
+        )
+        stake_chart = alt.layer(zero_line, bar_stake)
+        with st.expander("Desempenho por horário (PnL agregado)", expanded=False):
+            if entry_kind == "lay":
+                zero_line_liab = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+                bar_liab = (
+                    alt.Chart(by_bucket)
+                    .mark_bar(color="#8888FF")
+                    .encode(
+                        x=alt.X("hour_bucket:N", sort=bucket_order, title=""),
+                        y=alt.Y("pnl_liab:Q", title="PnL"),
+                    )
+                    .properties(width=small_width * 2, height=small_height)
+                )
+                liab_chart = alt.layer(zero_line_liab, bar_liab)
+                st.altair_chart(
+                    alt.vconcat(
+                        stake_chart.properties(title="Stake"),
+                        liab_chart.properties(title="Liability"),
+                    ).resolve_scale(y="independent").configure_view(stroke="#888", strokeWidth=1),
+                    use_container_width=True,
+                )
+            else:
+                st.altair_chart(
+                    stake_chart.configure_view(stroke="#888", strokeWidth=1).properties(title="Stake"),
+                    use_container_width=True,
+                )
+
     def _render_forecast_rank_perf(df_block: pd.DataFrame, entry_kind: str) -> None:
         """Barra por forecast_rank (so aparece quando a regra e forecast_odds e ha coluna forecast_rank)."""
         if df_block.empty or "forecast_rank" not in df_block.columns:
@@ -603,6 +675,10 @@ def main() -> None:
             "value_ratio_min",
             "value_ratio_max",
             "only_value_bets",
+            "weekdays_ms",
+            "sel_weekdays",
+            "hour_bucket_ms",
+            "trap_ms",
         ]
         for key in keys_to_clear:
             st.session_state.pop(key, None)
@@ -967,16 +1043,10 @@ def main() -> None:
             )
             st.caption("BSP max.")
 
-        # (campo movido para a frente do cabecalho de Stake)
-
-    filt = df_filtered.copy()
-
-    # Linha: Volume total negociado (solo)
-    vol_col, _ = st.columns([2, 1])
-    volume_key = "min_total_volume"
-    if volume_key not in st.session_state:
-        st.session_state[volume_key] = 2000.0
-    with vol_col:
+        # Volume total negociado mínimo (dentro de col_f3)
+        volume_key = "min_total_volume"
+        if volume_key not in st.session_state:
+            st.session_state[volume_key] = 2000.0
         vcol, _ = st.columns([3, 7])
         with vcol:
             st.number_input(
@@ -988,32 +1058,251 @@ def main() -> None:
                 key=volume_key,
                 help="Considera apenas corridas cuja soma de pptradedvol atinge o mínimo desejado.",
             )
-            st.caption("Volume min. por corrida (soma de pptradedvol)")
+
+        # (campo movido para a frente do cabecalho de Stake)
+
+    filt = df_filtered.copy()
+
     min_total_volume = float(st.session_state.get(volume_key, 2000.0))
     volume_series = pd.to_numeric(filt.get("total_matched_volume", pd.Series(dtype=float)), errors="coerce")
     # forecast_odds usa total_matched_volume neutro (0.0); nao aplicar filtro de volume para nao zerar
     if rule != "forecast_odds":
         filt = filt[volume_series.fillna(0.0) >= min_total_volume]
-    # Linha separada: Numero de corredores (mantém tamanho da caixa)
-    st.caption("Numero de corredores")
-    nr_vals = sorted([int(v) for v in pd.to_numeric(filt.get("num_runners", pd.Series(dtype=float)), errors="coerce").dropna().unique().tolist()])
-    if nr_vals:
-        btn_all, btn_clear, _ = st.columns([1, 1, 6])
-        with btn_all:
-            st.button(
-                "Todos",
-                key="nr_all",
-                on_click=lambda: st.session_state.update({"num_runners_ms": nr_vals}),
+
+    sel_traps = st.session_state.get("trap_ms", None)
+    if sel_traps is not None:
+        if sel_traps:
+            trap_series_filt = pd.to_numeric(filt.get("trap_number", pd.Series(dtype=float)), errors="coerce")
+            trap_series_filt = trap_series_filt.astype("Int64")
+            filt = filt[trap_series_filt.isin(sel_traps)]
+        else:
+            filt = filt.iloc[0:0]
+
+    # Enriquecimento: categoria por corrida (para UI de Categorias/Subcategorias na linha 2)
+    if ("category" in filt.columns) and ("category_token" in filt.columns):
+        if not filt.empty:
+            cat_letters = sorted(
+                [c for c in filt["category"].dropna().unique().tolist() if isinstance(c, str) and c]
             )
-        with btn_clear:
-            st.button(
-                "Limpar",
-                key="nr_none",
-                on_click=lambda: st.session_state.update({"num_runners_ms": []}),
+        else:
+            cat_letters = []
+    else:
+        cat_index = _build_category_index()
+        if not filt.empty:
+            filt["_key_track"] = filt["track_name"].astype(str).map(normalize_track_name)
+            filt["_key_race"] = filt["race_time_iso"].astype(str)
+            filt["category"] = filt.apply(
+                lambda r: (cat_index.get((str(r["_key_track"]), str(r["_key_race"])), {}) or {}).get("letter", ""),
+                axis=1,
             )
-        # Caixa mais curta abaixo dos botoes (agora menor)
-        col_ms, _ = st.columns([2, 8])
-        with col_ms:
+            filt["category_token"] = filt.apply(
+                lambda r: (cat_index.get((str(r["_key_track"]), str(r["_key_race"])), {}) or {}).get("token", ""),
+                axis=1,
+            )
+            cat_letters = sorted(
+                [c for c in filt["category"].dropna().unique().tolist() if isinstance(c, str) and c]
+            )
+        else:
+            cat_letters = []
+    sub_tokens = []
+    if "category_token" in filt.columns and not filt.empty:
+        raw_tokens = [t for t in filt["category_token"].dropna().astype(str).unique().tolist() if isinstance(t, str) and t]
+
+        def _sub_sort_key(tok: str) -> tuple:
+            m = re.match(r"^([A-Z]+)(\d+)$", str(tok))
+            if m:
+                return (m.group(1), int(m.group(2)))
+            m2 = re.match(r"^([A-Z]+)", str(tok))
+            return ((m2.group(1) if m2 else str(tok)), 0)
+
+        sub_tokens = sorted(raw_tokens, key=_sub_sort_key)
+
+    def _compute_hour_bucket(series: pd.Series) -> pd.Series:
+        ts = pd.to_datetime(series, errors="coerce")
+        minutes = ts.dt.hour * 60 + ts.dt.minute
+        bucket = pd.Series(index=series.index, dtype="object")
+        bucket[(minutes >= 8 * 60) & (minutes <= 12 * 60)] = "08:00-12:00"
+        bucket[(minutes >= 12 * 60 + 1) & (minutes <= 16 * 60)] = "12:01-16:00"
+        bucket[(minutes >= 16 * 60 + 1) & (minutes <= 20 * 60)] = "16:01-20:00"
+        bucket[(minutes >= 20 * 60 + 1)] = "20:01-23:59"
+        return bucket
+
+    col_s1, col_s2, col_s3 = st.columns(3)
+    with col_s1:
+        if not df_filtered.empty and "race_time_iso" in df_filtered.columns:
+            st.caption("Dias da semana")
+            tmp_ts = pd.to_datetime(df_filtered["race_time_iso"], errors="coerce")
+            wd_series = tmp_ts.dt.weekday.dropna().astype(int)
+            wd_unique = sorted(wd_series.unique().tolist())
+            wd_names = {0: "Seg", 1: "Ter", 2: "Qua", 3: "Qui", 4: "Sex", 5: "Sab", 6: "Dom"}
+            weekday_options = [wd_names[w] for w in wd_unique if w in wd_names]
+            if weekday_options:
+                wb1, wb2, _ = st.columns([1, 1, 2])
+                with wb1:
+                    st.button(
+                        "Todos",
+                        key="weekdays_all",
+                        on_click=lambda: st.session_state.update({"weekdays_ms": list(weekday_options)}),
+                    )
+                with wb2:
+                    st.button(
+                        "Limpar",
+                        key="weekdays_none",
+                        on_click=lambda: st.session_state.update({"weekdays_ms": []}),
+                    )
+                if "weekdays_ms" not in st.session_state:
+                    st.session_state["weekdays_ms"] = list(weekday_options)
+                else:
+                    existing_wd = st.session_state["weekdays_ms"]
+                    sanitized_wd = [w for w in existing_wd if w in weekday_options]
+                    if not sanitized_wd and existing_wd:
+                        sanitized_wd = list(weekday_options)
+                    st.session_state["weekdays_ms"] = sanitized_wd
+                st.multiselect(
+                    "Dias da semana",
+                    weekday_options,
+                    key="weekdays_ms",
+                    label_visibility="collapsed",
+                )
+                sel_weekdays_nums = [
+                    num for num, label in wd_names.items()
+                    if label in st.session_state.get("weekdays_ms", [])
+                ]
+                st.session_state["sel_weekdays"] = sel_weekdays_nums
+
+        if not df_filtered.empty and "race_time_iso" in df_filtered.columns:
+            st.caption("Faixa de horário")
+            hour_bucket = _compute_hour_bucket(df_filtered["race_time_iso"])
+            bucket_order = ["08:00-12:00", "12:01-16:00", "16:01-20:00", "20:01-23:59"]
+            bucket_options = [b for b in bucket_order if b in hour_bucket.dropna().unique().tolist()]
+            if bucket_options:
+                hb1, hb2, _ = st.columns([1, 1, 2])
+                with hb1:
+                    st.button(
+                        "Todos",
+                        key="hour_buckets_all",
+                        on_click=lambda: st.session_state.update({"hour_bucket_ms": list(bucket_options)}),
+                    )
+                with hb2:
+                    st.button(
+                        "Limpar",
+                        key="hour_buckets_none",
+                        on_click=lambda: st.session_state.update({"hour_bucket_ms": []}),
+                    )
+                if "hour_bucket_ms" not in st.session_state:
+                    st.session_state["hour_bucket_ms"] = list(bucket_options)
+                else:
+                    existing_hb = st.session_state["hour_bucket_ms"]
+                    sanitized_hb = [h for h in existing_hb if h in bucket_options]
+                    if not sanitized_hb and existing_hb:
+                        sanitized_hb = list(bucket_options)
+                    st.session_state["hour_bucket_ms"] = sanitized_hb
+                st.multiselect(
+                    "Faixa de horário",
+                    bucket_options,
+                    key="hour_bucket_ms",
+                    label_visibility="collapsed",
+                )
+    with col_s2:
+        st.caption("Categorias")
+        if cat_letters:
+            btn_all, btn_clear, _ = st.columns([1, 1, 6])
+            with btn_all:
+                st.button(
+                    "Todos",
+                    key="cats_all",
+                    on_click=lambda: st.session_state.update({"cats_ms": cat_letters}),
+                )
+            with btn_clear:
+                st.button(
+                    "Limpar",
+                    key="cats_none",
+                    on_click=lambda: st.session_state.update({"cats_ms": []}),
+                )
+            if "cats_ms" not in st.session_state:
+                st.session_state["cats_ms"] = list(cat_letters)
+            else:
+                existing_cats = st.session_state["cats_ms"]
+                sanitized_cats = [c for c in existing_cats if c in cat_letters]
+                if not sanitized_cats and existing_cats:
+                    sanitized_cats = list(cat_letters)
+                st.session_state["cats_ms"] = sanitized_cats
+            sel_cats = st.multiselect(
+                "Categoria (A/B/D...)",
+                cat_letters,
+                key="cats_ms",
+                label_visibility="collapsed",
+            )
+            sel_cats = [c for c in sel_cats if c in cat_letters]
+            st.session_state["sel_cats"] = sel_cats
+
+        st.caption("Subcategorias")
+        if sub_tokens:
+            sb1, sb2 = st.columns([1, 1])
+            with sb1:
+                st.button(
+                    "Todos",
+                    key="subcats_all",
+                    on_click=lambda: st.session_state.update({"subcats_ms": sub_tokens}),
+                )
+            with sb2:
+                st.button(
+                    "Limpar",
+                    key="subcats_none",
+                    on_click=lambda: st.session_state.update({"subcats_ms": []}),
+                )
+            if "subcats_ms" not in st.session_state:
+                st.session_state["subcats_ms"] = list(sub_tokens)
+            else:
+                existing_sc = st.session_state["subcats_ms"]
+                sanitized_sc = [t for t in existing_sc if t in sub_tokens]
+                if not sanitized_sc and existing_sc:
+                    sanitized_sc = list(sub_tokens)
+                st.session_state["subcats_ms"] = sanitized_sc
+            sel_subcats = st.multiselect(
+                "Subcategorias (A1/A2/D1/OR3/...)",
+                sub_tokens,
+                key="subcats_ms",
+                label_visibility="collapsed",
+            )
+            sel_subcats = [t for t in sel_subcats if t in sub_tokens]
+            st.session_state["sel_subcats"] = sel_subcats
+    with col_s3:
+        sel_weekdays_nums = st.session_state.get("sel_weekdays", None)
+        if sel_weekdays_nums is not None:
+            if sel_weekdays_nums:
+                if "race_time_iso" in filt.columns and not filt.empty:
+                    ts_filt = pd.to_datetime(filt["race_time_iso"], errors="coerce")
+                    wd_filt = ts_filt.dt.weekday
+                    filt = filt[wd_filt.isin(sel_weekdays_nums)]
+            else:
+                filt = filt.iloc[0:0]
+
+        sel_hour_buckets = st.session_state.get("hour_bucket_ms", None)
+        if sel_hour_buckets is not None:
+            if sel_hour_buckets:
+                if "race_time_iso" in filt.columns and not filt.empty:
+                    hb_filt = _compute_hour_bucket(filt["race_time_iso"])
+                    filt = filt[hb_filt.isin(sel_hour_buckets)]
+            else:
+                filt = filt.iloc[0:0]
+
+        st.caption("Numero de corredores")
+        nr_vals = sorted([int(v) for v in pd.to_numeric(filt.get("num_runners", pd.Series(dtype=float)), errors="coerce").dropna().unique().tolist()])
+        if nr_vals:
+            btn_all, btn_clear, _ = st.columns([1, 1, 6])
+            with btn_all:
+                st.button(
+                    "Todos",
+                    key="nr_all",
+                    on_click=lambda: st.session_state.update({"num_runners_ms": nr_vals}),
+                )
+            with btn_clear:
+                st.button(
+                    "Limpar",
+                    key="nr_none",
+                    on_click=lambda: st.session_state.update({"num_runners_ms": []}),
+                )
             if "num_runners_ms" not in st.session_state:
                 st.session_state["num_runners_ms"] = list(nr_vals)
             else:
@@ -1028,12 +1317,39 @@ def main() -> None:
                 key="num_runners_ms",
                 label_visibility="collapsed",
             )
-        sel_nr = [int(v) for v in sel_nr if v in nr_vals]
-        st.session_state["sel_num_runners"] = sel_nr
-        if sel_nr:
-            filt = filt[filt["num_runners"].isin(sel_nr)]
-        else:
-            filt = filt.iloc[0:0]
+            sel_nr = [int(v) for v in sel_nr if v in nr_vals]
+            st.session_state["sel_num_runners"] = sel_nr
+            if sel_nr:
+                filt = filt[filt["num_runners"].isin(sel_nr)]
+            else:
+                filt = filt.iloc[0:0]
+
+        trap_series = pd.to_numeric(df_filtered.get("trap_number", pd.Series(dtype=float)), errors="coerce")
+        trap_vals = sorted(trap_series.dropna().astype(int).unique().tolist())
+        if trap_vals:
+            st.caption("Trap")
+            tb1, tb2, _ = st.columns([1, 1, 2])
+            with tb1:
+                st.button(
+                    "Todos",
+                    key="traps_all",
+                    on_click=lambda: st.session_state.update({"trap_ms": list(trap_vals)}),
+                )
+            with tb2:
+                st.button(
+                    "Limpar",
+                    key="traps_none",
+                    on_click=lambda: st.session_state.update({"trap_ms": []}),
+                )
+            if "trap_ms" not in st.session_state:
+                st.session_state["trap_ms"] = list(trap_vals)
+            else:
+                existing_traps = st.session_state["trap_ms"]
+                sanitized_traps = [t for t in existing_traps if t in trap_vals]
+                if not sanitized_traps and existing_traps:
+                    sanitized_traps = list(trap_vals)
+                st.session_state["trap_ms"] = sanitized_traps
+            st.multiselect("Traps", trap_vals, key="trap_ms")
 
     # Filtro adicional: participacao do lider (somente para regra lider_volume_total)
     if rule == "lider_volume_total":
@@ -1125,42 +1441,6 @@ def main() -> None:
             if only_value_bets:
                 filt = filt[filt["value_ratio"].fillna(0.0) >= 1.0]
 
-    # Enriquecimento: categoria por corrida (A/B/D etc.)
-    # Se o DataFrame ja veio com as colunas de categoria, reaproveitamos diretamente.
-    if ("category" in filt.columns) and ("category_token" in filt.columns):
-        if not filt.empty:
-            cat_letters = sorted(
-                [
-                    c
-                    for c in filt["category"].dropna().unique().tolist()
-                    if isinstance(c, str) and c
-                ]
-            )
-        else:
-            cat_letters = []
-    else:
-        cat_index = _build_category_index()
-        if not filt.empty:
-            filt["_key_track"] = filt["track_name"].astype(str).map(normalize_track_name)
-            filt["_key_race"] = filt["race_time_iso"].astype(str)
-            filt["category"] = filt.apply(
-                lambda r: (cat_index.get((str(r["_key_track"]), str(r["_key_race"])), {}) or {}).get("letter", ""),
-                axis=1,
-            )
-            filt["category_token"] = filt.apply(
-                lambda r: (cat_index.get((str(r["_key_track"]), str(r["_key_race"])), {}) or {}).get("token", ""),
-                axis=1,
-            )
-            # Ordena letras (facilita UI)
-            cat_letters = sorted(
-                [
-                    c
-                    for c in filt["category"].dropna().unique().tolist()
-                    if isinstance(c, str) and c
-                ]
-            )
-        else:
-            cat_letters = []
     if sel_tracks:
         filt = filt[filt["track_name"].isin(sel_tracks)]
     # Regra principal terceiro_queda50: diferenca > 50% em relacao ao vol3
@@ -1178,91 +1458,15 @@ def main() -> None:
         current_bsp_col = "lay_target_bsp" if entry_type == "lay" else "back_target_bsp"
         filt = filt[(filt[current_bsp_col] >= bsp_low) & (filt[current_bsp_col] <= bsp_high)]
 
-    # Categorias (linha dedicada)
-    st.caption("Categorias")
     if cat_letters:
-        btn_all, btn_clear, _ = st.columns([1, 1, 6])
-        with btn_all:
-            st.button(
-                "Todos",
-                key="cats_all",
-                on_click=lambda: st.session_state.update({"cats_ms": cat_letters}),
-            )
-        with btn_clear:
-            st.button(
-                "Limpar",
-                key="cats_none",
-                on_click=lambda: st.session_state.update({"cats_ms": []}),
-            )
-        # Caixa mais curta abaixo dos botoes
-        col_ms, _ = st.columns([3, 7])
-        with col_ms:
-            if "cats_ms" not in st.session_state:
-                st.session_state["cats_ms"] = list(cat_letters)
-            else:
-                existing_cats = st.session_state["cats_ms"]
-                sanitized_cats = [c for c in existing_cats if c in cat_letters]
-                if not sanitized_cats and existing_cats:
-                    sanitized_cats = list(cat_letters)
-                st.session_state["cats_ms"] = sanitized_cats
-            sel_cats = st.multiselect(
-                "Categoria (A/B/D...)",
-                cat_letters,
-                key="cats_ms",
-                label_visibility="collapsed",
-            )
-            sel_cats = [c for c in sel_cats if c in cat_letters]
-            st.session_state["sel_cats"] = sel_cats
+        sel_cats = st.session_state.get("sel_cats", [])
         if sel_cats:
             filt = filt[filt["category"].isin(sel_cats)]
         else:
-            # sem selecao => nenhum resultado
             filt = filt.iloc[0:0]
 
-    # Filtro por subcategoria (tokens completos A1, A2, D1, OR3, ...) – continua logo apos categorias
-    sub_tokens = []
-    if "category_token" in filt.columns:
-        raw_tokens = [t for t in filt["category_token"].dropna().astype(str).unique().tolist() if isinstance(t, str) and t]
-        def _sub_sort_key(tok: str) -> tuple[str, int]:
-            m = re.match(r"^([A-Z]+)(\d+)$", str(tok))
-            if m:
-                return (m.group(1), int(m.group(2)))
-            m2 = re.match(r"^([A-Z]+)", str(tok))
-            return ((m2.group(1) if m2 else str(tok)), 0)
-        sub_tokens = sorted(raw_tokens, key=_sub_sort_key)
     if sub_tokens:
-        st.caption("Subcategorias")
-        scw, _ = st.columns([2, 5])
-        with scw:
-            sb1, sb2 = st.columns([1, 1])
-            with sb1:
-                st.button(
-                    "Todos",
-                    key="subcats_all",
-                    on_click=lambda: st.session_state.update({"subcats_ms": sub_tokens}),
-                )
-            with sb2:
-                st.button(
-                    "Limpar",
-                    key="subcats_none",
-                    on_click=lambda: st.session_state.update({"subcats_ms": []}),
-                )
-            if "subcats_ms" not in st.session_state:
-                st.session_state["subcats_ms"] = list(sub_tokens)
-            else:
-                existing_sc = st.session_state["subcats_ms"]
-                sanitized_sc = [t for t in existing_sc if t in sub_tokens]
-                if not sanitized_sc and existing_sc:
-                    sanitized_sc = list(sub_tokens)
-                st.session_state["subcats_ms"] = sanitized_sc
-            sel_subcats = st.multiselect(
-                "Subcategorias (A1/A2/D1/OR3/...)",
-                sub_tokens,
-                key="subcats_ms",
-                label_visibility="collapsed",
-            )
-            sel_subcats = [t for t in sel_subcats if t in sub_tokens]
-            st.session_state["sel_subcats"] = sel_subcats
+        sel_subcats = st.session_state.get("sel_subcats", [])
         if sel_subcats:
             filt = filt[filt["category_token"].isin(sel_subcats)]
         else:
@@ -1393,6 +1597,62 @@ def main() -> None:
                         )
                     )
                     st.altair_chart(alt.layer(zero_line, ch).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
+
+                # --- Drawdown intradiário por dia (Stake) ---
+                plot_intraday = plot.copy()
+                plot_intraday = plot_intraday.sort_values("ts").copy()
+                plot_intraday["date_only"] = plot_intraday["ts"].dt.date
+                plot_intraday["_pnl_stake_scaled"] = plot_intraday["_pnl_stake"] * scale_factor
+                plot_intraday["intraday_cum_stake"] = (
+                    plot_intraday.groupby("date_only")["_pnl_stake_scaled"].cumsum()
+                )
+                daily_min_stake = (
+                    plot_intraday.groupby("date_only")["intraday_cum_stake"]
+                    .min()
+                    .to_frame("min_intraday_stake")
+                    .reset_index()
+                )
+                daily_min_stake["min_intraday_stake"] = daily_min_stake["min_intraday_stake"].clip(upper=0.0)
+
+                daily_close_stake = (
+                    plot_intraday.groupby("date_only")["intraday_cum_stake"]
+                    .last()
+                    .to_frame("close_stake")
+                    .reset_index()
+                )
+                stake_dd = daily_min_stake.merge(daily_close_stake, on="date_only", how="left")
+
+                with st.expander("Drawdown Stake por dia (mínimo intradiário)", expanded=False):
+                    zero_line_dd = (
+                        alt.Chart(pd.DataFrame({"y": [0]}))
+                        .mark_rule(color="red", strokeWidth=1)
+                        .encode(y="y:Q")
+                    )
+                    min_line = (
+                        alt.Chart(stake_dd)
+                        .mark_line()
+                        .encode(
+                            x=alt.X("date_only:T", title="", axis=alt.Axis(format="%Y-%m-%d")),
+                            y=alt.Y(
+                                "min_intraday_stake:Q",
+                                title="Pior nível intradiário do dia",
+                            ),
+                        )
+                    )
+                    close_line = (
+                        alt.Chart(stake_dd)
+                        .mark_line()
+                        .encode(
+                            x=alt.X("date_only:T", title="", axis=alt.Axis(format="%Y-%m-%d")),
+                            y=alt.Y("close_stake:Q"),
+                            color=alt.value("#06D6A0"),
+                        )
+                    )
+                    st.altair_chart(
+                        alt.layer(zero_line_dd, min_line, close_line).configure_view(stroke="#888", strokeWidth=1),
+                        use_container_width=True,
+                    )
+
                 if entry_kind == "lay":
                     with st.expander("Evolucao Liability (PnL acumulado por dia)", expanded=False):
                         zero_line2 = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
@@ -1405,6 +1665,57 @@ def main() -> None:
                             )
                         )
                         st.altair_chart(alt.layer(zero_line2, ch2).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
+
+                    plot_intraday["_pnl_liab_scaled"] = plot_intraday["_pnl_liab"] * scale_factor
+                    plot_intraday["intraday_cum_liab"] = (
+                        plot_intraday.groupby("date_only")["_pnl_liab_scaled"].cumsum()
+                    )
+                    daily_min_liab = (
+                        plot_intraday.groupby("date_only")["intraday_cum_liab"]
+                        .min()
+                        .to_frame("min_intraday_liab")
+                        .reset_index()
+                    )
+                    daily_min_liab["min_intraday_liab"] = daily_min_liab["min_intraday_liab"].clip(upper=0.0)
+
+                    daily_close_liab = (
+                        plot_intraday.groupby("date_only")["intraday_cum_liab"]
+                        .last()
+                        .to_frame("close_liab")
+                        .reset_index()
+                    )
+                    liab_dd = daily_min_liab.merge(daily_close_liab, on="date_only", how="left")
+
+                    with st.expander("Drawdown Liability por dia (mínimo intradiário)", expanded=False):
+                        zero_line_dd2 = (
+                            alt.Chart(pd.DataFrame({"y": [0]}))
+                            .mark_rule(color="red", strokeWidth=1)
+                            .encode(y="y:Q")
+                        )
+                        min_line_liab = (
+                            alt.Chart(liab_dd)
+                            .mark_line()
+                            .encode(
+                                x=alt.X("date_only:T", title="", axis=alt.Axis(format="%Y-%m-%d")),
+                                y=alt.Y(
+                                    "min_intraday_liab:Q",
+                                    title="Pior nível intradiário do dia",
+                                ),
+                            )
+                        )
+                        close_line_liab = (
+                            alt.Chart(liab_dd)
+                            .mark_line()
+                            .encode(
+                                x=alt.X("date_only:T", title="", axis=alt.Axis(format="%Y-%m-%d")),
+                                y=alt.Y("close_liab:Q"),
+                                color=alt.value("#FDE74C"),
+                            )
+                        )
+                        st.altair_chart(
+                            alt.layer(zero_line_dd2, min_line_liab, close_line_liab).configure_view(stroke="#888", strokeWidth=1),
+                            use_container_width=True,
+                        )
             else:
                 # Evolucao por sequencia de apostas (ordem temporal)
                 plot["bet_idx"] = range(1, len(plot) + 1)
@@ -1774,6 +2085,61 @@ def main() -> None:
                     )
                     st.altair_chart(alt.layer(zero_line, ch).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
 
+                # --- Drawdown intradiário por dia (Stake) ---
+                plot_intraday = plot.copy()
+                plot_intraday = plot_intraday.sort_values("ts").copy()
+                plot_intraday["date_only"] = plot_intraday["ts"].dt.date
+                plot_intraday["_pnl_stake_scaled"] = plot_intraday["_pnl_stake"] * scale_factor
+                plot_intraday["intraday_cum_stake"] = (
+                    plot_intraday.groupby("date_only")["_pnl_stake_scaled"].cumsum()
+                )
+                daily_min_stake = (
+                    plot_intraday.groupby("date_only")["intraday_cum_stake"]
+                    .min()
+                    .to_frame("min_intraday_stake")
+                    .reset_index()
+                )
+                daily_min_stake["min_intraday_stake"] = daily_min_stake["min_intraday_stake"].clip(upper=0.0)
+
+                daily_close_stake = (
+                    plot_intraday.groupby("date_only")["intraday_cum_stake"]
+                    .last()
+                    .to_frame("close_stake")
+                    .reset_index()
+                )
+                stake_dd = daily_min_stake.merge(daily_close_stake, on="date_only", how="left")
+
+                with st.expander("Drawdown Stake por dia (mínimo intradiário)", expanded=False):
+                    zero_line_dd = (
+                        alt.Chart(pd.DataFrame({"y": [0]}))
+                        .mark_rule(color="red", strokeWidth=1)
+                        .encode(y="y:Q")
+                    )
+                    min_line = (
+                        alt.Chart(stake_dd)
+                        .mark_line()
+                        .encode(
+                            x=alt.X("date_only:T", title="", axis=alt.Axis(format="%Y-%m-%d")),
+                            y=alt.Y(
+                                "min_intraday_stake:Q",
+                                title="Pior nível intradiário do dia",
+                            ),
+                        )
+                    )
+                    close_line = (
+                        alt.Chart(stake_dd)
+                        .mark_line()
+                        .encode(
+                            x=alt.X("date_only:T", title="", axis=alt.Axis(format="%Y-%m-%d")),
+                            y=alt.Y("close_stake:Q"),
+                            color=alt.value("#06D6A0"),
+                        )
+                    )
+                    st.altair_chart(
+                        alt.layer(zero_line_dd, min_line, close_line).configure_view(stroke="#888", strokeWidth=1),
+                        use_container_width=True,
+                    )
+
                 if entry_type == "lay":
                     with st.expander("Evolucao Liability (PnL acumulado por dia)", expanded=False):
                         zero_line2 = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
@@ -1786,6 +2152,57 @@ def main() -> None:
                             )
                         )
                         st.altair_chart(alt.layer(zero_line2, ch2).configure_view(stroke="#888", strokeWidth=1), use_container_width=True)
+
+                    plot_intraday["_pnl_liab_scaled"] = plot_intraday["_pnl_liab"] * scale_factor
+                    plot_intraday["intraday_cum_liab"] = (
+                        plot_intraday.groupby("date_only")["_pnl_liab_scaled"].cumsum()
+                    )
+                    daily_min_liab = (
+                        plot_intraday.groupby("date_only")["intraday_cum_liab"]
+                        .min()
+                        .to_frame("min_intraday_liab")
+                        .reset_index()
+                    )
+                    daily_min_liab["min_intraday_liab"] = daily_min_liab["min_intraday_liab"].clip(upper=0.0)
+
+                    daily_close_liab = (
+                        plot_intraday.groupby("date_only")["intraday_cum_liab"]
+                        .last()
+                        .to_frame("close_liab")
+                        .reset_index()
+                    )
+                    liab_dd = daily_min_liab.merge(daily_close_liab, on="date_only", how="left")
+
+                    with st.expander("Drawdown Liability por dia (mínimo intradiário)", expanded=False):
+                        zero_line_dd2 = (
+                            alt.Chart(pd.DataFrame({"y": [0]}))
+                            .mark_rule(color="red", strokeWidth=1)
+                            .encode(y="y:Q")
+                        )
+                        min_line_liab = (
+                            alt.Chart(liab_dd)
+                            .mark_line()
+                            .encode(
+                                x=alt.X("date_only:T", title="", axis=alt.Axis(format="%Y-%m-%d")),
+                                y=alt.Y(
+                                    "min_intraday_liab:Q",
+                                    title="Pior nível intradiário do dia",
+                                ),
+                            )
+                        )
+                        close_line_liab = (
+                            alt.Chart(liab_dd)
+                            .mark_line()
+                            .encode(
+                                x=alt.X("date_only:T", title="", axis=alt.Axis(format="%Y-%m-%d")),
+                                y=alt.Y("close_liab:Q"),
+                                color=alt.value("#FDE74C"),
+                            )
+                        )
+                        st.altair_chart(
+                            alt.layer(zero_line_dd2, min_line_liab, close_line_liab).configure_view(stroke="#888", strokeWidth=1),
+                            use_container_width=True,
+                        )
             else:
                 # Evolucao por sequencia de apostas (ordem temporal)
                 plot["bet_idx"] = range(1, len(plot) + 1)
@@ -1820,6 +2237,7 @@ def main() -> None:
         # Desempenho por dia da semana (antes da tabela)
         _render_weekday_perf(filt, entry_type)
         _render_trap_perf(filt, entry_type)
+        _render_hour_bucket_perf(filt, entry_type)
         _render_forecast_rank_perf(filt, entry_type)
 
         # Relatorio mensal (entre desempenho semanal e tabela)
