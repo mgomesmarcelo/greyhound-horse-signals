@@ -536,46 +536,60 @@ def main() -> None:
         if by_bucket.empty:
             return
         by_bucket["hour_bucket"] = pd.Categorical(by_bucket["hour_bucket"], categories=bucket_order, ordered=True)
+        by_bucket = by_bucket.sort_values("hour_bucket")
         by_bucket["pnl_stake"] = by_bucket["_pnl_stake"] * scale_factor
         if entry_kind == "lay":
             by_bucket["pnl_liab"] = by_bucket["_pnl_liab"] * scale_factor
 
-        zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+        zero_line = (
+            alt.Chart(pd.DataFrame({"y": [0]}))
+            .mark_rule(color="red", strokeWidth=1)
+            .encode(y="y:Q")
+        )
         bar_stake = (
             alt.Chart(by_bucket)
             .mark_bar()
             .encode(
-                x=alt.X("hour_bucket:N", sort=bucket_order, title=""),
+                x=alt.X(
+                    "hour_bucket:N",
+                    sort=bucket_order,
+                    title="",
+                ),
                 y=alt.Y("pnl_stake:Q", title="PnL"),
             )
             .properties(width=small_width * 2, height=small_height)
         )
         stake_chart = alt.layer(zero_line, bar_stake)
-        with st.expander("Desempenho por horário (PnL agregado)", expanded=False):
+        with st.expander("Desempenho por faixa horária (PnL agregado)", expanded=False):
             if entry_kind == "lay":
-                zero_line_liab = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+                zero_line_liab = (
+                    alt.Chart(pd.DataFrame({"y": [0]}))
+                    .mark_rule(color="red", strokeWidth=1)
+                    .encode(y="y:Q")
+                )
                 bar_liab = (
                     alt.Chart(by_bucket)
                     .mark_bar(color="#8888FF")
                     .encode(
-                        x=alt.X("hour_bucket:N", sort=bucket_order, title=""),
+                        x=alt.X(
+                            "hour_bucket:N",
+                            sort=bucket_order,
+                            title="",
+                        ),
                         y=alt.Y("pnl_liab:Q", title="PnL"),
                     )
                     .properties(width=small_width * 2, height=small_height)
                 )
                 liab_chart = alt.layer(zero_line_liab, bar_liab)
-                st.altair_chart(
-                    alt.vconcat(
-                        stake_chart.properties(title="Stake"),
-                        liab_chart.properties(title="Liability"),
-                    ).resolve_scale(y="independent").configure_view(stroke="#888", strokeWidth=1),
-                    use_container_width=True,
-                )
+
+                chart = alt.vconcat(
+                    stake_chart.properties(title="Stake"),
+                    liab_chart.properties(title="Liability"),
+                ).resolve_scale(y="independent").configure_view(stroke="#888", strokeWidth=1)
             else:
-                st.altair_chart(
-                    stake_chart.configure_view(stroke="#888", strokeWidth=1).properties(title="Stake"),
-                    use_container_width=True,
-                )
+                chart = stake_chart.configure_view(stroke="#888", strokeWidth=1).properties(title="Stake")
+
+            st.altair_chart(chart, use_container_width=True)
 
     def _render_forecast_rank_perf(df_block: pd.DataFrame, entry_kind: str) -> None:
         """Barra por forecast_rank (so aparece quando a regra e forecast_odds e ha coluna forecast_rank)."""
@@ -1104,18 +1118,8 @@ def main() -> None:
             )
         else:
             cat_letters = []
+    # sub_tokens será calculado depois que sel_cats for atualizado
     sub_tokens = []
-    if "category_token" in filt.columns and not filt.empty:
-        raw_tokens = [t for t in filt["category_token"].dropna().astype(str).unique().tolist() if isinstance(t, str) and t]
-
-        def _sub_sort_key(tok: str) -> tuple:
-            m = re.match(r"^([A-Z]+)(\d+)$", str(tok))
-            if m:
-                return (m.group(1), int(m.group(2)))
-            m2 = re.match(r"^([A-Z]+)", str(tok))
-            return ((m2.group(1) if m2 else str(tok)), 0)
-
-        sub_tokens = sorted(raw_tokens, key=_sub_sort_key)
 
     def _compute_hour_bucket(series: pd.Series) -> pd.Series:
         ts = pd.to_datetime(series, errors="coerce")
@@ -1235,6 +1239,31 @@ def main() -> None:
             )
             sel_cats = [c for c in sel_cats if c in cat_letters]
             st.session_state["sel_cats"] = sel_cats
+
+        # Construção de sub_tokens filtrada por categorias selecionadas (DEPOIS que sel_cats foi atualizado)
+        if "category_token" in filt.columns and not filt.empty:
+            # Usa sel_cats atualizado (ou cats_ms como fallback)
+            sel_cats_state = st.session_state.get("sel_cats")
+            if not sel_cats_state:
+                # fallback para cats_ms, se existir
+                sel_cats_state = st.session_state.get("cats_ms")
+
+            token_source = filt
+
+            # Se houver categorias selecionadas e a coluna existir, restringe por elas
+            if sel_cats_state and "category" in token_source.columns:
+                token_source = token_source[token_source["category"].isin(sel_cats_state)]
+
+            raw_tokens = [t for t in token_source["category_token"].dropna().astype(str).unique().tolist() if isinstance(t, str) and t]
+
+            def _sub_sort_key(tok: str) -> tuple:
+                m = re.match(r"^([A-Z]+)(\d+)$", str(tok))
+                if m:
+                    return (m.group(1), int(m.group(2)))
+                m2 = re.match(r"^([A-Z]+)", str(tok))
+                return ((m2.group(1) if m2 else str(tok)), 0)
+
+            sub_tokens = sorted(raw_tokens, key=_sub_sort_key)
 
         st.caption("Subcategorias")
         if sub_tokens:
@@ -1749,6 +1778,7 @@ def main() -> None:
         # Desempenho por dia da semana (antes da tabela)
         _render_weekday_perf(df_block, entry_kind)
         _render_trap_perf(df_block, entry_kind)
+        _render_hour_bucket_perf(df_block, entry_kind)
         _render_forecast_rank_perf(df_block, entry_kind)
 
         # Relatorio mensal (entre desempenho semanal e tabela)
