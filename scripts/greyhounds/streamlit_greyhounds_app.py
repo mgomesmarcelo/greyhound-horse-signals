@@ -28,6 +28,82 @@ _REF_FACTOR: float = 10.0
 # Formato ISO para race_time_iso (ex: 2025-09-06T17:25 ou 2025-09-06T17:25:00).
 _RACE_TIME_ISO_FORMAT = "%Y-%m-%dT%H:%M"
 
+# Diretório base de dados greyhounds (derivado do script, sem hardcode de drive).
+_SIGNALS_DATA_DIR = PROJECT_ROOT / "data" / "greyhounds"
+_PROCESSED_SIGNALS_SUBDIR = _SIGNALS_DATA_DIR / "processed" / "signals"
+_RAW_SIGNALS_SUBDIR = _SIGNALS_DATA_DIR / "signals"
+
+_ESSENTIAL_SIGNALS_COLUMNS = ("market", "entry_type", "race_time_iso", "track_name", "category_token")
+
+
+def _signals_basename(source_slug: str, market: str, rule_slug: str) -> str:
+    """Retorna o nome base do arquivo de signals (sem extensao)."""
+    return f"signals_{source_slug}_{market}_{rule_slug}"
+
+
+def _resolve_signals_path(source_slug: str, market: str, rule_slug: str) -> Tuple[Path, str]:
+    """
+    Procura parquet em processed/signals e, se nao existir, csv em signals.
+    Retorna (path, "parquet") ou (path, "csv").
+    Levanta FileNotFoundError com mensagem clara se nenhum existir.
+    """
+    base = _signals_basename(source_slug, market, rule_slug)
+    parquet_path = _PROCESSED_SIGNALS_SUBDIR / f"{base}.parquet"
+    if parquet_path.exists():
+        return (parquet_path, "parquet")
+    csv_path = _RAW_SIGNALS_SUBDIR / f"{base}.csv"
+    if csv_path.exists():
+        return (csv_path, "csv")
+    raise FileNotFoundError(
+        f"Arquivo de signals nao encontrado: basename='{base}'. "
+        f"Verificados: (1) {_PROCESSED_SIGNALS_SUBDIR!s} (parquet), (2) {_RAW_SIGNALS_SUBDIR!s} (csv)."
+    )
+
+
+def get_group_key(strategy_dict: dict) -> Tuple[str, str, str]:
+    """
+    Extrai (source_slug, market, rule_slug) de um strategy_dict.
+    Usa source_select_label, market, rule_select_label; normaliza labels para slug quando necessario.
+    """
+    source_val = strategy_dict.get("source_select_label", "top3")
+    market_val = strategy_dict.get("market", "win")
+    rule_val = strategy_dict.get("rule_select_label", "terceiro_queda50")
+    source_slug = SOURCE_LABELS_INV.get(source_val, source_val) if isinstance(source_val, str) else "top3"
+    rule_slug = RULE_LABELS_INV.get(rule_val, rule_val) if isinstance(rule_val, str) else "terceiro_queda50"
+    if rule_slug == rule_val and rule_val == "Forecast Odds (Timeform)":
+        rule_slug = "forecast_odds"
+    return (source_slug, market_val, rule_slug)
+
+
+@st.cache_data(show_spinner=False)
+def load_signals_df(
+    source_slug: str,
+    market: str,
+    rule_slug: str,
+    signals_mtime: float = 0.0,
+) -> pd.DataFrame:
+    """
+    Carrega o DataFrame de signals por (source, market, rule).
+    Preferencia: parquet em data/greyhounds/processed/signals, fallback csv em data/greyhounds/signals.
+    Levanta FileNotFoundError se nenhum arquivo existir.
+    signals_mtime e usado apenas na chave de cache para invalidar quando o arquivo mudar.
+    """
+    del signals_mtime  # usado somente para a chave de cache
+    path, fmt = _resolve_signals_path(source_slug, market, rule_slug)
+    if fmt == "parquet":
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(
+            path,
+            encoding=settings.CSV_ENCODING,
+            engine="python",
+            on_bad_lines="skip",
+        )
+    for col in _ESSENTIAL_SIGNALS_COLUMNS:
+        if col not in df.columns:
+            df[col] = pd.NA
+    return df
+
 
 def _iter_result_paths(pattern: str) -> List[Path]:
     parquet_paths = sorted(settings.PROCESSED_RESULT_DIR.glob(f"{pattern}.parquet"))
@@ -244,7 +320,7 @@ def get_current_strategy_snapshot(
     market: str,
     entry_type: str,
 ) -> dict:
-    """Captura os parâmetros atuais do app em um dict serializável."""
+    """Captura os parâmetros atuais do app em um dict serializável (core + extras da regra ativa)."""
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     strategy_name = f"{rule_select_label}_{market}_{entry_type}_{ts.replace(':', '-')}"
     out = {
@@ -255,11 +331,12 @@ def get_current_strategy_snapshot(
         "market": market,
         "entry_type": entry_type,
     }
-    filter_keys = [
-        "tracks_ms", "cats_ms", "subcats_ms", "weekdays_ms", "hour_bucket_ms",
-        "num_runners_ms", "trap_ms", "bsp_low", "bsp_high", "min_total_volume",
-        "date_mode", "date_start_input", "date_end_input", "date_range_slider",
-    ]
+    rule_slug = RULE_LABELS_INV.get(rule_select_label, rule_select_label)
+    if rule_slug == rule_select_label and "Forecast" in str(rule_select_label):
+        rule_slug = "forecast_odds"
+    filter_keys = list(CORE_STATE_KEYS) + list(RULE_EXTRA_KEYS.get(rule_slug, []))
+    if rule_slug == "forecast_odds":
+        filter_keys = [k for k in filter_keys if k != "min_total_volume"]
     for key in filter_keys:
         if key in st.session_state:
             val = st.session_state[key]
@@ -269,6 +346,8 @@ def get_current_strategy_snapshot(
                 out[key] = json.dumps([v.isoformat() if hasattr(v, "isoformat") else str(v) for v in val])
             elif isinstance(val, (list, tuple)):
                 out[key] = json.dumps(list(val))
+            elif isinstance(val, bool) and key == "only_value_bets":
+                out[key] = val
             else:
                 out[key] = val
     return out
@@ -317,6 +396,8 @@ def parse_strategies_csv(uploaded_file: Any) -> List[dict]:
                 except (json.JSONDecodeError, TypeError):
                     pass
             d[col] = val
+        if "only_value_bets" in d and isinstance(d["only_value_bets"], str):
+            d["only_value_bets"] = d["only_value_bets"].strip().lower() in ("true", "1", "yes")
         out.append(d)
     return out
 
@@ -327,19 +408,41 @@ def _hash_uploaded_file(uploaded_file: Any) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-# Chaves permitidas ao aplicar estrategia importada (ignora created_at, strategy_name e extras)
-_STRATEGY_STATE_WHITELIST = frozenset([
-    "rule_select_label", "source_select_label", "market", "entry_type",
-    "tracks_ms", "cats_ms", "subcats_ms", "weekdays_ms", "hour_bucket_ms",
-    "num_runners_ms", "trap_ms", "bsp_low", "bsp_high", "bsp_slider",
-    "min_total_volume", "date_mode", "date_start_input", "date_end_input", "date_range_slider",
-])
+CORE_STATE_KEYS = [
+    "tracks_ms", "cats_ms", "subcats_ms",
+    "weekdays_ms", "hour_bucket_ms",
+    "trap_ms", "num_runners_ms",
+    "bsp_low", "bsp_high",
+    "min_total_volume",
+    "date_mode", "date_start_input", "date_end_input", "date_range_slider",
+]
+
+RULE_EXTRA_KEYS: dict[str, List[str]] = {
+    "forecast_odds": ["forecast_rank_ms", "value_ratio_min", "value_ratio_max", "only_value_bets"],
+}
+
+
+def _rule_label_to_slug(rule_label: str) -> str:
+    """Converte label da regra para slug (ex: Forecast Odds (Timeform) -> forecast_odds)."""
+    if not rule_label:
+        return ""
+    slug = RULE_LABELS_INV.get(rule_label, rule_label)
+    if slug == rule_label and "Forecast" in str(rule_label):
+        return "forecast_odds"
+    return slug
 
 
 def _apply_strategy_to_state(strategy_dict: dict) -> None:
     """Aplica ao session_state apenas chaves conhecidas; chamar ANTES de qualquer widget."""
+    imported_rule = strategy_dict.get("rule_select_label", "")
+    imported_rule_slug = _rule_label_to_slug(imported_rule)
+    allowed = (
+        set(["rule_select_label", "source_select_label", "market", "entry_type"])
+        | set(CORE_STATE_KEYS)
+        | set(RULE_EXTRA_KEYS.get(imported_rule_slug, []))
+    )
     for key, value in strategy_dict.items():
-        if key not in _STRATEGY_STATE_WHITELIST:
+        if key not in allowed:
             continue
         if key in ("date_start_input", "date_end_input") and isinstance(value, str):
             try:
@@ -352,6 +455,8 @@ def _apply_strategy_to_state(strategy_dict: dict) -> None:
                     value = (pd.to_datetime(value[0]).to_pydatetime(), pd.to_datetime(value[1]).to_pydatetime())
                 except Exception:
                     pass
+        if key == "only_value_bets" and isinstance(value, str):
+            value = value.strip().lower() in ("true", "1", "yes")
         st.session_state[key] = value
 
 
@@ -388,6 +493,15 @@ def _build_mask_from_strategy(df: pd.DataFrame, strategy_dict: dict) -> pd.Serie
         return pd.Series(dtype=bool)
     mask = pd.Series(True, index=df.index)
     work = df.copy()
+    rule_slug_early = _rule_label_to_slug(strategy_dict.get("rule_select_label", ""))
+
+    entry_raw = strategy_dict.get("entry_type")
+    entry = str(entry_raw).strip().lower() if entry_raw is not None else ""
+
+    # Filtro por entry_type: both/ambos/vazio = nao restringe; back/lay = restringe
+    if entry in ("back", "lay") and "entry_type" in df.columns:
+        entry_series = df["entry_type"].astype(str).str.strip().str.lower()
+        mask &= (entry_series == entry).fillna(False)
 
     # Datas
     date_mode = strategy_dict.get("date_mode")
@@ -413,14 +527,15 @@ def _build_mask_from_strategy(df: pd.DataFrame, strategy_dict: dict) -> pd.Serie
         date_parsed = pd.to_datetime(df["date"], errors="coerce").dt.date
         mask &= (date_parsed >= range_start) & (date_parsed <= range_end)
 
-    # Volume
-    min_vol = strategy_dict.get("min_total_volume")
-    if min_vol is not None and "total_matched_volume" in df.columns:
-        vol = pd.to_numeric(df["total_matched_volume"], errors="coerce").fillna(0.0)
-        try:
-            mask &= vol >= float(min_vol)
-        except (TypeError, ValueError):
-            pass
+    # Volume (forecast_odds nao usa volume: ignorar min_total_volume)
+    if rule_slug_early != "forecast_odds":
+        min_vol = strategy_dict.get("min_total_volume")
+        if min_vol is not None and "total_matched_volume" in df.columns:
+            vol = pd.to_numeric(df["total_matched_volume"], errors="coerce").fillna(0.0)
+            try:
+                mask &= vol >= float(min_vol)
+            except (TypeError, ValueError):
+                pass
 
     # Pistas
     tracks = _strategy_list(strategy_dict, "tracks_ms")
@@ -471,22 +586,31 @@ def _build_mask_from_strategy(df: pd.DataFrame, strategy_dict: dict) -> pd.Serie
         else:
             mask &= pd.Series(False, index=df.index)
 
-    # BSP
+    # BSP: back_target_bsp / lay_target_bsp; entry both/ambos = (back between) OR (lay between)
     bsp_low = strategy_dict.get("bsp_low")
     bsp_high = strategy_dict.get("bsp_high")
-    strat_entry = strategy_dict.get("entry_type", "both")
+    back_col = "back_target_bsp"
+    lay_col = "lay_target_bsp"
     if bsp_low is not None and bsp_high is not None:
         try:
             low, high = float(bsp_low), float(bsp_high)
-            if strat_entry == "both":
-                mask &= (
-                    ((work["entry_type"] == "lay") & (work["lay_target_bsp"].between(low, high))) |
-                    ((work["entry_type"] == "back") & (work["back_target_bsp"].between(low, high)))
-                ).fillna(False)
-            else:
-                col = "lay_target_bsp" if strat_entry == "lay" else "back_target_bsp"
-                if col in work.columns:
-                    mask &= (work[col] >= low) & (work[col] <= high)
+            has_back = back_col in work.columns
+            has_lay = lay_col in work.columns
+            if entry == "back" and has_back:
+                bsp_ser = pd.to_numeric(work[back_col], errors="coerce")
+                mask &= ((bsp_ser >= low) & (bsp_ser <= high)).fillna(False)
+            elif entry == "lay" and has_lay:
+                bsp_ser = pd.to_numeric(work[lay_col], errors="coerce")
+                mask &= ((bsp_ser >= low) & (bsp_ser <= high)).fillna(False)
+            elif entry in ("both", "ambos", ""):
+                part_back = (pd.to_numeric(work[back_col], errors="coerce") >= low) & (pd.to_numeric(work[back_col], errors="coerce") <= high) if has_back else pd.Series(False, index=df.index)
+                part_lay = (pd.to_numeric(work[lay_col], errors="coerce") >= low) & (pd.to_numeric(work[lay_col], errors="coerce") <= high) if has_lay else pd.Series(False, index=df.index)
+                if has_back and has_lay:
+                    mask &= (part_back | part_lay).fillna(False)
+                elif has_back:
+                    mask &= part_back.fillna(False)
+                elif has_lay:
+                    mask &= part_lay.fillna(False)
         except (TypeError, ValueError):
             pass
 
@@ -500,7 +624,68 @@ def _build_mask_from_strategy(df: pd.DataFrame, strategy_dict: dict) -> pd.Serie
     if subcats and "category_token" in work.columns:
         mask &= work["category_token"].astype(str).isin([str(s) for s in subcats])
 
+    rule_slug = rule_slug_early
+
+    # Filtros extras da regra forecast_odds (mesma logica do modo normal)
+    if rule_slug == "forecast_odds":
+        ranks = _strategy_list(strategy_dict, "forecast_rank_ms")
+        vmin = strategy_dict.get("value_ratio_min")
+        vmax = strategy_dict.get("value_ratio_max")
+        only_value = strategy_dict.get("only_value_bets")
+        if isinstance(only_value, str):
+            only_value = only_value.strip().lower() in ("true", "1", "yes")
+
+        if ranks and "forecast_rank" in df.columns:
+            try:
+                rank_series = pd.to_numeric(df["forecast_rank"], errors="coerce")
+                rank_ints = [int(x) for x in ranks if x is not None]
+                if rank_ints:
+                    mask &= rank_series.isin(rank_ints).fillna(False)
+            except (TypeError, ValueError):
+                pass
+        if vmin is not None and vmax is not None and "value_ratio" in df.columns:
+            try:
+                vr = pd.to_numeric(df["value_ratio"], errors="coerce").fillna(float("nan"))
+                mask &= vr.between(float(vmin), float(vmax)).fillna(False)
+            except (TypeError, ValueError):
+                pass
+        if only_value and "value_ratio" in df.columns:
+            try:
+                vr_fill = pd.to_numeric(df["value_ratio"], errors="coerce").fillna(0.0)
+                mask &= (vr_fill >= 1.0).fillna(False)
+            except (TypeError, ValueError):
+                pass
+
     return mask.reindex(df.index, fill_value=False).fillna(False)
+
+
+def _make_dedup_key(df: pd.DataFrame) -> pd.Series:
+    """
+    Retorna uma Series de strings: chave por linha para dedup.
+    key = race_time_iso|track_name|market|entry_type|target_name.
+    target_name: back -> back_target_name; lay -> lay_target_name; senao back com fallback em lay.
+    NA convertido para "".
+    """
+    if df.empty:
+        return pd.Series(dtype=str)
+    race = df.get("race_time_iso", pd.Series("", index=df.index)).astype(str).fillna("")
+    track = df.get("track_name", pd.Series("", index=df.index)).astype(str).fillna("")
+    mkt = df.get("market", pd.Series("win", index=df.index))
+    if isinstance(mkt, pd.Series):
+        mkt = mkt.astype(str).fillna("")
+    else:
+        mkt = pd.Series(str(mkt), index=df.index)
+    entry = df.get("entry_type", pd.Series("", index=df.index)).astype(str).fillna("")
+
+    back_t = df.get("back_target_name", pd.Series("", index=df.index)).astype(str).fillna("")
+    lay_t = df.get("lay_target_name", pd.Series("", index=df.index)).astype(str).fillna("")
+    target = pd.Series("", index=df.index)
+    target[entry == "back"] = back_t[entry == "back"]
+    target[entry == "lay"] = lay_t[entry == "lay"]
+    other = (entry != "back") & (entry != "lay")
+    target[other] = back_t[other].where(back_t[other] != "", lay_t[other])
+
+    return race + "|" + track + "|" + mkt + "|" + entry + "|" + target
 
 
 def _add_dedup_key(df: pd.DataFrame, market: str = "win") -> pd.DataFrame:
@@ -531,6 +716,55 @@ def _add_dedup_key(df: pd.DataFrame, market: str = "win") -> pd.DataFrame:
         target.astype(str)
     )
     return df
+
+
+def _build_consolidated_df_by_groups(
+    strategies: List[dict],
+) -> Tuple[pd.DataFrame, int, int, int]:
+    """
+    Agrupa estrategias por (source_slug, market, rule_slug), carrega o df de signals
+    de cada grupo (load_signals_enriched), aplica OR das mascaras por estrategia,
+    dedup por grupo e concatena; dedup global. Retorna (df_union, total_before, total_after, overlap).
+    total_before = soma dos tamanhos antes do dedup em cada grupo; total_after = len(df_union).
+    """
+    grouped: dict[Tuple[str, str, str], List[dict]] = {}
+    for s in strategies:
+        gk = get_group_key(s)
+        grouped.setdefault(gk, []).append(s)
+
+    frames: List[pd.DataFrame] = []
+    total_before_sum = 0
+
+    for (source, market, rule), strategies_in_group in grouped.items():
+        try:
+            signals_mtime = _get_signals_mtime(source, market, rule)
+            df_group = load_signals_enriched(source=source, market=market, rule=rule, signals_mtime=signals_mtime)
+        except FileNotFoundError:
+            continue
+        if df_group.empty:
+            continue
+
+        mask_group = None
+        for strat in strategies_in_group:
+            m = _build_mask_from_strategy(df_group, strat)
+            mask_group = m if mask_group is None else (mask_group | m)
+
+        df_group_sel = df_group[mask_group].copy() if mask_group is not None else df_group.iloc[0:0].copy()
+        df_group_sel["dedup_key"] = _make_dedup_key(df_group_sel)
+        before = len(df_group_sel)
+        df_group_sel = df_group_sel.drop_duplicates(subset=["dedup_key"])
+        total_before_sum += before
+        frames.append(df_group_sel)
+
+    if not frames:
+        df_union = pd.DataFrame()
+        return (df_union, 0, 0, 0)
+
+    df_union = pd.concat(frames, ignore_index=True)
+    df_union = df_union.drop_duplicates(subset=["dedup_key"])
+    total_after = len(df_union)
+    overlap = total_before_sum - total_after
+    return (df_union, total_before_sum, total_after, overlap)
 
 
 # Teste rápido de assertividade esperado:
@@ -574,19 +808,13 @@ def _build_num_runners_index() -> dict[tuple[str, str], int]:
 
 
 def _get_signals_mtime(source: str, market: str, rule: str) -> float:
-    parquet_path = settings.PROCESSED_SIGNALS_DIR / f"signals_{source}_{market}_{rule}.parquet"
-    if parquet_path.exists():
-        try:
-            return parquet_path.stat().st_mtime
-        except OSError:
-            return 0.0
-    csv_path = settings.RAW_SIGNALS_DIR / f"signals_{source}_{market}_{rule}.csv"
-    if csv_path.exists():
-        try:
-            return csv_path.stat().st_mtime
-        except OSError:
-            return 0.0
-    return 0.0
+    try:
+        path, _ = _resolve_signals_path(source, market, rule)
+        return path.stat().st_mtime
+    except FileNotFoundError:
+        return 0.0
+    except OSError:
+        return 0.0
 
 
 def load_signals(source: str = "top3", market: str = "win", rule: str = "terceiro_queda50") -> pd.DataFrame:
@@ -631,8 +859,12 @@ def load_signals_enriched(
     O parâmetro signals_mtime é usado apenas para invalidar o cache quando o
     arquivo de sinais for atualizado em disco.
     """
-    del signals_mtime  # usado somente para a chave de cache
-    df = load_signals(source=source, market=market, rule=rule)
+    df = load_signals_df(
+        source_slug=source,
+        market=market,
+        rule_slug=rule,
+        signals_mtime=signals_mtime,
+    )
     if df.empty:
         return df
 
@@ -692,6 +924,8 @@ def main() -> None:
         st.session_state["consolidated_uploader_nonce"] = 0
     if "applied_strategy" not in st.session_state:
         st.session_state["applied_strategy"] = None
+    if "pending_remove_consolidated" not in st.session_state:
+        st.session_state["pending_remove_consolidated"] = None
 
     def _reset_rule_dependent_state() -> None:
         keys_to_clear = [
@@ -709,12 +943,12 @@ def main() -> None:
     if st.session_state.get("pending_strategy_import") is not None:
         strategy_dict = st.session_state["pending_strategy_import"]
         _apply_strategy_to_state(strategy_dict)
-        keep_keys = frozenset([
-            "strategy_name", "created_at", "rule_select_label", "source_select_label",
-            "market", "entry_type", "tracks_ms", "cats_ms", "subcats_ms", "weekdays_ms",
-            "hour_bucket_ms", "num_runners_ms", "trap_ms", "bsp_low", "bsp_high", "bsp_slider",
-            "min_total_volume", "date_mode", "date_start_input", "date_end_input", "date_range_slider",
-        ])
+        imported_rule_slug = _rule_label_to_slug(strategy_dict.get("rule_select_label", ""))
+        keep_keys = (
+            frozenset(["strategy_name", "created_at", "rule_select_label", "source_select_label", "market", "entry_type"])
+            | frozenset(CORE_STATE_KEYS)
+            | frozenset(RULE_EXTRA_KEYS.get(imported_rule_slug, []))
+        )
         st.session_state["applied_strategy"] = {k: v for k, v in strategy_dict.items() if k in keep_keys}
         st.session_state["pending_strategy_import"] = None
         st.session_state["import_in_progress"] = False
@@ -725,6 +959,7 @@ def main() -> None:
         st.session_state["consolidated_strategies"] = []
         st.session_state["visualize_mode"] = "Consolidado (Tudo)"
         st.session_state["applied_strategy"] = None
+        st.session_state.pop("consolidated_union_result", None)
         _reset_rule_dependent_state()
         st.session_state["import_uploader_nonce"] = st.session_state.get("import_uploader_nonce", 0) + 1
         st.session_state["consolidated_uploader_nonce"] = st.session_state.get("consolidated_uploader_nonce", 0) + 1
@@ -745,6 +980,22 @@ def main() -> None:
         st.session_state["pending_strategy_import"] = None
         st.session_state["pending_restore_filters"] = False
         st.session_state["import_feedback"] = "Filtros restaurados"
+
+    # Remover uma estrategia do consolidado (marcado por callback; processar aqui para nao chamar st.rerun() no callback)
+    remove_key = st.session_state.get("pending_remove_consolidated")
+    if remove_key is not None:
+        L = st.session_state.get("consolidated_strategies", [])
+        idx = remove_key if isinstance(remove_key, int) else None
+        if idx is not None and 0 <= idx < len(L):
+            del st.session_state["consolidated_strategies"][idx]
+        st.session_state.pop("consolidated_union_result", None)
+        st.session_state["pending_remove_consolidated"] = None
+        if not st.session_state.get("consolidated_strategies"):
+            st.session_state["visualize_mode"] = "Consolidado (Tudo)"
+            _reset_rule_dependent_state()
+            st.session_state["consolidated_uploader_nonce"] = st.session_state.get("consolidated_uploader_nonce", 0) + 1
+            st.session_state["last_consolidated_import_hash"] = None
+        st.rerun()
 
     is_consolidated = len(st.session_state.get("consolidated_strategies", [])) > 0
     if is_consolidated:
@@ -1168,19 +1419,15 @@ def main() -> None:
 
     # UI condicional: consolidado, estrategia aplicada ou default
     if is_consolidated:
-        def _do_remove_consolidated(idx: int) -> None:
-            L = st.session_state.get("consolidated_strategies", [])
-            if 0 <= idx < len(L):
-                del st.session_state["consolidated_strategies"][idx]
-            if not st.session_state.get("consolidated_strategies"):
-                st.session_state["visualize_mode"] = "Consolidado (Tudo)"
-                _reset_rule_dependent_state()
-                st.session_state["consolidated_uploader_nonce"] = st.session_state.get("consolidated_uploader_nonce", 0) + 1
-                st.session_state["last_consolidated_import_hash"] = None
-            st.rerun()
-
         n_strat = len(st.session_state.get("consolidated_strategies", []))
-        st.info(f"Consolidado ativo ({n_strat} estrategias). Para editar filtros ou aplicar uma estrategia unica, limpe as consolidadas.")
+        consolidated_strategies_for_banner = st.session_state.get("consolidated_strategies", [])
+        _union_result = _build_consolidated_df_by_groups(consolidated_strategies_for_banner)
+        st.session_state["consolidated_union_result"] = _union_result
+        _tb, _ta, _ov = _union_result[1], _union_result[2], _union_result[3]
+        st.info(
+            f"Consolidado ativo ({n_strat} estrategias). Para editar filtros ou aplicar uma estrategia unica, limpe as consolidadas. "
+            f"Sinais: {_tb} | Unicos: {_ta} | Sobreposicao: {_ov}"
+        )
         visualize_options = ["Consolidado (Tudo)", "Consolidado (So BACK)", "Consolidado (So LAY)"]
         for s in st.session_state.get("consolidated_strategies", []):
             name = s.get("strategy_name") or "Sem nome"
@@ -1196,6 +1443,8 @@ def main() -> None:
                 name = s.get("strategy_name", "?")
                 mkt = s.get("market", "?")
                 entry = s.get("entry_type", "?")
+                gk = get_group_key(s)
+                st.caption(f"source/market/rule: {gk[0]} / {gk[1]} / {gk[2]}")
                 tracks = s.get("tracks_ms")
                 if isinstance(tracks, str):
                     try:
@@ -1217,7 +1466,11 @@ def main() -> None:
                 with col_resumo:
                     st.write(f"**{name}** — {mkt} / {entry} — {resumo}")
                 with col_btn:
-                    st.button("Remover", key=f"remove_cons_{i}", on_click=lambda idx=i: _do_remove_consolidated(idx))
+                    st.button(
+                        "Remover",
+                        key=f"remove_cons_{i}",
+                        on_click=lambda idx=i: st.session_state.update({"pending_remove_consolidated": idx}),
+                    )
     elif st.session_state.get("applied_strategy") is not None:
         ap = st.session_state["applied_strategy"]
         name = ap.get("strategy_name", "?")
@@ -1244,7 +1497,11 @@ def main() -> None:
             st.write(f"**{name}** — {mkt} / {entry} — {resumo}")
 
     signals_mtime = _get_signals_mtime(source, market, rule)
-    df = load_signals_enriched(source=source, market=market, rule=rule, signals_mtime=signals_mtime)
+    try:
+        df = load_signals_enriched(source=source, market=market, rule=rule, signals_mtime=signals_mtime)
+    except FileNotFoundError as e:
+        st.error(str(e))
+        return
     with st.expander("Debug (carregamento de sinais)", expanded=False):
         st.write("PROCESSED_SIGNALS_DIR:", str(settings.PROCESSED_SIGNALS_DIR))
         st.write("Selecionado:", {"source": source, "market": market, "rule": rule})
@@ -1564,56 +1821,76 @@ def main() -> None:
             )
             st.caption("BSP max.")
 
-        # Volume total negociado mínimo (dentro de col_f3)
+        # Volume total negociado mínimo (forecast_odds nao usa; outras regras sim)
         volume_key = "min_total_volume"
         if volume_key not in st.session_state:
             st.session_state[volume_key] = 2000.0
         vcol, _ = st.columns([3, 7])
         with vcol:
-            st.number_input(
-                "Volume total negociado mínimo",
-                min_value=0.0,
-                max_value=1_000_000.0,
-                step=100.0,
-                format="%.0f",
-                key=volume_key,
-                help="Considera apenas corridas cuja soma de pptradedvol atinge o mínimo desejado.",
-                disabled=is_consolidated,
-            )
+            if rule != "forecast_odds":
+                st.number_input(
+                    "Volume total negociado mínimo",
+                    min_value=0.0,
+                    max_value=1_000_000.0,
+                    step=100.0,
+                    format="%.0f",
+                    key=volume_key,
+                    help="Considera apenas corridas cuja soma de pptradedvol atinge o mínimo desejado.",
+                    disabled=is_consolidated,
+                )
+            else:
+                st.number_input(
+                    "Volume total negociado mínimo",
+                    min_value=0.0,
+                    max_value=1_000_000.0,
+                    step=100.0,
+                    format="%.0f",
+                    key=volume_key,
+                    help="Forecast Odds nao usa filtro de volume; campo desabilitado.",
+                    disabled=True,
+                )
 
         # (campo movido para a frente do cabecalho de Stake)
 
     if is_consolidated and st.session_state.get("consolidated_strategies"):
         consolidated_strategies = st.session_state["consolidated_strategies"]
-        mask_total = None
-        for s in consolidated_strategies:
-            m = _build_mask_from_strategy(df, s)
-            mask_total = m if mask_total is None else (mask_total | m)
-        df_union = df[mask_total].copy() if mask_total is not None else df.iloc[0:0].copy()
-        total_before_dedup = len(df_union)
-        df_union = _add_dedup_key(df_union, market)
-        df_union = df_union.drop_duplicates(subset=["dedup_key"])
-        total_unique = len(df_union)
-        overlap = total_before_dedup - total_unique
+        _cached = st.session_state.get("consolidated_union_result")
+        if _cached is not None and len(_cached) == 4:
+            df_union, total_before, total_after, overlap = _cached
+        else:
+            df_union, total_before, total_after, overlap = _build_consolidated_df_by_groups(consolidated_strategies)
+            st.session_state["consolidated_union_result"] = (df_union, total_before, total_after, overlap)
         viz_mode = st.session_state.get("visualize_mode", "Consolidado (Tudo)")
         if viz_mode == "Consolidado (So BACK)":
-            filt = df_union[df_union["entry_type"] == "back"].copy()
+            if not df_union.empty and "entry_type" in df_union.columns:
+                filt = df_union[df_union["entry_type"] == "back"].copy()
+            else:
+                filt = df_union.copy()
         elif viz_mode == "Consolidado (So LAY)":
-            filt = df_union[df_union["entry_type"] == "lay"].copy()
+            if not df_union.empty and "entry_type" in df_union.columns:
+                filt = df_union[df_union["entry_type"] == "lay"].copy()
+            else:
+                filt = df_union.copy()
         elif isinstance(viz_mode, str) and viz_mode.startswith("Estrategia:"):
             name = viz_mode.replace("Estrategia:", "").strip()
-            chosen = next((s for s in consolidated_strategies if (s.get("strategy_name") or "").strip() == name), None)
+            chosen = next((s for s in consolidated_strategies if (s.get("strategy_name") or "Sem nome").strip() == name), None)
             if chosen is not None:
-                mask_i = _build_mask_from_strategy(df, chosen)
-                df_i = df[mask_i].copy()
-                df_i = _add_dedup_key(df_i, market)
-                df_i = df_i.drop_duplicates(subset=["dedup_key"])
-                filt = df_i
+                try:
+                    source_g, market_g, rule_g = get_group_key(chosen)
+                    signals_mtime_g = _get_signals_mtime(source_g, market_g, rule_g)
+                    df_group = load_signals_enriched(source=source_g, market=market_g, rule=rule_g, signals_mtime=signals_mtime_g)
+                    mask_i = _build_mask_from_strategy(df_group, chosen)
+                    df_i = df_group[mask_i].copy()
+                    df_i["dedup_key"] = _make_dedup_key(df_i)
+                    df_i = df_i.drop_duplicates(subset=["dedup_key"])
+                    filt = df_i
+                except FileNotFoundError:
+                    filt = df_union.copy()
             else:
-                filt = df_union
+                filt = df_union.copy()
         else:
-            filt = df_union
-        st.caption(f"Consolidado: {total_before_dedup} linhas antes do dedup | {total_unique} unicas | sobreposicao = {overlap}")
+            filt = df_union.copy()
+        st.caption(f"Sinais: {total_before} | Unicos: {total_after} | Sobreposicao: {overlap}")
     else:
         filt = df_filtered.copy()
 
