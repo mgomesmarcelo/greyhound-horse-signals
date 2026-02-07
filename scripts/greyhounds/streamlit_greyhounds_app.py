@@ -1,9 +1,12 @@
 import datetime
 import calendar
+import hashlib
+import io
+import json
 import math
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -234,6 +237,302 @@ def _compute_summary_metrics(df_block: pd.DataFrame, entry_kind: str, base_amoun
         metrics["drawdown_liab"] = _calc_drawdown(cumulative_liab)
     return metrics
 
+
+def get_current_strategy_snapshot(
+    rule_select_label: str,
+    source_select_label: str,
+    market: str,
+    entry_type: str,
+) -> dict:
+    """Captura os parâmetros atuais do app em um dict serializável."""
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    strategy_name = f"{rule_select_label}_{market}_{entry_type}_{ts.replace(':', '-')}"
+    out = {
+        "strategy_name": strategy_name,
+        "created_at": ts,
+        "rule_select_label": rule_select_label,
+        "source_select_label": source_select_label,
+        "market": market,
+        "entry_type": entry_type,
+    }
+    filter_keys = [
+        "tracks_ms", "cats_ms", "subcats_ms", "weekdays_ms", "hour_bucket_ms",
+        "num_runners_ms", "trap_ms", "bsp_low", "bsp_high", "min_total_volume",
+        "date_mode", "date_start_input", "date_end_input", "date_range_slider",
+    ]
+    for key in filter_keys:
+        if key in st.session_state:
+            val = st.session_state[key]
+            if isinstance(val, (datetime.date, datetime.datetime)):
+                out[key] = val.isoformat() if hasattr(val, "isoformat") else str(val)
+            elif isinstance(val, (tuple, list)) and val and isinstance(val[0], (datetime.date, datetime.datetime)):
+                out[key] = json.dumps([v.isoformat() if hasattr(v, "isoformat") else str(v) for v in val])
+            elif isinstance(val, (list, tuple)):
+                out[key] = json.dumps(list(val))
+            else:
+                out[key] = val
+    return out
+
+
+def strategy_to_csv_bytes(strategy_dict: dict) -> bytes:
+    """Exporta estratégia para CSV com header e 1 linha; listas em JSON, datas em ISO."""
+    row = {}
+    for k, v in strategy_dict.items():
+        if isinstance(v, (list, tuple)):
+            row[k] = json.dumps(v)
+        elif hasattr(v, "isoformat"):
+            row[k] = v.isoformat()
+        else:
+            row[k] = v
+    df = pd.DataFrame([row])
+    buf = io.BytesIO()
+    df.to_csv(buf, index=False, encoding="utf-8")
+    return buf.getvalue()
+
+
+def parse_strategies_csv(uploaded_file: Any) -> List[dict]:
+    """Lê CSV e devolve lista de dicts; colunas que parecem JSON são parseadas."""
+    if uploaded_file is None:
+        return []
+    try:
+        df = pd.read_csv(uploaded_file, encoding="utf-8")
+    except Exception:
+        try:
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+        except Exception:
+            return []
+    if df.empty:
+        return []
+    out = []
+    for _, row in df.iterrows():
+        d = {}
+        for col in df.columns:
+            val = row[col]
+            if pd.isna(val):
+                continue
+            if isinstance(val, str) and val.strip().startswith(("[", "{")):
+                try:
+                    val = json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            d[col] = val
+        out.append(d)
+    return out
+
+
+def _hash_uploaded_file(uploaded_file: Any) -> str:
+    """Retorna hash SHA256 em hex do conteudo do arquivo (usa getvalue para nao consumir ponteiro)."""
+    data = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    return hashlib.sha256(data).hexdigest()
+
+
+# Chaves permitidas ao aplicar estrategia importada (ignora created_at, strategy_name e extras)
+_STRATEGY_STATE_WHITELIST = frozenset([
+    "rule_select_label", "source_select_label", "market", "entry_type",
+    "tracks_ms", "cats_ms", "subcats_ms", "weekdays_ms", "hour_bucket_ms",
+    "num_runners_ms", "trap_ms", "bsp_low", "bsp_high", "bsp_slider",
+    "min_total_volume", "date_mode", "date_start_input", "date_end_input", "date_range_slider",
+])
+
+
+def _apply_strategy_to_state(strategy_dict: dict) -> None:
+    """Aplica ao session_state apenas chaves conhecidas; chamar ANTES de qualquer widget."""
+    for key, value in strategy_dict.items():
+        if key not in _STRATEGY_STATE_WHITELIST:
+            continue
+        if key in ("date_start_input", "date_end_input") and isinstance(value, str):
+            try:
+                value = pd.to_datetime(value).date()
+            except Exception:
+                pass
+        if key == "date_range_slider":
+            if isinstance(value, list) and len(value) == 2:
+                try:
+                    value = (pd.to_datetime(value[0]).to_pydatetime(), pd.to_datetime(value[1]).to_pydatetime())
+                except Exception:
+                    pass
+        st.session_state[key] = value
+
+
+def _strategy_list(d: dict, key: str):
+    """Extrai lista do strategy dict (pode vir como list ou JSON string)."""
+    v = d.get(key)
+    if v is None:
+        return None
+    if isinstance(v, list):
+        return v if v else None
+    if isinstance(v, str) and v.strip().startswith("["):
+        try:
+            return json.loads(v)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return None
+
+
+def _compute_hour_bucket_series(series: pd.Series) -> pd.Series:
+    """Retorna serie de buckets horarios (08:00-12:00, etc.) a partir de race_time_iso."""
+    ts = pd.to_datetime(series, format=_RACE_TIME_ISO_FORMAT, errors="coerce")
+    minutes = ts.dt.hour * 60 + ts.dt.minute
+    bucket = pd.Series(index=series.index, dtype="object")
+    bucket[(minutes >= 8 * 60) & (minutes <= 12 * 60)] = "08:00-12:00"
+    bucket[(minutes >= 12 * 60 + 1) & (minutes <= 16 * 60)] = "12:01-16:00"
+    bucket[(minutes >= 16 * 60 + 1) & (minutes <= 20 * 60)] = "16:01-20:00"
+    bucket[(minutes >= 20 * 60 + 1)] = "20:01-23:59"
+    return bucket
+
+
+def _build_mask_from_strategy(df: pd.DataFrame, strategy_dict: dict) -> pd.Series:
+    """Mascara booleana: True onde a linha atende aos filtros do strategy_dict. Falta de chave = sem filtro."""
+    if df.empty:
+        return pd.Series(dtype=bool)
+    mask = pd.Series(True, index=df.index)
+    work = df.copy()
+
+    # Datas
+    date_mode = strategy_dict.get("date_mode")
+    range_start = range_end = None
+    if date_mode == "Barra":
+        slider = strategy_dict.get("date_range_slider")
+        if isinstance(slider, (list, tuple)) and len(slider) >= 2:
+            try:
+                range_start = pd.to_datetime(slider[0]).date()
+                range_end = pd.to_datetime(slider[1]).date()
+            except Exception:
+                pass
+    if range_start is None or range_end is None:
+        start_val = strategy_dict.get("date_start_input")
+        end_val = strategy_dict.get("date_end_input")
+        if start_val is not None and end_val is not None:
+            try:
+                range_start = pd.to_datetime(start_val).date()
+                range_end = pd.to_datetime(end_val).date()
+            except Exception:
+                pass
+    if range_start is not None and range_end is not None and "date" in df.columns:
+        date_parsed = pd.to_datetime(df["date"], errors="coerce").dt.date
+        mask &= (date_parsed >= range_start) & (date_parsed <= range_end)
+
+    # Volume
+    min_vol = strategy_dict.get("min_total_volume")
+    if min_vol is not None and "total_matched_volume" in df.columns:
+        vol = pd.to_numeric(df["total_matched_volume"], errors="coerce").fillna(0.0)
+        try:
+            mask &= vol >= float(min_vol)
+        except (TypeError, ValueError):
+            pass
+
+    # Pistas
+    tracks = _strategy_list(strategy_dict, "tracks_ms")
+    if tracks and "track_name" in df.columns:
+        mask &= df["track_name"].astype(str).isin([str(t) for t in tracks])
+
+    # Traps
+    traps = _strategy_list(strategy_dict, "trap_ms")
+    if traps is not None and "trap_number" in df.columns:
+        trap_series = pd.to_numeric(df["trap_number"], errors="coerce").astype("Int64")
+        if traps:
+            mask &= trap_series.isin([int(t) for t in traps]).fillna(False)
+        else:
+            mask &= pd.Series(False, index=df.index)
+
+    # Categoria: enriquecer se faltar
+    if "category" not in work.columns or "category_token" not in work.columns:
+        if "track_name" in work.columns and "race_time_iso" in work.columns:
+            cat_index = _build_category_index()
+            work["_key_track"] = work["track_name"].astype(str).map(normalize_track_name)
+            work["_key_race"] = work["race_time_iso"].astype(str)
+            keys_series = pd.Series(list(zip(work["_key_track"], work["_key_race"])), index=work.index)
+            work["category"] = keys_series.map(lambda k: (cat_index.get(k, {}) or {}).get("letter", "")).fillna("").astype(str)
+            work["category_token"] = keys_series.map(lambda k: (cat_index.get(k, {}) or {}).get("token", "")).fillna("").astype(str)
+
+    # Weekdays
+    weekdays_ms = _strategy_list(strategy_dict, "weekdays_ms")
+    if weekdays_ms and "race_time_iso" in work.columns:
+        wd_names = {"Seg": 0, "Ter": 1, "Qua": 2, "Qui": 3, "Sex": 4, "Sab": 5, "Dom": 6}
+        sel_nums = [wd_names.get(str(w), w) for w in weekdays_ms if isinstance(w, (int, str)) and (isinstance(w, int) or str(w) in wd_names)]
+        if sel_nums:
+            ts_filt = pd.to_datetime(work["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
+            wd_filt = ts_filt.dt.weekday
+            mask &= wd_filt.isin(sel_nums).fillna(False)
+
+    # Hour bucket
+    hb = _strategy_list(strategy_dict, "hour_bucket_ms")
+    if hb and "race_time_iso" in work.columns:
+        bucket_series = _compute_hour_bucket_series(work["race_time_iso"])
+        mask &= bucket_series.isin(hb).fillna(False)
+
+    # Num runners
+    nr = _strategy_list(strategy_dict, "num_runners_ms")
+    if nr is not None and "num_runners" in work.columns:
+        nr_series = pd.to_numeric(work["num_runners"], errors="coerce")
+        if nr:
+            mask &= nr_series.isin([int(x) for x in nr]).fillna(False)
+        else:
+            mask &= pd.Series(False, index=df.index)
+
+    # BSP
+    bsp_low = strategy_dict.get("bsp_low")
+    bsp_high = strategy_dict.get("bsp_high")
+    strat_entry = strategy_dict.get("entry_type", "both")
+    if bsp_low is not None and bsp_high is not None:
+        try:
+            low, high = float(bsp_low), float(bsp_high)
+            if strat_entry == "both":
+                mask &= (
+                    ((work["entry_type"] == "lay") & (work["lay_target_bsp"].between(low, high))) |
+                    ((work["entry_type"] == "back") & (work["back_target_bsp"].between(low, high)))
+                ).fillna(False)
+            else:
+                col = "lay_target_bsp" if strat_entry == "lay" else "back_target_bsp"
+                if col in work.columns:
+                    mask &= (work[col] >= low) & (work[col] <= high)
+        except (TypeError, ValueError):
+            pass
+
+    # Categorias
+    cats = _strategy_list(strategy_dict, "cats_ms")
+    if cats and "category" in work.columns:
+        mask &= work["category"].astype(str).isin([str(c) for c in cats])
+
+    # Subcategorias
+    subcats = _strategy_list(strategy_dict, "subcats_ms")
+    if subcats and "category_token" in work.columns:
+        mask &= work["category_token"].astype(str).isin([str(s) for s in subcats])
+
+    return mask.reindex(df.index, fill_value=False).fillna(False)
+
+
+def _add_dedup_key(df: pd.DataFrame, market: str = "win") -> pd.DataFrame:
+    """Adiciona coluna dedup_key para remocao de duplicatas (race|track|market|entry|target)."""
+    if df.empty:
+        df["dedup_key"] = pd.Series(dtype=str)
+        return df
+    entry = df.get("entry_type", pd.Series("", index=df.index)).astype(str)
+    if "back_target_name" in df.columns and "lay_target_name" in df.columns:
+        target = df.apply(lambda r: (r["back_target_name"] if r["entry_type"] == "back" else r["lay_target_name"]) if pd.notna(r.get("entry_type")) else "", axis=1)
+    elif "back_target_name" in df.columns:
+        target = df["back_target_name"].fillna("").astype(str)
+    elif "lay_target_name" in df.columns:
+        target = df["lay_target_name"].fillna("").astype(str)
+    else:
+        target = df.get("race_time_iso", pd.Series("", index=df.index)).astype(str)
+    m = df.get("market", market)
+    if isinstance(m, pd.Series):
+        m = m.astype(str)
+    else:
+        m = str(m)
+    df = df.copy()
+    df["dedup_key"] = (
+        df["race_time_iso"].astype(str) + "|" +
+        df["track_name"].astype(str) + "|" +
+        m + "|" +
+        entry + "|" +
+        target.astype(str)
+    )
+    return df
+
+
 # Teste rápido de assertividade esperado:
 # signals=10, greens=6 -> accuracy=0.6 -> 60.00%
 # signals=0, greens=0 -> accuracy=0.0 -> 0.00%
@@ -370,6 +669,87 @@ def load_signals_enriched(
 
 def main() -> None:
     st.set_page_config(page_title="Sinais LAY/BACK - Galgos", layout="wide")
+    # Inicializacao do modo consolidado e estrategias
+    if "consolidated_strategies" not in st.session_state:
+        st.session_state["consolidated_strategies"] = []
+    if "visualize_mode" not in st.session_state:
+        st.session_state["visualize_mode"] = "Consolidado (Tudo)"
+    if "pending_strategy_import" not in st.session_state:
+        st.session_state["pending_strategy_import"] = None
+    if "last_import_hash" not in st.session_state:
+        st.session_state["last_import_hash"] = None
+    if "import_in_progress" not in st.session_state:
+        st.session_state["import_in_progress"] = False
+    if "last_consolidated_import_hash" not in st.session_state:
+        st.session_state["last_consolidated_import_hash"] = None
+    if "pending_clear_consolidated" not in st.session_state:
+        st.session_state["pending_clear_consolidated"] = False
+    if "pending_restore_filters" not in st.session_state:
+        st.session_state["pending_restore_filters"] = False
+    if "import_uploader_nonce" not in st.session_state:
+        st.session_state["import_uploader_nonce"] = 0
+    if "consolidated_uploader_nonce" not in st.session_state:
+        st.session_state["consolidated_uploader_nonce"] = 0
+    if "applied_strategy" not in st.session_state:
+        st.session_state["applied_strategy"] = None
+
+    def _reset_rule_dependent_state() -> None:
+        keys_to_clear = [
+            "date_start_input", "date_end_input", "date_range_slider",
+            "dates_range", "dates_ms", "tracks_ms", "num_runners_ms", "cats_ms",
+            "subcats_ms", "sel_num_runners", "sel_cats", "sel_subcats",
+            "bsp_low", "bsp_high", "bsp_slider", "forecast_rank_ms",
+            "value_ratio_min", "value_ratio_max", "only_value_bets",
+            "weekdays_ms", "sel_weekdays", "hour_bucket_ms", "trap_ms",
+        ]
+        for key in keys_to_clear:
+            st.session_state.pop(key, None)
+
+    # Aplicar estrategia pendente ANTES de qualquer widget (evita StreamlitAPIException)
+    if st.session_state.get("pending_strategy_import") is not None:
+        strategy_dict = st.session_state["pending_strategy_import"]
+        _apply_strategy_to_state(strategy_dict)
+        keep_keys = frozenset([
+            "strategy_name", "created_at", "rule_select_label", "source_select_label",
+            "market", "entry_type", "tracks_ms", "cats_ms", "subcats_ms", "weekdays_ms",
+            "hour_bucket_ms", "num_runners_ms", "trap_ms", "bsp_low", "bsp_high", "bsp_slider",
+            "min_total_volume", "date_mode", "date_start_input", "date_end_input", "date_range_slider",
+        ])
+        st.session_state["applied_strategy"] = {k: v for k, v in strategy_dict.items() if k in keep_keys}
+        st.session_state["pending_strategy_import"] = None
+        st.session_state["import_in_progress"] = False
+        st.session_state["import_feedback"] = "Estrategia aplicada com sucesso"
+
+    # Processar clear consolidado ANTES de qualquer widget (evita StreamlitAPIException)
+    if st.session_state.get("pending_clear_consolidated"):
+        st.session_state["consolidated_strategies"] = []
+        st.session_state["visualize_mode"] = "Consolidado (Tudo)"
+        st.session_state["applied_strategy"] = None
+        _reset_rule_dependent_state()
+        st.session_state["import_uploader_nonce"] = st.session_state.get("import_uploader_nonce", 0) + 1
+        st.session_state["consolidated_uploader_nonce"] = st.session_state.get("consolidated_uploader_nonce", 0) + 1
+        st.session_state["last_import_hash"] = None
+        st.session_state["import_in_progress"] = False
+        st.session_state["last_consolidated_import_hash"] = None
+        st.session_state["pending_strategy_import"] = None
+        st.session_state["pending_clear_consolidated"] = False
+        st.session_state["import_feedback"] = "Consolidadas limpas"
+
+    # Restaurar filtros pendente (antes de qualquer widget)
+    if st.session_state.get("pending_restore_filters"):
+        _reset_rule_dependent_state()
+        st.session_state["applied_strategy"] = None
+        st.session_state["import_uploader_nonce"] = st.session_state.get("import_uploader_nonce", 0) + 1
+        st.session_state["last_import_hash"] = None
+        st.session_state["import_in_progress"] = False
+        st.session_state["pending_strategy_import"] = None
+        st.session_state["pending_restore_filters"] = False
+        st.session_state["import_feedback"] = "Filtros restaurados"
+
+    is_consolidated = len(st.session_state.get("consolidated_strategies", [])) > 0
+    if is_consolidated:
+        st.session_state["applied_strategy"] = None
+
     st.title("Sinais LAY/BACK - Estrategias Greyhounds")
 
     # (Sem CSS custom)  Restaurado layout padrao do Streamlit
@@ -671,35 +1051,6 @@ def main() -> None:
     # st.write("RULE_LABELS.keys():", list(getattr(_cfg, "RULE_LABELS", {}).keys()))
     rule_labels = [label for _, label in rule_label_pairs]
 
-    def _reset_rule_dependent_state() -> None:
-        keys_to_clear = [
-            "date_start_input",
-            "date_end_input",
-            "date_range_slider",
-            "dates_range",
-            "dates_ms",
-            "tracks_ms",
-            "num_runners_ms",
-            "cats_ms",
-            "subcats_ms",
-            "sel_num_runners",
-            "sel_cats",
-            "sel_subcats",
-            "bsp_low",
-            "bsp_high",
-            "bsp_slider",
-            "forecast_rank_ms",
-            "value_ratio_min",
-            "value_ratio_max",
-            "only_value_bets",
-            "weekdays_ms",
-            "sel_weekdays",
-            "hour_bucket_ms",
-            "trap_ms",
-        ]
-        for key in keys_to_clear:
-            st.session_state.pop(key, None)
-
     with col_rule:
         if "rule_select_label" not in st.session_state:
             st.session_state["rule_select_label"] = rule_labels[0]
@@ -744,6 +1095,153 @@ def main() -> None:
             entry_type = "back" if entry_label == ENTRY_TYPE_LABELS["back"] else "lay"
 
     st.caption(f"Regra selecionada: {selected_rule_label} · Fonte de dados: {source_label}")
+
+    import_feedback_msg = st.session_state.pop("import_feedback", None)
+
+    col_restore, col_exp, col_imp, col_imp_cons, col_clear = st.columns(5)
+    with col_restore:
+        if st.button("Restaurar filtros", key="restore_filters_btn", disabled=is_consolidated):
+            st.session_state["pending_restore_filters"] = True
+            st.rerun()
+        if import_feedback_msg:
+            st.caption(import_feedback_msg)
+    with col_exp:
+        snapshot = get_current_strategy_snapshot(selected_rule_label, selected_source_label, market, entry_type)
+        csv_bytes = strategy_to_csv_bytes(snapshot)
+        st.download_button(
+            "Exportar estrategia (CSV)",
+            data=csv_bytes,
+            file_name="estrategia.csv",
+            mime="text/csv",
+            key="export_strategy_btn",
+        )
+    with col_imp:
+        if is_consolidated:
+            st.session_state["import_uploader_nonce"] = st.session_state.get("import_uploader_nonce", 0) + 1
+            st.session_state["last_import_hash"] = None
+            st.session_state["import_in_progress"] = False
+            st.session_state["pending_strategy_import"] = None
+            _strategy_uploader_key = f"import_strategy_csv_{st.session_state['import_uploader_nonce']}"
+            st.file_uploader("Importar estrategia (CSV)", type=["csv"], key=_strategy_uploader_key, disabled=True)
+            st.warning("Consolidado ativo: para aplicar estrategia unica, limpe as consolidadas.")
+        else:
+            _strategy_uploader_key = f"import_strategy_csv_{st.session_state['import_uploader_nonce']}"
+            uploaded_single = st.file_uploader("Importar estrategia (CSV)", type=["csv"], key=_strategy_uploader_key)
+            if uploaded_single is None:
+                st.session_state["last_import_hash"] = None
+                st.session_state["import_in_progress"] = False
+            else:
+                data = uploaded_single.getvalue()
+                h = _hash_uploaded_file(io.BytesIO(data))
+                last_h = st.session_state.get("last_import_hash")
+                in_progress = st.session_state.get("import_in_progress", False)
+                if last_h == h and not in_progress:
+                    pass
+                else:
+                    strategies = parse_strategies_csv(io.BytesIO(data))
+                    if strategies:
+                        st.session_state["pending_strategy_import"] = strategies[0]
+                        st.session_state["last_import_hash"] = h
+                        st.session_state["import_in_progress"] = True
+                        st.rerun()
+    with col_imp_cons:
+        _consolidated_uploader_key = f"import_consolidated_csv_{st.session_state['consolidated_uploader_nonce']}"
+        uploaded_consolidated = st.file_uploader("Importar consolidadas (CSV)", type=["csv"], key=_consolidated_uploader_key)
+        if uploaded_consolidated is None:
+            st.session_state["last_consolidated_import_hash"] = None
+        else:
+            data_cons = uploaded_consolidated.getvalue()
+            h_cons = _hash_uploaded_file(io.BytesIO(data_cons))
+            last_h_cons = st.session_state.get("last_consolidated_import_hash")
+            if last_h_cons == h_cons:
+                pass
+            else:
+                strategies = parse_strategies_csv(io.BytesIO(data_cons))
+                if strategies:
+                    st.session_state["consolidated_strategies"] = st.session_state.get("consolidated_strategies", []) + strategies
+                    st.session_state["last_consolidated_import_hash"] = h_cons
+                    st.rerun()
+    with col_clear:
+        if st.button("Limpar consolidadas", key="clear_consolidated_btn"):
+            st.session_state["pending_clear_consolidated"] = True
+            st.rerun()
+
+    # UI condicional: consolidado, estrategia aplicada ou default
+    if is_consolidated:
+        def _do_remove_consolidated(idx: int) -> None:
+            L = st.session_state.get("consolidated_strategies", [])
+            if 0 <= idx < len(L):
+                del st.session_state["consolidated_strategies"][idx]
+            if not st.session_state.get("consolidated_strategies"):
+                st.session_state["visualize_mode"] = "Consolidado (Tudo)"
+                _reset_rule_dependent_state()
+                st.session_state["consolidated_uploader_nonce"] = st.session_state.get("consolidated_uploader_nonce", 0) + 1
+                st.session_state["last_consolidated_import_hash"] = None
+            st.rerun()
+
+        n_strat = len(st.session_state.get("consolidated_strategies", []))
+        st.info(f"Consolidado ativo ({n_strat} estrategias). Para editar filtros ou aplicar uma estrategia unica, limpe as consolidadas.")
+        visualize_options = ["Consolidado (Tudo)", "Consolidado (So BACK)", "Consolidado (So LAY)"]
+        for s in st.session_state.get("consolidated_strategies", []):
+            name = s.get("strategy_name") or "Sem nome"
+            visualize_options.append(f"Estrategia: {name}")
+        current_viz = st.session_state.get("visualize_mode", "Consolidado (Tudo)")
+        if current_viz not in visualize_options:
+            st.session_state["visualize_mode"] = "Consolidado (Tudo)"
+        st.selectbox("Visualizar", visualize_options, key="visualize_mode")
+        consolidated = st.session_state.get("consolidated_strategies", [])
+        n = len(consolidated)
+        with st.expander(f"Estrategias consolidadas ({n})", expanded=(n > 0)):
+            for i, s in enumerate(consolidated):
+                name = s.get("strategy_name", "?")
+                mkt = s.get("market", "?")
+                entry = s.get("entry_type", "?")
+                tracks = s.get("tracks_ms")
+                if isinstance(tracks, str):
+                    try:
+                        tracks = json.loads(tracks) if tracks else []
+                    except json.JSONDecodeError:
+                        tracks = []
+                cats = s.get("cats_ms")
+                if isinstance(cats, str):
+                    try:
+                        cats = json.loads(cats) if cats else []
+                    except json.JSONDecodeError:
+                        cats = []
+                bsp_low = s.get("bsp_low", "")
+                bsp_high = s.get("bsp_high", "")
+                resumo = f"pistas: {len(tracks) if isinstance(tracks, list) else '?'} | categorias: {len(cats) if isinstance(cats, list) else '?'}"
+                if bsp_low != "" or bsp_high != "":
+                    resumo += f" | BSP: [{bsp_low}, {bsp_high}]"
+                col_resumo, col_btn = st.columns([0.85, 0.15])
+                with col_resumo:
+                    st.write(f"**{name}** — {mkt} / {entry} — {resumo}")
+                with col_btn:
+                    st.button("Remover", key=f"remove_cons_{i}", on_click=lambda idx=i: _do_remove_consolidated(idx))
+    elif st.session_state.get("applied_strategy") is not None:
+        ap = st.session_state["applied_strategy"]
+        name = ap.get("strategy_name", "?")
+        mkt = ap.get("market", "?")
+        entry = ap.get("entry_type", "?")
+        tracks = ap.get("tracks_ms")
+        if isinstance(tracks, str):
+            try:
+                tracks = json.loads(tracks) if tracks else []
+            except json.JSONDecodeError:
+                tracks = []
+        cats = ap.get("cats_ms")
+        if isinstance(cats, str):
+            try:
+                cats = json.loads(cats) if cats else []
+            except json.JSONDecodeError:
+                cats = []
+        bsp_low = ap.get("bsp_low", "")
+        bsp_high = ap.get("bsp_high", "")
+        resumo = f"pistas: {len(tracks) if isinstance(tracks, list) else '?'} | categorias: {len(cats) if isinstance(cats, list) else '?'}"
+        if bsp_low != "" or bsp_high != "":
+            resumo += f" | BSP: [{bsp_low}, {bsp_high}]"
+        with st.expander("Estrategia aplicada", expanded=True):
+            st.write(f"**{name}** — {mkt} / {entry} — {resumo}")
 
     signals_mtime = _get_signals_mtime(source, market, rule)
     df = load_signals_enriched(source=source, market=market, rule=rule, signals_mtime=signals_mtime)
@@ -838,6 +1336,7 @@ def main() -> None:
                 horizontal=True,
                 index=0 if default_mode != "Barra" else 1,
                 key="date_mode_selector",
+                disabled=is_consolidated,
             )
             st.session_state["date_mode"] = active_mode
 
@@ -848,7 +1347,7 @@ def main() -> None:
                     min_value=min_date,
                     max_value=max_date,
                     key=date_start_key,
-                    disabled=active_mode == "Barra",
+                    disabled=(active_mode == "Barra") or is_consolidated,
                 )
             with end_col:
                 end_selected = st.date_input(
@@ -856,7 +1355,7 @@ def main() -> None:
                     min_value=min_date,
                     max_value=max_date,
                     key=date_end_key,
-                    disabled=active_mode == "Barra",
+                    disabled=(active_mode == "Barra") or is_consolidated,
                 )
 
             # Faixa inicial derivada do calendário (default)
@@ -903,7 +1402,7 @@ def main() -> None:
                 max_value=slider_max_dt,
                 format="YYYY-MM-DD",
                 key=slider_key,
-                disabled=active_mode == "Calendário",
+                disabled=(active_mode == "Calendário") or is_consolidated,
             )
             slider_start_date = slider_start_dt.date()
             slider_end_date = slider_end_dt.date()
@@ -939,12 +1438,14 @@ def main() -> None:
                 "Todos",
                 key="tracks_all",
                 on_click=lambda: st.session_state.update({"tracks_ms": list(tracks)}),
+                disabled=is_consolidated,
             )
         with tb2:
             st.button(
                 "Limpar",
                 key="tracks_none",
                 on_click=lambda: st.session_state.update({"tracks_ms": []}),
+                disabled=is_consolidated,
             )
         if "tracks_ms" not in st.session_state:
             st.session_state["tracks_ms"] = list(tracks)
@@ -954,7 +1455,7 @@ def main() -> None:
             if not sanitized_tracks and existing_tracks:
                 sanitized_tracks = list(tracks)
             st.session_state["tracks_ms"] = sanitized_tracks
-        sel_tracks = st.multiselect("Pistas", tracks, key="tracks_ms")
+        sel_tracks = st.multiselect("Pistas", tracks, key="tracks_ms", disabled=is_consolidated)
     with col_f3:
         if entry_type == "lay":
             bsp_col = "lay_target_bsp"
@@ -1033,6 +1534,7 @@ def main() -> None:
             step=0.01,
             key="bsp_slider",
             on_change=_sync_bsp_from_slider,
+            disabled=is_consolidated,
         )
         c41, c42, _ = st.columns([1, 1, 2])
         with c41:
@@ -1045,6 +1547,7 @@ def main() -> None:
                 key="bsp_low",
                 on_change=_sync_bsp_low,
                 label_visibility="collapsed",
+                disabled=is_consolidated,
             )
             st.caption("BSP min.")
         with c42:
@@ -1057,6 +1560,7 @@ def main() -> None:
                 key="bsp_high",
                 on_change=_sync_bsp_high,
                 label_visibility="collapsed",
+                disabled=is_consolidated,
             )
             st.caption("BSP max.")
 
@@ -1074,20 +1578,53 @@ def main() -> None:
                 format="%.0f",
                 key=volume_key,
                 help="Considera apenas corridas cuja soma de pptradedvol atinge o mínimo desejado.",
+                disabled=is_consolidated,
             )
 
         # (campo movido para a frente do cabecalho de Stake)
 
-    filt = df_filtered.copy()
+    if is_consolidated and st.session_state.get("consolidated_strategies"):
+        consolidated_strategies = st.session_state["consolidated_strategies"]
+        mask_total = None
+        for s in consolidated_strategies:
+            m = _build_mask_from_strategy(df, s)
+            mask_total = m if mask_total is None else (mask_total | m)
+        df_union = df[mask_total].copy() if mask_total is not None else df.iloc[0:0].copy()
+        total_before_dedup = len(df_union)
+        df_union = _add_dedup_key(df_union, market)
+        df_union = df_union.drop_duplicates(subset=["dedup_key"])
+        total_unique = len(df_union)
+        overlap = total_before_dedup - total_unique
+        viz_mode = st.session_state.get("visualize_mode", "Consolidado (Tudo)")
+        if viz_mode == "Consolidado (So BACK)":
+            filt = df_union[df_union["entry_type"] == "back"].copy()
+        elif viz_mode == "Consolidado (So LAY)":
+            filt = df_union[df_union["entry_type"] == "lay"].copy()
+        elif isinstance(viz_mode, str) and viz_mode.startswith("Estrategia:"):
+            name = viz_mode.replace("Estrategia:", "").strip()
+            chosen = next((s for s in consolidated_strategies if (s.get("strategy_name") or "").strip() == name), None)
+            if chosen is not None:
+                mask_i = _build_mask_from_strategy(df, chosen)
+                df_i = df[mask_i].copy()
+                df_i = _add_dedup_key(df_i, market)
+                df_i = df_i.drop_duplicates(subset=["dedup_key"])
+                filt = df_i
+            else:
+                filt = df_union
+        else:
+            filt = df_union
+        st.caption(f"Consolidado: {total_before_dedup} linhas antes do dedup | {total_unique} unicas | sobreposicao = {overlap}")
+    else:
+        filt = df_filtered.copy()
 
     min_total_volume = float(st.session_state.get(volume_key, 2000.0))
     volume_series = pd.to_numeric(filt.get("total_matched_volume", pd.Series(dtype=float)), errors="coerce")
-    # forecast_odds usa total_matched_volume neutro (0.0); nao aplicar filtro de volume para nao zerar
-    if rule != "forecast_odds":
-        filt = filt[volume_series.fillna(0.0) >= min_total_volume]
+    if not is_consolidated:
+        if rule != "forecast_odds":
+            filt = filt[volume_series.fillna(0.0) >= min_total_volume]
 
     sel_traps = st.session_state.get("trap_ms", None)
-    if sel_traps is not None:
+    if not is_consolidated and sel_traps is not None:
         if sel_traps:
             trap_series_filt = pd.to_numeric(filt.get("trap_number", pd.Series(dtype=float)), errors="coerce")
             trap_series_filt = trap_series_filt.astype("Int64")
@@ -1150,12 +1687,14 @@ def main() -> None:
                         "Todos",
                         key="weekdays_all",
                         on_click=lambda: st.session_state.update({"weekdays_ms": list(weekday_options)}),
+                        disabled=is_consolidated,
                     )
                 with wb2:
                     st.button(
                         "Limpar",
                         key="weekdays_none",
                         on_click=lambda: st.session_state.update({"weekdays_ms": []}),
+                        disabled=is_consolidated,
                     )
                 if "weekdays_ms" not in st.session_state:
                     st.session_state["weekdays_ms"] = list(weekday_options)
@@ -1170,6 +1709,7 @@ def main() -> None:
                     weekday_options,
                     key="weekdays_ms",
                     label_visibility="collapsed",
+                    disabled=is_consolidated,
                 )
                 sel_weekdays_nums = [
                     num for num, label in wd_names.items()
@@ -1189,12 +1729,14 @@ def main() -> None:
                         "Todos",
                         key="hour_buckets_all",
                         on_click=lambda: st.session_state.update({"hour_bucket_ms": list(bucket_options)}),
+                        disabled=is_consolidated,
                     )
                 with hb2:
                     st.button(
                         "Limpar",
                         key="hour_buckets_none",
                         on_click=lambda: st.session_state.update({"hour_bucket_ms": []}),
+                        disabled=is_consolidated,
                     )
                 if "hour_bucket_ms" not in st.session_state:
                     st.session_state["hour_bucket_ms"] = list(bucket_options)
@@ -1209,6 +1751,7 @@ def main() -> None:
                     bucket_options,
                     key="hour_bucket_ms",
                     label_visibility="collapsed",
+                    disabled=is_consolidated,
                 )
     with col_s2:
         st.caption("Categorias")
@@ -1219,12 +1762,14 @@ def main() -> None:
                     "Todos",
                     key="cats_all",
                     on_click=lambda: st.session_state.update({"cats_ms": cat_letters}),
+                    disabled=is_consolidated,
                 )
             with btn_clear:
                 st.button(
                     "Limpar",
                     key="cats_none",
                     on_click=lambda: st.session_state.update({"cats_ms": []}),
+                    disabled=is_consolidated,
                 )
             if "cats_ms" not in st.session_state:
                 st.session_state["cats_ms"] = list(cat_letters)
@@ -1239,6 +1784,7 @@ def main() -> None:
                 cat_letters,
                 key="cats_ms",
                 label_visibility="collapsed",
+                disabled=is_consolidated,
             )
             sel_cats = [c for c in sel_cats if c in cat_letters]
             st.session_state["sel_cats"] = sel_cats
@@ -1276,12 +1822,14 @@ def main() -> None:
                     "Todos",
                     key="subcats_all",
                     on_click=lambda: st.session_state.update({"subcats_ms": sub_tokens}),
+                    disabled=is_consolidated,
                 )
             with sb2:
                 st.button(
                     "Limpar",
                     key="subcats_none",
                     on_click=lambda: st.session_state.update({"subcats_ms": []}),
+                    disabled=is_consolidated,
                 )
             if "subcats_ms" not in st.session_state:
                 st.session_state["subcats_ms"] = list(sub_tokens)
@@ -1296,12 +1844,13 @@ def main() -> None:
                 sub_tokens,
                 key="subcats_ms",
                 label_visibility="collapsed",
+                disabled=is_consolidated,
             )
             sel_subcats = [t for t in sel_subcats if t in sub_tokens]
             st.session_state["sel_subcats"] = sel_subcats
     with col_s3:
         sel_weekdays_nums = st.session_state.get("sel_weekdays", None)
-        if sel_weekdays_nums is not None:
+        if not is_consolidated and sel_weekdays_nums is not None:
             if sel_weekdays_nums:
                 if "race_time_iso" in filt.columns and not filt.empty:
                     ts_filt = pd.to_datetime(filt["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
@@ -1311,7 +1860,7 @@ def main() -> None:
                 filt = filt.iloc[0:0]
 
         sel_hour_buckets = st.session_state.get("hour_bucket_ms", None)
-        if sel_hour_buckets is not None:
+        if not is_consolidated and sel_hour_buckets is not None:
             if sel_hour_buckets:
                 if "race_time_iso" in filt.columns and not filt.empty:
                     hb_filt = _compute_hour_bucket(filt["race_time_iso"])
@@ -1328,12 +1877,14 @@ def main() -> None:
                     "Todos",
                     key="nr_all",
                     on_click=lambda: st.session_state.update({"num_runners_ms": nr_vals}),
+                    disabled=is_consolidated,
                 )
             with btn_clear:
                 st.button(
                     "Limpar",
                     key="nr_none",
                     on_click=lambda: st.session_state.update({"num_runners_ms": []}),
+                    disabled=is_consolidated,
                 )
             if "num_runners_ms" not in st.session_state:
                 st.session_state["num_runners_ms"] = list(nr_vals)
@@ -1348,13 +1899,15 @@ def main() -> None:
                 nr_vals,
                 key="num_runners_ms",
                 label_visibility="collapsed",
+                disabled=is_consolidated,
             )
             sel_nr = [int(v) for v in sel_nr if v in nr_vals]
             st.session_state["sel_num_runners"] = sel_nr
-            if sel_nr:
-                filt = filt[filt["num_runners"].isin(sel_nr)]
-            else:
-                filt = filt.iloc[0:0]
+            if not is_consolidated:
+                if sel_nr:
+                    filt = filt[filt["num_runners"].isin(sel_nr)]
+                else:
+                    filt = filt.iloc[0:0]
 
         trap_series = pd.to_numeric(df_filtered.get("trap_number", pd.Series(dtype=float)), errors="coerce")
         trap_vals = sorted(trap_series.dropna().astype(int).unique().tolist())
@@ -1366,12 +1919,14 @@ def main() -> None:
                     "Todos",
                     key="traps_all",
                     on_click=lambda: st.session_state.update({"trap_ms": list(trap_vals)}),
+                    disabled=is_consolidated,
                 )
             with tb2:
                 st.button(
                     "Limpar",
                     key="traps_none",
                     on_click=lambda: st.session_state.update({"trap_ms": []}),
+                    disabled=is_consolidated,
                 )
             if "trap_ms" not in st.session_state:
                 st.session_state["trap_ms"] = list(trap_vals)
@@ -1381,7 +1936,7 @@ def main() -> None:
                 if not sanitized_traps and existing_traps:
                     sanitized_traps = list(trap_vals)
                 st.session_state["trap_ms"] = sanitized_traps
-            st.multiselect("Traps", trap_vals, key="trap_ms")
+            st.multiselect("Traps", trap_vals, key="trap_ms", disabled=is_consolidated)
 
     # Filtro adicional: participacao do lider (somente para regra lider_volume_total)
     if rule == "lider_volume_total":
@@ -1394,8 +1949,10 @@ def main() -> None:
                 value=50.0,
                 step=1.0,
                 format="%.0f",
+                disabled=is_consolidated,
             )
-        filt = filt[filt["leader_volume_share_pct"].fillna(0) >= float(leader_min)]
+        if not is_consolidated:
+            filt = filt[filt["leader_volume_share_pct"].fillna(0) >= float(leader_min)]
 
     # Filtros especificos para regra forecast_odds
     if rule == "forecast_odds":
@@ -1424,8 +1981,9 @@ def main() -> None:
                     "Forecast rank",
                     options=rank_vals,
                     key="forecast_rank_ms",
+                    disabled=is_consolidated,
                 )
-            if sel_ranks:
+            if not is_consolidated and sel_ranks:
                 filt = filt[filt["forecast_rank"].isin(sel_ranks)]
         if "value_ratio" in filt.columns and not filt.empty:
             vr = pd.to_numeric(filt["value_ratio"], errors="coerce").fillna(float("nan"))
@@ -1456,6 +2014,7 @@ def main() -> None:
                         max_value=vmax,
                         step=0.05,
                         key="value_ratio_min",
+                        disabled=is_consolidated,
                     )
                 with col_vr2:
                     value_ratio_max = st.number_input(
@@ -1464,49 +2023,49 @@ def main() -> None:
                         max_value=vmax,
                         step=0.05,
                         key="value_ratio_max",
+                        disabled=is_consolidated,
                     )
-            filt = filt[filt["value_ratio"].fillna(float("nan")).between(value_ratio_min, value_ratio_max)]
+            if not is_consolidated:
+                filt = filt[filt["value_ratio"].fillna(float("nan")).between(value_ratio_min, value_ratio_max)]
             only_value_bets = st.checkbox(
                 "Somente value bets (value_ratio >= 1.0)",
                 key="only_value_bets",
+                disabled=is_consolidated,
             )
-            if only_value_bets:
+            if not is_consolidated and only_value_bets:
                 filt = filt[filt["value_ratio"].fillna(0.0) >= 1.0]
 
-    if sel_tracks:
+    if not is_consolidated and sel_tracks:
         filt = filt[filt["track_name"].isin(sel_tracks)]
-    # Regra principal terceiro_queda50: diferenca > 50% em relacao ao vol3
-    if rule == "terceiro_queda50":
+    if not is_consolidated and rule == "terceiro_queda50":
         filt = filt[filt["pct_diff_second_vs_third"].fillna(0) > 50.0]
-    # Aplica filtro por BSP com inputs precisos (respeitando limites)
-    bsp_low = float(st.session_state.get("bsp_low", bsp_min))
-    bsp_high = float(st.session_state.get("bsp_high", bsp_max))
-    if entry_type == "both":
-        filt = filt[
-            ((filt["entry_type"] == "lay") & (filt["lay_target_bsp"].between(bsp_low, bsp_high))) |
-            ((filt["entry_type"] == "back") & (filt["back_target_bsp"].between(bsp_low, bsp_high)))
-        ]
-    else:
-        current_bsp_col = "lay_target_bsp" if entry_type == "lay" else "back_target_bsp"
-        filt = filt[(filt[current_bsp_col] >= bsp_low) & (filt[current_bsp_col] <= bsp_high)]
+    if not is_consolidated:
+        bsp_low = float(st.session_state.get("bsp_low", bsp_min))
+        bsp_high = float(st.session_state.get("bsp_high", bsp_max))
+        if entry_type == "both":
+            filt = filt[
+                ((filt["entry_type"] == "lay") & (filt["lay_target_bsp"].between(bsp_low, bsp_high))) |
+                ((filt["entry_type"] == "back") & (filt["back_target_bsp"].between(bsp_low, bsp_high)))
+            ]
+        else:
+            current_bsp_col = "lay_target_bsp" if entry_type == "lay" else "back_target_bsp"
+            filt = filt[(filt[current_bsp_col] >= bsp_low) & (filt[current_bsp_col] <= bsp_high)]
 
-    if cat_letters:
+    if not is_consolidated and cat_letters:
         sel_cats = st.session_state.get("sel_cats", [])
         if sel_cats:
             filt = filt[filt["category"].isin(sel_cats)]
         else:
             filt = filt.iloc[0:0]
 
-    if sub_tokens:
+    if not is_consolidated and sub_tokens:
         sel_subcats = st.session_state.get("sel_subcats", [])
         if sel_subcats:
             filt = filt[filt["category_token"].isin(sel_subcats)]
         else:
             filt = filt.iloc[0:0]
 
-    # Filtro por tipo de entrada: Back -> apenas entry_type='back'; Lay -> apenas entry_type='lay';
-    # Ambos -> mantem todas as linhas (entry_type IN ('back','lay')). Nao assume duas linhas por galgo/corrida.
-    if entry_type != "both":
+    if not is_consolidated and entry_type != "both":
         filt = filt[filt["entry_type"] == entry_type]
 
     # Seletor global do eixo X para graficos de evolucao
