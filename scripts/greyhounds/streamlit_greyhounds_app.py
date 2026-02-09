@@ -6,7 +6,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -76,21 +76,46 @@ def get_group_key(strategy_dict: dict) -> Tuple[str, str, str]:
     return (source_slug, market_val, rule_slug)
 
 
+def _shorten_filename(name: Optional[str], max_len: int = 55) -> str:
+    """Encurta nome de arquivo preservando extensao; retorna prefix...suffix.ext se exceder max_len."""
+    if not name or not (name := name.strip()):
+        return ""
+    if len(name) <= max_len:
+        return name
+    # Preservar extensao (ex.: .csv)
+    if "." in name:
+        base, ext = name.rsplit(".", 1)
+        ext = "." + ext
+    else:
+        base, ext = name, ""
+    available = max_len - len(ext) - 3  # 3 = "..."
+    if available <= 0:
+        return name[:max_len]
+    if len(base) <= available:
+        return name
+    prefix_len = available // 2
+    suffix_len = available - prefix_len
+    return f"{base[:prefix_len]}...{base[-suffix_len:]}{ext}"
+
+
 def _format_strategy_line(strategy_dict: dict, tail: str = "") -> str:
-    """Formata uma linha em markdown: [import_filename] -> em peso normal, strategy_name + tail em negrito."""
+    """Formata uma linha em markdown: [import_filename] -> strategy_name (uma linha limpa; tail nao usado na UI)."""
     fname = (strategy_dict.get("import_filename") or "").strip()
     sname = (strategy_dict.get("strategy_name") or "Sem nome").strip()
+    if fname:
+        fname = _shorten_filename(fname)
     prefix = f"[{fname}] -> " if fname else ""
-    rest = f"{sname}{(' ' + tail) if tail else ''}"
-    return f"{prefix}**{rest}**"
+    return f"{prefix}**{sname}**"
 
 
 def _visualize_label(strategy_dict: dict) -> str:
-    """Monta o label da opcao 'Visualizar' para uma estrategia (compativel com CSVs sem import_filename)."""
-    name = strategy_dict.get("strategy_name") or "Sem nome"
+    """Monta o label da opcao 'Visualizar': Estrategia: [arquivo] -> strategy_name (ou so strategy_name se sem arquivo)."""
+    name = (strategy_dict.get("strategy_name") or "Sem nome").strip()
     fname = (strategy_dict.get("import_filename") or "").strip()
-    prefix = f"[{fname}] " if fname else ""
-    return f"Estrategia: {prefix}{name}"
+    if fname:
+        fname = _shorten_filename(fname)
+        return f"Estrategia: [{fname}] -> {name}"
+    return f"Estrategia: {name}"
 
 
 @st.cache_data(show_spinner=False)
@@ -581,7 +606,7 @@ def get_current_strategy_snapshot(
     pnl: float | None = None,
     roi: float | None = None,
 ) -> dict:
-    """Captura os parâmetros atuais do app em um dict serializável (core + extras da regra ativa)."""
+    """Captura os parâmetros atuais do app em um dict serializável (core + extras da regra ativa). PNL/ROI não são incluídos."""
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     rule_slug = RULE_LABELS_INV.get(rule_select_label, rule_select_label)
     if rule_slug == rule_select_label and "Forecast" in str(rule_select_label):
@@ -595,7 +620,6 @@ def get_current_strategy_snapshot(
         rule_slug, source_slug, market, entry_type,
         tracks_ms=tracks_ms, cats_ms=cats_ms,
         bsp_low=bsp_low, bsp_high=bsp_high,
-        pnl=pnl, roi=roi,
     )
     out = {
         "strategy_name": strategy_name,
@@ -604,8 +628,6 @@ def get_current_strategy_snapshot(
         "source_select_label": source_select_label,
         "market": market,
         "entry_type": entry_type,
-        "pnl": pnl,
-        "roi": roi,
     }
     filter_keys = list(CORE_STATE_KEYS) + list(RULE_EXTRA_KEYS.get(rule_slug, []))
     if rule_slug == "forecast_odds":
@@ -671,6 +693,10 @@ def parse_strategies_csv(uploaded_file: Any) -> List[dict]:
             d[col] = val
         if "only_value_bets" in d and isinstance(d["only_value_bets"], str):
             d["only_value_bets"] = d["only_value_bets"].strip().lower() in ("true", "1", "yes")
+        if isinstance(d.get("strategy_name"), str):
+            s = d["strategy_name"].strip()
+            s2 = re.split(r"\s*\u2022?\s*PNL:\s*", s, maxsplit=1)[0]
+            d["strategy_name"] = s2.rstrip(" \u2022").strip()
         out.append(d)
     return out
 
@@ -694,6 +720,47 @@ RULE_EXTRA_KEYS: dict[str, List[str]] = {
     "forecast_odds": ["forecast_rank_ms", "value_ratio_min", "value_ratio_max", "only_value_bets"],
 }
 
+# Ordem estavel para export do pacote: basicos primeiro, depois resto alfabetico
+_EXPORT_BASIC_ORDER = (
+    ["strategy_name", "created_at", "import_filename", "rule_select_label", "source_select_label", "market", "entry_type"]
+    + list(CORE_STATE_KEYS)
+    + ["forecast_rank_ms", "value_ratio_min", "value_ratio_max", "only_value_bets"]
+)
+
+
+def strategies_list_to_csv_bytes(strategies: List[dict]) -> bytes:
+    """Exporta lista de estrategias para CSV (header unico, uma linha por estrategia). Mesmo esquema do export individual. PNL/ROI não são exportados."""
+    if not strategies:
+        return b""
+    all_keys = set()
+    for s in strategies:
+        all_keys.update(s.keys())
+    # Excluir pnl/roi se existirem (CSVs antigos podem ter)
+    all_keys.discard("pnl")
+    all_keys.discard("roi")
+    ordered_basic = [c for c in _EXPORT_BASIC_ORDER if c in all_keys]
+    rest = sorted(all_keys - set(ordered_basic))
+    columns = ordered_basic + rest
+    rows = []
+    for s in strategies:
+        row = {}
+        for k in columns:
+            if k == "strategy_name":
+                v = _regen_strategy_name_from_dict(s)
+            else:
+                v = s.get(k)
+            if isinstance(v, (list, tuple)):
+                row[k] = json.dumps(v)
+            elif hasattr(v, "isoformat"):
+                row[k] = v.isoformat()
+            else:
+                row[k] = v if v is not None else ""
+        rows.append(row)
+    df = pd.DataFrame(rows, columns=columns)
+    buf = io.BytesIO()
+    df.to_csv(buf, index=False, encoding="utf-8")
+    return buf.getvalue()
+
 
 def _rule_label_to_slug(rule_label: str) -> str:
     """Converte label da regra para slug (ex: Forecast Odds (Timeform) -> forecast_odds)."""
@@ -703,6 +770,43 @@ def _rule_label_to_slug(rule_label: str) -> str:
     if slug == rule_label and "Forecast" in str(rule_label):
         return "forecast_odds"
     return slug
+
+
+def _regen_strategy_name_from_dict(s: dict) -> str:
+    """Regenera strategy_name a partir dos campos do dict (sem PNL/ROI). Fallback para nome existente ou 'Sem nome'."""
+    rule_label = s.get("rule_select_label", "")
+    source_label = s.get("source_select_label", "")
+    market = s.get("market", "")
+    entry_type = s.get("entry_type", "")
+    if not rule_label and not source_label:
+        existing = (s.get("strategy_name") or "Sem nome").strip()
+        idx = existing.find("PNL:")
+        if idx != -1:
+            existing = existing[:idx].rstrip(" \u2022").strip()
+        return existing or "Sem nome"
+    rule_slug = _rule_label_to_slug(rule_label)
+    if not rule_slug:
+        rule_slug = rule_label
+    source_slug = SOURCE_LABELS_INV.get(source_label, source_label) if source_label else "top3"
+    tracks_ms = s.get("tracks_ms")
+    cats_ms = s.get("cats_ms")
+    if isinstance(tracks_ms, str) and tracks_ms.strip().startswith("["):
+        try:
+            tracks_ms = json.loads(tracks_ms)
+        except (json.JSONDecodeError, TypeError):
+            tracks_ms = None
+    if isinstance(cats_ms, str) and cats_ms.strip().startswith("["):
+        try:
+            cats_ms = json.loads(cats_ms)
+        except (json.JSONDecodeError, TypeError):
+            cats_ms = None
+    bsp_low = s.get("bsp_low")
+    bsp_high = s.get("bsp_high")
+    return format_strategy_name(
+        rule_slug, source_slug, market, entry_type,
+        tracks_ms=tracks_ms, cats_ms=cats_ms,
+        bsp_low=bsp_low, bsp_high=bsp_high,
+    )
 
 
 def _apply_strategy_to_state(strategy_dict: dict) -> None:
@@ -1715,7 +1819,19 @@ def main() -> None:
             file_name="estrategia.csv",
             mime="text/csv",
             key="export_strategy_btn",
+            disabled=is_consolidated,
         )
+        if is_consolidated:
+            st.caption("Consolidado ativo: para exportar combinacoes use 'Exportar consolidadas (CSV)'.")
+            consolidated_list = st.session_state.get("consolidated_strategies", [])
+            csv_cons_bytes = strategies_list_to_csv_bytes(consolidated_list)
+            st.download_button(
+                "Exportar consolidadas (CSV)",
+                data=csv_cons_bytes,
+                file_name="consolidado_estrategias.csv",
+                mime="text/csv",
+                key="export_consolidated_btn",
+            )
     with col_imp:
         if is_consolidated:
             st.session_state["import_uploader_nonce"] = st.session_state.get("import_uploader_nonce", 0) + 1
@@ -1800,31 +1916,11 @@ def main() -> None:
         n = len(consolidated)
         with st.expander(f"Estrategias consolidadas ({n})", expanded=(n > 0)):
             for i, s in enumerate(consolidated):
-                mkt = s.get("market", "?")
-                entry = s.get("entry_type", "?")
                 gk = get_group_key(s)
                 st.caption(f"source/market/rule: {gk[0]} / {gk[1]} / {gk[2]}")
-                tracks = s.get("tracks_ms")
-                if isinstance(tracks, str):
-                    try:
-                        tracks = json.loads(tracks) if tracks else []
-                    except json.JSONDecodeError:
-                        tracks = []
-                cats = s.get("cats_ms")
-                if isinstance(cats, str):
-                    try:
-                        cats = json.loads(cats) if cats else []
-                    except json.JSONDecodeError:
-                        cats = []
-                bsp_low = s.get("bsp_low", "")
-                bsp_high = s.get("bsp_high", "")
-                resumo = f"pistas: {len(tracks) if isinstance(tracks, list) else '?'} | categorias: {len(cats) if isinstance(cats, list) else '?'}"
-                if bsp_low != "" or bsp_high != "":
-                    resumo += f" | BSP: [{bsp_low}, {bsp_high}]"
-                tail_text = f"— {mkt} / {entry} — {resumo}"
                 col_resumo, col_btn = st.columns([0.85, 0.15])
                 with col_resumo:
-                    st.markdown(_format_strategy_line(s, tail_text))
+                    st.markdown(_format_strategy_line(s))
                 with col_btn:
                     st.button(
                         "Remover",
@@ -1833,28 +1929,8 @@ def main() -> None:
                     )
     elif st.session_state.get("applied_strategy") is not None:
         ap = st.session_state["applied_strategy"]
-        mkt = ap.get("market", "?")
-        entry = ap.get("entry_type", "?")
-        tracks = ap.get("tracks_ms")
-        if isinstance(tracks, str):
-            try:
-                tracks = json.loads(tracks) if tracks else []
-            except json.JSONDecodeError:
-                tracks = []
-        cats = ap.get("cats_ms")
-        if isinstance(cats, str):
-            try:
-                cats = json.loads(cats) if cats else []
-            except json.JSONDecodeError:
-                cats = []
-        bsp_low = ap.get("bsp_low", "")
-        bsp_high = ap.get("bsp_high", "")
-        resumo = f"pistas: {len(tracks) if isinstance(tracks, list) else '?'} | categorias: {len(cats) if isinstance(cats, list) else '?'}"
-        if bsp_low != "" or bsp_high != "":
-            resumo += f" | BSP: [{bsp_low}, {bsp_high}]"
-        tail_text = f"— {mkt} / {entry} — {resumo}"
         with st.expander("Estrategia aplicada", expanded=True):
-            st.markdown(_format_strategy_line(ap, tail_text))
+            st.markdown(_format_strategy_line(ap))
 
     df = st.session_state.get("_df", pd.DataFrame())
     with st.expander("Debug (carregamento de sinais)", expanded=False):

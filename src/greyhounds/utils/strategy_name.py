@@ -18,8 +18,9 @@ def format_strategy_name(
 ) -> str:
     """
     Gera strategy_name no formato:
-    "{rule} • {source} • {market} • {entry_type} • pistas:{N} • cats:{A,B,...} • BSP:{low–high} • PNL:{+312} • ROI:{+6.8%}"
+    "{rule} • {source} • {market} • {entry_type} • pistas:{N/ALL} • cats:{.../ALL} • BSP:{low–high/-}"
     Sem data. Separador: " • ".
+    PNL/ROI não são incluídos (calculados apenas no dashboard).
     """
     sep = " • "
     rule = (rule_slug or "").strip()
@@ -44,16 +45,5 @@ def format_strategy_name(
     else:
         bsp_s = "BSP:-"
 
-    if pnl is not None:
-        pnl_int = int(round(pnl))
-        pnl_s = f"PNL:{pnl_int:+d}"
-    else:
-        pnl_s = "PNL:-"
-
-    if roi is not None:
-        roi_s = f"ROI:{roi:+.1f}%"
-    else:
-        roi_s = "ROI:-"
-
-    parts = [rule, source, market_s, entry, pistas_s, cats_s, bsp_s, pnl_s, roi_s]
+    parts = [rule, source, market_s, entry, pistas_s, cats_s, bsp_s]
     return sep.join(parts)
