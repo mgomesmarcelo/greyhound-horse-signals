@@ -1187,6 +1187,8 @@ def main() -> None:
         st.session_state["import_in_progress"] = False
     if "last_consolidated_import_hash" not in st.session_state:
         st.session_state["last_consolidated_import_hash"] = None
+    if "consolidated_import_hashes" not in st.session_state:
+        st.session_state["consolidated_import_hashes"] = set()
     if "pending_clear_consolidated" not in st.session_state:
         st.session_state["pending_clear_consolidated"] = False
     if "pending_restore_filters" not in st.session_state:
@@ -1239,6 +1241,7 @@ def main() -> None:
         st.session_state["last_import_hash"] = None
         st.session_state["import_in_progress"] = False
         st.session_state["last_consolidated_import_hash"] = None
+        st.session_state["consolidated_import_hashes"] = set()
         st.session_state["pending_strategy_import"] = None
         st.session_state["pending_clear_consolidated"] = False
         st.session_state["import_feedback"] = "Consolidadas limpas"
@@ -1268,6 +1271,7 @@ def main() -> None:
             _reset_rule_dependent_state()
             st.session_state["consolidated_uploader_nonce"] = st.session_state.get("consolidated_uploader_nonce", 0) + 1
             st.session_state["last_consolidated_import_hash"] = None
+            st.session_state["consolidated_import_hashes"] = set()
         st.rerun()
 
     is_consolidated = len(st.session_state.get("consolidated_strategies", [])) > 0
@@ -1746,24 +1750,29 @@ def main() -> None:
                         st.rerun()
     with col_imp_cons:
         _consolidated_uploader_key = f"import_consolidated_csv_{st.session_state['consolidated_uploader_nonce']}"
-        uploaded_consolidated = st.file_uploader("Importar consolidadas (CSV)", type=["csv"], key=_consolidated_uploader_key)
-        if uploaded_consolidated is None:
-            st.session_state["last_consolidated_import_hash"] = None
-        else:
-            data_cons = uploaded_consolidated.getvalue()
-            filename_cons = uploaded_consolidated.name
-            h_cons = _hash_uploaded_file(io.BytesIO(data_cons))
-            last_h_cons = st.session_state.get("last_consolidated_import_hash")
-            if last_h_cons == h_cons:
-                pass
-            else:
-                strategies = parse_strategies_csv(io.BytesIO(data_cons))
+        uploaded_consolidated = st.file_uploader(
+            "Importar consolidadas (CSV)", type=["csv"], key=_consolidated_uploader_key, accept_multiple_files=True
+        )
+        uploaded_files = uploaded_consolidated if isinstance(uploaded_consolidated, list) else ([uploaded_consolidated] if uploaded_consolidated else [])
+        if uploaded_files:
+            hashes = st.session_state.get("consolidated_import_hashes", set())
+            any_new = False
+            for uf in uploaded_files:
+                data = uf.getvalue()
+                h = _hash_uploaded_file(io.BytesIO(data))
+                if h in hashes:
+                    continue
+                strategies = parse_strategies_csv(io.BytesIO(data))
                 if strategies:
                     for d in strategies:
-                        d["import_filename"] = filename_cons
+                        d["import_filename"] = uf.name
                     st.session_state["consolidated_strategies"] = st.session_state.get("consolidated_strategies", []) + strategies
-                    st.session_state["last_consolidated_import_hash"] = h_cons
-                    st.rerun()
+                    hashes.add(h)
+                    any_new = True
+            st.session_state["consolidated_import_hashes"] = hashes
+            if any_new:
+                st.session_state.pop("consolidated_union_result", None)
+                st.rerun()
     with col_clear:
         if st.button("Limpar consolidadas", key="clear_consolidated_btn"):
             st.session_state["pending_clear_consolidated"] = True
