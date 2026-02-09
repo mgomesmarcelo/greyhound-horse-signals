@@ -20,6 +20,7 @@ sys.path.append(str(PROJECT_ROOT))
 from src.greyhounds.config import settings
 from src.greyhounds.config import RULE_LABELS, RULE_LABELS_INV, ENTRY_TYPE_LABELS, SOURCE_LABELS, SOURCE_LABELS_INV
 from src.greyhounds.utils.text import normalize_track_name
+from src.greyhounds.utils.strategy_name import format_strategy_name
 from scripts.greyhounds.units_helper import get_ref_factor, get_scale, get_col, to_bool_series
 
 # Fator de referência global (definido em tempo de execução com base no dataset carregado).
@@ -314,15 +315,271 @@ def _compute_summary_metrics(df_block: pd.DataFrame, entry_kind: str, base_amoun
     return metrics
 
 
+def compute_export_pnl_roi(
+    filt_df: pd.DataFrame,
+    entry_type: str,
+    base_amount: float,
+) -> tuple[float | None, float | None]:
+    """
+    Calcula PNL e ROI para o export usando o mesmo caminho dos cards.
+    Retorna (export_pnl, export_roi_pct); ROI em percentual (ex.: 6.8).
+    Se filt vazio ou sem dados, retorna (None, None).
+    """
+    if filt_df is None or filt_df.empty:
+        return (None, None)
+    if entry_type == "back":
+        summary = _compute_summary_metrics(filt_df, "back", base_amount)
+        pnl = summary["pnl_stake"]
+        roi_pct = (summary["roi_stake"] * 100.0) if summary["roi_stake"] is not None else None
+        return (pnl, roi_pct)
+    if entry_type == "lay":
+        summary = _compute_summary_metrics(filt_df, "lay", base_amount)
+        pnl = summary["pnl_stake"]
+        roi_pct = (summary["roi_stake"] * 100.0) if summary["roi_stake"] is not None else None
+        return (pnl, roi_pct)
+    # both
+    back_df = filt_df[filt_df["entry_type"] == "back"] if "entry_type" in filt_df.columns else filt_df.iloc[0:0]
+    lay_df = filt_df[filt_df["entry_type"] == "lay"] if "entry_type" in filt_df.columns else filt_df.iloc[0:0]
+    s_back = _compute_summary_metrics(back_df, "back", base_amount)
+    s_lay = _compute_summary_metrics(lay_df, "lay", base_amount)
+    export_pnl = s_back["pnl_stake"] + s_lay["pnl_stake"]
+    total_base = s_back["base_stake"] + s_lay["base_stake"]
+    export_roi_pct = (export_pnl / total_base * 100.0) if total_base > 0 else 0.0
+    return (export_pnl, export_roi_pct)
+
+
+def _get_dates_in_range_from_state(df: pd.DataFrame, session_state: dict) -> List[str]:
+    """Calcula dates_in_range a partir de session_state (sem renderizar widgets)."""
+    raw_date_values = df["date"].dropna().astype(str).unique().tolist()
+    parsed_dates = []
+    for date_str in raw_date_values:
+        parsed = pd.to_datetime(date_str, errors="coerce")
+        if pd.notna(parsed):
+            parsed_dates.append((date_str, parsed.date()))
+    parsed_dates.sort(key=lambda item: item[1])
+    if not parsed_dates:
+        return sorted(raw_date_values) if raw_date_values else []
+    min_date = parsed_dates[0][1]
+    max_date = parsed_dates[-1][1]
+
+    def _norm_dt(value: object, fallback: datetime.date) -> datetime.date:
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime().date()
+        if isinstance(value, datetime.datetime):
+            return value.date()
+        if isinstance(value, datetime.date):
+            return value
+        if isinstance(value, str):
+            p = pd.to_datetime(value, errors="coerce")
+            if pd.notna(p):
+                return p.date()
+        return fallback
+
+    date_start_key = "date_start_input"
+    date_end_key = "date_end_input"
+    stored_start = _norm_dt(session_state.get(date_start_key, min_date), min_date)
+    stored_end = _norm_dt(session_state.get(date_end_key, max_date), max_date)
+    sanitized_start = max(min_date, min(stored_start, max_date))
+    sanitized_end = max(min_date, min(stored_end, max_date))
+    if sanitized_start > sanitized_end:
+        sanitized_end = sanitized_start
+
+    active_mode = session_state.get("date_mode", "Calendário")
+    if active_mode == "Barra":
+        slider_key = "date_range_slider"
+        default_slider = (
+            datetime.datetime.combine(sanitized_start, datetime.time.min),
+            datetime.datetime.combine(sanitized_end, datetime.time.min),
+        )
+        current = session_state.get(slider_key, default_slider)
+        if isinstance(current, (tuple, list)) and len(current) == 2:
+            start_norm = current[0]
+            end_norm = current[1]
+            if isinstance(start_norm, pd.Timestamp):
+                start_norm = start_norm.to_pydatetime()
+            if isinstance(end_norm, pd.Timestamp):
+                end_norm = end_norm.to_pydatetime()
+            if isinstance(start_norm, datetime.date) and not isinstance(start_norm, datetime.datetime):
+                start_norm = datetime.datetime.combine(start_norm, datetime.time.min)
+            if isinstance(end_norm, datetime.date) and not isinstance(end_norm, datetime.datetime):
+                end_norm = datetime.datetime.combine(end_norm, datetime.time.min)
+            slider_min_dt = datetime.datetime.combine(min_date, datetime.time.min)
+            slider_max_dt = datetime.datetime.combine(max_date, datetime.time.min)
+            start_norm = max(slider_min_dt, min(start_norm, slider_max_dt))
+            end_norm = max(slider_min_dt, min(end_norm, slider_max_dt))
+            if start_norm > end_norm:
+                end_norm = start_norm
+            range_start = start_norm.date()
+            range_end = end_norm.date()
+        else:
+            range_start, range_end = sanitized_start, sanitized_end
+    else:
+        range_start, range_end = sanitized_start, sanitized_end
+
+    range_start = max(min_date, range_start)
+    range_end = min(max_date, range_end)
+    if range_start > range_end:
+        range_end = range_start
+    return [d for d, parsed in parsed_dates if range_start <= parsed <= range_end]
+
+
+def _apply_filters_to_df_filtered(
+    df_filtered: pd.DataFrame,
+    session_state: dict,
+    rule: str,
+    entry_type: str,
+) -> pd.DataFrame:
+    """Aplica os mesmos filtros que o dashboard (sem widgets). Retorna filt."""
+    filt = df_filtered.copy()
+    volume_key = "min_total_volume"
+    min_total_volume = float(session_state.get(volume_key, 2000.0))
+    volume_series = pd.to_numeric(filt.get("total_matched_volume", pd.Series(dtype=float)), errors="coerce")
+    if rule != "forecast_odds":
+        filt = filt[volume_series.fillna(0.0) >= min_total_volume]
+
+    sel_traps = session_state.get("trap_ms", None)
+    if sel_traps is not None:
+        if sel_traps:
+            trap_series_filt = pd.to_numeric(filt.get("trap_number", pd.Series(dtype=float)), errors="coerce").astype("Int64")
+            filt = filt[trap_series_filt.isin(sel_traps)]
+        else:
+            filt = filt.iloc[0:0]
+
+    if ("category" not in filt.columns or "category_token" not in filt.columns) and not filt.empty:
+        cat_index = _build_category_index()
+        filt = filt.copy()
+        filt["_key_track"] = filt["track_name"].astype(str).map(normalize_track_name)
+        filt["_key_race"] = filt["race_time_iso"].astype(str)
+        def _cat_letter(r: pd.Series) -> str:
+            val = cat_index.get((str(r["_key_track"]), str(r["_key_race"])), {})
+            return (val or {}).get("letter", "")
+
+        def _cat_token(r: pd.Series) -> str:
+            val = cat_index.get((str(r["_key_track"]), str(r["_key_race"])), {})
+            return (val or {}).get("token", "")
+
+        filt["category"] = filt.apply(_cat_letter, axis=1)
+        filt["category_token"] = filt.apply(_cat_token, axis=1)
+    cat_letters = sorted([c for c in filt["category"].dropna().unique().tolist() if isinstance(c, str) and c]) if not filt.empty and "category" in filt.columns else []
+    sub_tokens = []
+    if "category_token" in filt.columns and not filt.empty:
+        sel_cats_state = session_state.get("sel_cats") or session_state.get("cats_ms")
+        token_source = filt[filt["category"].isin(sel_cats_state)] if sel_cats_state and "category" in filt.columns else filt
+        raw_tokens = [t for t in token_source["category_token"].dropna().astype(str).unique().tolist() if isinstance(t, str) and t]
+        def _sub_sort(tok: str) -> tuple:
+            m = re.match(r"^([A-Z]+)(\d+)$", str(tok))
+            if m:
+                return (m.group(1), int(m.group(2)))
+            m2 = re.match(r"^([A-Z]+)", str(tok))
+            return ((m2.group(1) if m2 else str(tok)), 0)
+        sub_tokens = sorted(raw_tokens, key=_sub_sort)
+
+    wd_names = {0: "Seg", 1: "Ter", 2: "Qua", 3: "Qui", 4: "Sex", 5: "Sab", 6: "Dom"}
+    sel_weekdays_nums = [num for num, label in wd_names.items() if label in session_state.get("weekdays_ms", [])]
+    if sel_weekdays_nums is not None and sel_weekdays_nums:
+        if "race_time_iso" in filt.columns and not filt.empty:
+            ts_filt = pd.to_datetime(filt["race_time_iso"], format=_RACE_TIME_ISO_FORMAT, errors="coerce")
+            filt = filt[ts_filt.dt.weekday.isin(sel_weekdays_nums)]
+        else:
+            filt = filt.iloc[0:0]
+
+    sel_hour_buckets = session_state.get("hour_bucket_ms", None)
+    if sel_hour_buckets:
+        if "race_time_iso" in filt.columns and not filt.empty:
+            hb_filt = _compute_hour_bucket_series(filt["race_time_iso"])
+            filt = filt[hb_filt.isin(sel_hour_buckets)]
+        else:
+            filt = filt.iloc[0:0]
+
+    sel_nr = session_state.get("sel_num_runners") or session_state.get("num_runners_ms")
+    if sel_nr is not None:
+        if sel_nr and "num_runners" in filt.columns:
+            filt = filt[filt["num_runners"].isin(sel_nr)]
+        else:
+            filt = filt.iloc[0:0]
+
+    if rule == "lider_volume_total":
+        leader_min = float(session_state.get("leader_min", 50.0))
+        if "leader_volume_share_pct" in filt.columns:
+            filt = filt[filt["leader_volume_share_pct"].fillna(0) >= leader_min]
+
+    if rule == "forecast_odds":
+        if "forecast_rank" in filt.columns:
+            filt["forecast_rank"] = pd.to_numeric(filt["forecast_rank"], errors="coerce")
+        if "value_ratio" in filt.columns:
+            filt["value_ratio"] = pd.to_numeric(filt["value_ratio"], errors="coerce")
+        sel_ranks = session_state.get("forecast_rank_ms", None)
+        if sel_ranks and "forecast_rank" in filt.columns:
+            filt = filt[filt["forecast_rank"].isin(sel_ranks)]
+        vr_min = float(session_state.get("value_ratio_min", 0.0))
+        vr_max = float(session_state.get("value_ratio_max", 1.0))
+        if "value_ratio" in filt.columns:
+            filt = filt[filt["value_ratio"].fillna(float("nan")).between(vr_min, vr_max)]
+        if session_state.get("only_value_bets", False) and "value_ratio" in filt.columns:
+            filt = filt[filt["value_ratio"].fillna(0.0) >= 1.0]
+
+    sel_tracks = session_state.get("tracks_ms", None)
+    if sel_tracks and "track_name" in filt.columns:
+        filt = filt[filt["track_name"].isin(sel_tracks)]
+    if rule == "terceiro_queda50" and "pct_diff_second_vs_third" in filt.columns:
+        filt = filt[filt["pct_diff_second_vs_third"].fillna(0) > 50.0]
+
+    bsp_low = float(session_state.get("bsp_low", 1.01))
+    bsp_high = float(session_state.get("bsp_high", 100.0))
+    if entry_type == "both":
+        filt = filt[
+            ((filt["entry_type"] == "lay") & (filt["lay_target_bsp"].between(bsp_low, bsp_high))) |
+            ((filt["entry_type"] == "back") & (filt["back_target_bsp"].between(bsp_low, bsp_high)))
+        ]
+    else:
+        bsp_col = "lay_target_bsp" if entry_type == "lay" else "back_target_bsp"
+        if bsp_col in filt.columns:
+            filt = filt[(filt[bsp_col] >= bsp_low) & (filt[bsp_col] <= bsp_high)]
+
+    sel_cats = session_state.get("sel_cats", [])
+    if cat_letters and sel_cats is not None:
+        if sel_cats and "category" in filt.columns:
+            filt = filt[filt["category"].isin(sel_cats)]
+        else:
+            filt = filt.iloc[0:0]
+
+    sel_subcats = session_state.get("sel_subcats", [])
+    if sub_tokens and sel_subcats is not None:
+        if sel_subcats and "category_token" in filt.columns:
+            filt = filt[filt["category_token"].isin(sel_subcats)]
+        else:
+            filt = filt.iloc[0:0]
+
+    if entry_type != "both" and "entry_type" in filt.columns:
+        filt = filt[filt["entry_type"] == entry_type]
+
+    return filt
+
+
 def get_current_strategy_snapshot(
     rule_select_label: str,
     source_select_label: str,
     market: str,
     entry_type: str,
+    pnl: float | None = None,
+    roi: float | None = None,
 ) -> dict:
     """Captura os parâmetros atuais do app em um dict serializável (core + extras da regra ativa)."""
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    strategy_name = f"{rule_select_label}_{market}_{entry_type}_{ts.replace(':', '-')}"
+    rule_slug = RULE_LABELS_INV.get(rule_select_label, rule_select_label)
+    if rule_slug == rule_select_label and "Forecast" in str(rule_select_label):
+        rule_slug = "forecast_odds"
+    source_slug = SOURCE_LABELS_INV.get(source_select_label, source_select_label)
+    tracks_ms = st.session_state.get("tracks_ms")
+    cats_ms = st.session_state.get("cats_ms")
+    bsp_low = st.session_state.get("bsp_low")
+    bsp_high = st.session_state.get("bsp_high")
+    strategy_name = format_strategy_name(
+        rule_slug, source_slug, market, entry_type,
+        tracks_ms=tracks_ms, cats_ms=cats_ms,
+        bsp_low=bsp_low, bsp_high=bsp_high,
+        pnl=pnl, roi=roi,
+    )
     out = {
         "strategy_name": strategy_name,
         "created_at": ts,
@@ -330,10 +587,9 @@ def get_current_strategy_snapshot(
         "source_select_label": source_select_label,
         "market": market,
         "entry_type": entry_type,
+        "pnl": pnl,
+        "roi": roi,
     }
-    rule_slug = RULE_LABELS_INV.get(rule_select_label, rule_select_label)
-    if rule_slug == rule_select_label and "Forecast" in str(rule_select_label):
-        rule_slug = "forecast_odds"
     filter_keys = list(CORE_STATE_KEYS) + list(RULE_EXTRA_KEYS.get(rule_slug, []))
     if rule_slug == "forecast_odds":
         filter_keys = [k for k in filter_keys if k != "min_total_volume"]
@@ -1347,6 +1603,77 @@ def main() -> None:
 
     st.caption(f"Regra selecionada: {selected_rule_label} · Fonte de dados: {source_label}")
 
+    # Carregar dados e construir filt antes do header (para export com PNL/ROI do mesmo run)
+    signals_mtime = _get_signals_mtime(source, market, rule)
+    df_early = None
+    try:
+        df_early = load_signals_enriched(source=source, market=market, rule=rule, signals_mtime=signals_mtime)
+    except FileNotFoundError:
+        df_early = pd.DataFrame()
+    if df_early is None or df_early.empty:
+        st.session_state["_df"] = pd.DataFrame()
+        st.session_state["_df_filtered"] = pd.DataFrame()
+        st.session_state["_filt"] = pd.DataFrame()
+        export_pnl, export_roi = None, None
+    else:
+        if "is_green" in df_early.columns:
+            df_early["is_green"] = to_bool_series(df_early["is_green"])
+        elif "win_lose" in df_early.columns:
+            win_numeric = pd.to_numeric(df_early["win_lose"], errors="coerce")
+            entry_series = df_early.get("entry_type", pd.Series(dtype=str)).astype(str)
+            df_early["is_green"] = False
+            df_early.loc[entry_series == "back", "is_green"] = win_numeric.loc[entry_series == "back"] == 1
+            df_early.loc[entry_series == "lay", "is_green"] = win_numeric.loc[entry_series == "lay"] == 0
+        global _REF_FACTOR
+        _REF_FACTOR = get_ref_factor(df_early)
+        st.session_state["_df"] = df_early
+        dates_in_range = _get_dates_in_range_from_state(df_early, st.session_state)
+        df_filtered_early = df_early[df_early["date"].isin(dates_in_range)].copy() if dates_in_range else df_early.iloc[0:0].copy()
+        if "total_matched_volume" not in df_filtered_early.columns:
+            df_filtered_early["total_matched_volume"] = pd.NA
+        df_filtered_early["total_matched_volume"] = pd.to_numeric(df_filtered_early["total_matched_volume"], errors="coerce")
+        if is_consolidated and st.session_state.get("consolidated_strategies"):
+            consolidated_strategies = st.session_state["consolidated_strategies"]
+            _cached = st.session_state.get("consolidated_union_result")
+            if _cached is not None and len(_cached) == 4:
+                df_union_early, _tb, _ta, _ov = _cached
+            else:
+                df_union_early, _tb, _ta, _ov = _build_consolidated_df_by_groups(consolidated_strategies)
+                st.session_state["consolidated_union_result"] = (df_union_early, _tb, _ta, _ov)
+            viz_mode = st.session_state.get("visualize_mode", "Consolidado (Tudo)")
+            if viz_mode == "Consolidado (So BACK)" and not df_union_early.empty and "entry_type" in df_union_early.columns:
+                filt_early = df_union_early[df_union_early["entry_type"] == "back"].copy()
+            elif viz_mode == "Consolidado (So LAY)" and not df_union_early.empty and "entry_type" in df_union_early.columns:
+                filt_early = df_union_early[df_union_early["entry_type"] == "lay"].copy()
+            elif isinstance(viz_mode, str) and viz_mode.startswith("Estrategia:"):
+                name = viz_mode.replace("Estrategia:", "").strip()
+                chosen = next((s for s in consolidated_strategies if (s.get("strategy_name") or "Sem nome").strip() == name), None)
+                if chosen is not None:
+                    try:
+                        source_g, market_g, rule_g = get_group_key(chosen)
+                        signals_mtime_g = _get_signals_mtime(source_g, market_g, rule_g)
+                        df_group = load_signals_enriched(source=source_g, market=market_g, rule=rule_g, signals_mtime=signals_mtime_g)
+                        mask_i = _build_mask_from_strategy(df_group, chosen)
+                        df_i = df_group[mask_i].copy()
+                        df_i["dedup_key"] = _make_dedup_key(df_i)
+                        df_i = df_i.drop_duplicates(subset=["dedup_key"])
+                        filt_early = df_i
+                    except FileNotFoundError:
+                        filt_early = df_union_early.copy()
+                else:
+                    filt_early = df_union_early.copy()
+            else:
+                filt_early = df_union_early.copy()
+            df_filtered_early = df_union_early
+        else:
+            filt_early = _apply_filters_to_df_filtered(df_filtered_early, st.session_state, rule, entry_type)
+        st.session_state["_filt"] = filt_early
+        st.session_state["_df_filtered"] = df_filtered_early
+        base_amount_early = float(st.session_state.get("base_amount", 1.0))
+        export_pnl, export_roi = compute_export_pnl_roi(filt_early, entry_type, base_amount_early)
+        if is_consolidated:
+            export_pnl, export_roi = None, None
+
     import_feedback_msg = st.session_state.pop("import_feedback", None)
 
     col_restore, col_exp, col_imp, col_imp_cons, col_clear = st.columns(5)
@@ -1357,7 +1684,10 @@ def main() -> None:
         if import_feedback_msg:
             st.caption(import_feedback_msg)
     with col_exp:
-        snapshot = get_current_strategy_snapshot(selected_rule_label, selected_source_label, market, entry_type)
+        snapshot = get_current_strategy_snapshot(
+            selected_rule_label, selected_source_label, market, entry_type,
+            pnl=export_pnl, roi=export_roi,
+        )
         csv_bytes = strategy_to_csv_bytes(snapshot)
         st.download_button(
             "Exportar estrategia (CSV)",
@@ -1496,12 +1826,7 @@ def main() -> None:
         with st.expander("Estrategia aplicada", expanded=True):
             st.write(f"**{name}** — {mkt} / {entry} — {resumo}")
 
-    signals_mtime = _get_signals_mtime(source, market, rule)
-    try:
-        df = load_signals_enriched(source=source, market=market, rule=rule, signals_mtime=signals_mtime)
-    except FileNotFoundError as e:
-        st.error(str(e))
-        return
+    df = st.session_state.get("_df", pd.DataFrame())
     with st.expander("Debug (carregamento de sinais)", expanded=False):
         st.write("PROCESSED_SIGNALS_DIR:", str(settings.PROCESSED_SIGNALS_DIR))
         st.write("Selecionado:", {"source": source, "market": market, "rule": rule})
@@ -1513,33 +1838,8 @@ def main() -> None:
         st.info("Nenhum sinal encontrado para a selecao. Gere antes com: python scripts/greyhounds/generate_greyhound_signals.py --source {src} --market {mkt} --rule {rule} --entry_type both".format(src=source, mkt=market, rule=rule))
         return
 
-    # Normaliza is_green (bool) para evitar assertividade zerada por tipos diferentes.
-    if "is_green" in df.columns:
-        df["is_green"] = to_bool_series(df["is_green"])
-    elif "win_lose" in df.columns:
-        win_numeric = pd.to_numeric(df["win_lose"], errors="coerce")
-        entry_series = df.get("entry_type", pd.Series(dtype=str)).astype(str)
-        df["is_green"] = False
-        df.loc[entry_series == "back", "is_green"] = win_numeric.loc[entry_series == "back"] == 1
-        df.loc[entry_series == "lay", "is_green"] = win_numeric.loc[entry_series == "lay"] == 0
-
-    # Normaliza is_green (bool) para evitar assertividade zerada por tipos diferentes.
-    if "is_green" in df.columns:
-        df["is_green"] = to_bool_series(df["is_green"])
-    elif "win_lose" in df.columns:
-        win_numeric = pd.to_numeric(df["win_lose"], errors="coerce")
-        entry_series = df.get("entry_type", pd.Series(dtype=str)).astype(str)
-        df["is_green"] = False
-        df.loc[entry_series == "back", "is_green"] = win_numeric.loc[entry_series == "back"] == 1
-        df.loc[entry_series == "lay", "is_green"] = win_numeric.loc[entry_series == "lay"] == 0
-
-    global _REF_FACTOR
-    _REF_FACTOR = get_ref_factor(df)
-
-    df_filtered = df.copy()
-    if "total_matched_volume" not in df_filtered.columns:
-        df_filtered["total_matched_volume"] = pd.NA
-    df_filtered["total_matched_volume"] = pd.to_numeric(df_filtered["total_matched_volume"], errors="coerce")
+    df_filtered = st.session_state["_df_filtered"]
+    filt = st.session_state["_filt"]
 
     # Filtros (sem ratio; regra fixa >50%)
     col_f1, col_f2, col_f3 = st.columns(3)
@@ -1685,8 +1985,6 @@ def main() -> None:
         else:
             range_start = range_end = None
             dates_in_range = sorted(raw_date_values)
-
-        df_filtered = df[df["date"].isin(dates_in_range)].copy() if dates_in_range else df.iloc[0:0].copy()
     with col_f2:
         tracks = sorted(df_filtered["track_name"].dropna().unique().tolist())
         tb1, tb2, _ = st.columns([1, 1, 2])
@@ -2345,6 +2643,9 @@ def main() -> None:
     if not is_consolidated and entry_type != "both":
         filt = filt[filt["entry_type"] == entry_type]
 
+    filt = st.session_state["_filt"]
+    df_filtered = st.session_state["_df_filtered"]
+
     # Seletor global do eixo X para graficos de evolucao
     x_axis_mode = st.radio(
         "Eixo X dos graficos de evolucao",
@@ -2834,6 +3135,14 @@ def main() -> None:
     if entry_type == "both":
         render_block("Resultados BACK", filt[filt["entry_type"] == "back"], "back")
         render_block("Resultados LAY", filt[filt["entry_type"] == "lay"], "lay")
+        if not is_consolidated:
+            base_amount_both = float(st.session_state.get("base_amount", 1.0))
+            s_back = _compute_summary_metrics(filt[filt["entry_type"] == "back"], "back", base_amount_both)
+            s_lay = _compute_summary_metrics(filt[filt["entry_type"] == "lay"], "lay", base_amount_both)
+            total_pnl_both = s_back["pnl_stake"] + s_lay["pnl_stake"]
+            total_base_both = s_back["base_stake"] + s_lay["base_stake"]
+            st.session_state["export_pnl"] = total_pnl_both
+            st.session_state["export_roi"] = (total_pnl_both / total_base_both * 100.0) if total_base_both > 0 else 0.0
     else:
         # Evita duplicacao quando selecionado apenas um tipo: usar apenas os paineis agregados abaixo
         pass
@@ -2865,6 +3174,9 @@ def main() -> None:
         total_pnl_stake = summary["pnl_stake"]
         roi_stake = summary["roi_stake"]
         drawdown_stake = summary["drawdown_stake"]
+        if not is_consolidated:
+            st.session_state["export_pnl"] = total_pnl_stake
+            st.session_state["export_roi"] = (roi_stake * 100.0) if roi_stake is not None else None
 
         # Linha 2: Stake(10)
         st.subheader(f"Stake (valor fixo {base_amount:.2f})")
