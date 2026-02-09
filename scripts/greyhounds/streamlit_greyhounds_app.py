@@ -76,6 +76,23 @@ def get_group_key(strategy_dict: dict) -> Tuple[str, str, str]:
     return (source_slug, market_val, rule_slug)
 
 
+def _format_strategy_line(strategy_dict: dict, tail: str = "") -> str:
+    """Formata uma linha em markdown: [import_filename] -> em peso normal, strategy_name + tail em negrito."""
+    fname = (strategy_dict.get("import_filename") or "").strip()
+    sname = (strategy_dict.get("strategy_name") or "Sem nome").strip()
+    prefix = f"[{fname}] -> " if fname else ""
+    rest = f"{sname}{(' ' + tail) if tail else ''}"
+    return f"{prefix}**{rest}**"
+
+
+def _visualize_label(strategy_dict: dict) -> str:
+    """Monta o label da opcao 'Visualizar' para uma estrategia (compativel com CSVs sem import_filename)."""
+    name = strategy_dict.get("strategy_name") or "Sem nome"
+    fname = (strategy_dict.get("import_filename") or "").strip()
+    prefix = f"[{fname}] " if fname else ""
+    return f"Estrategia: {prefix}{name}"
+
+
 @st.cache_data(show_spinner=False)
 def load_signals_df(
     source_slug: str,
@@ -1201,7 +1218,7 @@ def main() -> None:
         _apply_strategy_to_state(strategy_dict)
         imported_rule_slug = _rule_label_to_slug(strategy_dict.get("rule_select_label", ""))
         keep_keys = (
-            frozenset(["strategy_name", "created_at", "rule_select_label", "source_select_label", "market", "entry_type"])
+            frozenset(["strategy_name", "created_at", "import_filename", "rule_select_label", "source_select_label", "market", "entry_type"])
             | frozenset(CORE_STATE_KEYS)
             | frozenset(RULE_EXTRA_KEYS.get(imported_rule_slug, []))
         )
@@ -1646,8 +1663,7 @@ def main() -> None:
             elif viz_mode == "Consolidado (So LAY)" and not df_union_early.empty and "entry_type" in df_union_early.columns:
                 filt_early = df_union_early[df_union_early["entry_type"] == "lay"].copy()
             elif isinstance(viz_mode, str) and viz_mode.startswith("Estrategia:"):
-                name = viz_mode.replace("Estrategia:", "").strip()
-                chosen = next((s for s in consolidated_strategies if (s.get("strategy_name") or "Sem nome").strip() == name), None)
+                chosen = next((s for s in consolidated_strategies if _visualize_label(s) == viz_mode), None)
                 if chosen is not None:
                     try:
                         source_g, market_g, rule_g = get_group_key(chosen)
@@ -1713,6 +1729,7 @@ def main() -> None:
                 st.session_state["import_in_progress"] = False
             else:
                 data = uploaded_single.getvalue()
+                filename = uploaded_single.name
                 h = _hash_uploaded_file(io.BytesIO(data))
                 last_h = st.session_state.get("last_import_hash")
                 in_progress = st.session_state.get("import_in_progress", False)
@@ -1721,6 +1738,8 @@ def main() -> None:
                 else:
                     strategies = parse_strategies_csv(io.BytesIO(data))
                     if strategies:
+                        for d in strategies:
+                            d["import_filename"] = filename
                         st.session_state["pending_strategy_import"] = strategies[0]
                         st.session_state["last_import_hash"] = h
                         st.session_state["import_in_progress"] = True
@@ -1732,6 +1751,7 @@ def main() -> None:
             st.session_state["last_consolidated_import_hash"] = None
         else:
             data_cons = uploaded_consolidated.getvalue()
+            filename_cons = uploaded_consolidated.name
             h_cons = _hash_uploaded_file(io.BytesIO(data_cons))
             last_h_cons = st.session_state.get("last_consolidated_import_hash")
             if last_h_cons == h_cons:
@@ -1739,6 +1759,8 @@ def main() -> None:
             else:
                 strategies = parse_strategies_csv(io.BytesIO(data_cons))
                 if strategies:
+                    for d in strategies:
+                        d["import_filename"] = filename_cons
                     st.session_state["consolidated_strategies"] = st.session_state.get("consolidated_strategies", []) + strategies
                     st.session_state["last_consolidated_import_hash"] = h_cons
                     st.rerun()
@@ -1760,8 +1782,7 @@ def main() -> None:
         )
         visualize_options = ["Consolidado (Tudo)", "Consolidado (So BACK)", "Consolidado (So LAY)"]
         for s in st.session_state.get("consolidated_strategies", []):
-            name = s.get("strategy_name") or "Sem nome"
-            visualize_options.append(f"Estrategia: {name}")
+            visualize_options.append(_visualize_label(s))
         current_viz = st.session_state.get("visualize_mode", "Consolidado (Tudo)")
         if current_viz not in visualize_options:
             st.session_state["visualize_mode"] = "Consolidado (Tudo)"
@@ -1770,7 +1791,6 @@ def main() -> None:
         n = len(consolidated)
         with st.expander(f"Estrategias consolidadas ({n})", expanded=(n > 0)):
             for i, s in enumerate(consolidated):
-                name = s.get("strategy_name", "?")
                 mkt = s.get("market", "?")
                 entry = s.get("entry_type", "?")
                 gk = get_group_key(s)
@@ -1792,9 +1812,10 @@ def main() -> None:
                 resumo = f"pistas: {len(tracks) if isinstance(tracks, list) else '?'} | categorias: {len(cats) if isinstance(cats, list) else '?'}"
                 if bsp_low != "" or bsp_high != "":
                     resumo += f" | BSP: [{bsp_low}, {bsp_high}]"
+                tail_text = f"— {mkt} / {entry} — {resumo}"
                 col_resumo, col_btn = st.columns([0.85, 0.15])
                 with col_resumo:
-                    st.write(f"**{name}** — {mkt} / {entry} — {resumo}")
+                    st.markdown(_format_strategy_line(s, tail_text))
                 with col_btn:
                     st.button(
                         "Remover",
@@ -1803,7 +1824,6 @@ def main() -> None:
                     )
     elif st.session_state.get("applied_strategy") is not None:
         ap = st.session_state["applied_strategy"]
-        name = ap.get("strategy_name", "?")
         mkt = ap.get("market", "?")
         entry = ap.get("entry_type", "?")
         tracks = ap.get("tracks_ms")
@@ -1823,8 +1843,9 @@ def main() -> None:
         resumo = f"pistas: {len(tracks) if isinstance(tracks, list) else '?'} | categorias: {len(cats) if isinstance(cats, list) else '?'}"
         if bsp_low != "" or bsp_high != "":
             resumo += f" | BSP: [{bsp_low}, {bsp_high}]"
+        tail_text = f"— {mkt} / {entry} — {resumo}"
         with st.expander("Estrategia aplicada", expanded=True):
-            st.write(f"**{name}** — {mkt} / {entry} — {resumo}")
+            st.markdown(_format_strategy_line(ap, tail_text))
 
     df = st.session_state.get("_df", pd.DataFrame())
     with st.expander("Debug (carregamento de sinais)", expanded=False):
@@ -2170,8 +2191,7 @@ def main() -> None:
             else:
                 filt = df_union.copy()
         elif isinstance(viz_mode, str) and viz_mode.startswith("Estrategia:"):
-            name = viz_mode.replace("Estrategia:", "").strip()
-            chosen = next((s for s in consolidated_strategies if (s.get("strategy_name") or "Sem nome").strip() == name), None)
+            chosen = next((s for s in consolidated_strategies if _visualize_label(s) == viz_mode), None)
             if chosen is not None:
                 try:
                     source_g, market_g, rule_g = get_group_key(chosen)
