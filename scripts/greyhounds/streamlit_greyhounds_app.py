@@ -753,24 +753,32 @@ def _parse_event_path(event_path: str) -> dict:
         m_off = re.search(r"(\d{1,2}:\d{2})\s+[A-Za-z]", s)
         if m_off:
             out["off_time"] = m_off.group(1).strip()
-    # grade_distance: "D5 238m" ou "A5 400m" em " - D5 238m - "
-    m_grade = re.search(r"\s-\s+([A-Z]\d+\s*\d*m)\s*-", s)
+    # grade_distance: "D5 238m" ou "A1 500m" - formato " - Xn NNNm - " ou variantes sem tracos
+    m_grade = re.search(r"\s-\s+([A-Z]\d+\s+\d+m)\s*-", s)
     if m_grade:
         out["grade_distance"] = m_grade.group(1).strip()
+    if not out["grade_distance"]:
+        m_grade = re.search(r"\s-\s+([A-Z]\d+\s*\d+m)\s*-", s)
+        if m_grade:
+            out["grade_distance"] = m_grade.group(1).strip()
+    if not out["grade_distance"]:
+        m_grade = re.search(r"([A-Z]\d+\s+\d+m)", s, re.IGNORECASE)
+        if m_grade:
+            out["grade_distance"] = m_grade.group(1).strip()
     return out
 
 
-def parse_marketfeeder_statement(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def parse_marketfeeder_statement(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """
-    Le CSV do MarketFeeder (sem header), normaliza colunas e separa apostas (Back/Lay) e Market P/L.
-    Retorna (df_bets, df_market_pl). Commission fica em df_bets como tipo mas pode ser filtrado; aqui nao retornamos df_commission.
+    Le CSV do MarketFeeder (sem header), normaliza colunas e separa apostas (Back/Lay), Market P/L e Commission.
+    Retorna (df_bets, df_market_pl, total_commission). total_commission e a soma da coluna profit das linhas type==Commission (geralmente negativa).
     """
     import csv
     buf = io.BytesIO(file_bytes)
     reader = csv.reader(io.TextIOWrapper(buf, encoding="utf-8", errors="replace"), quoting=csv.QUOTE_MINIMAL)
     rows = list(reader)
     if not rows:
-        return (pd.DataFrame(columns=_MF_STATEMENT_COLS), pd.DataFrame(columns=_MF_STATEMENT_COLS))
+        return (pd.DataFrame(columns=_MF_STATEMENT_COLS), pd.DataFrame(columns=_MF_STATEMENT_COLS), 0.0)
 
     # Construir DataFrame sem header: 11 colunas
     n_cols = len(_MF_STATEMENT_COLS)
@@ -791,9 +799,11 @@ def parse_marketfeeder_statement(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.Da
 
     df_bets = df[df["type"].astype(str).str.strip().isin(("Back", "Lay"))].copy()
     df_market_pl = df[df["type"].astype(str).str.strip() == "Market P/L"].copy()
+    df_commission = df[df["type"].astype(str).str.strip() == "Commission"]
+    total_commission = float(pd.to_numeric(df_commission["profit"], errors="coerce").fillna(0).sum())
 
     if df_bets.empty:
-        return (df_bets, df_market_pl)
+        return (df_bets, df_market_pl, total_commission)
 
     # Colunas derivadas em df_bets
     df_bets["entry_type"] = df_bets["type"].astype(str).str.strip().str.lower()
@@ -839,7 +849,7 @@ def parse_marketfeeder_statement(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.Da
         sel_name_clean + "|" +
         df_bets["entry_type"].astype(str)
     )
-    return (df_bets, df_market_pl)
+    return (df_bets, df_market_pl, total_commission)
 
 
 def _is_likely_marketfeeder_statement_csv(file_bytes: bytes) -> bool:
@@ -1471,6 +1481,10 @@ def main() -> None:
         st.session_state["mf_market_pl_df"] = pd.DataFrame()
     if "mf_loaded" not in st.session_state:
         st.session_state["mf_loaded"] = False
+    if "last_mf_statement_hash" not in st.session_state:
+        st.session_state["last_mf_statement_hash"] = None
+    if "mf_commission_total" not in st.session_state:
+        st.session_state["mf_commission_total"] = 0.0
     if "show_internal_signals_table" not in st.session_state:
         st.session_state["show_internal_signals_table"] = False
 
@@ -2071,14 +2085,19 @@ def main() -> None:
         uploaded_mf = st.file_uploader("Importar statement MarketFeeder (CSV)", type=["csv"], key=mf_uploader_key)
         if uploaded_mf is not None:
             data_mf = uploaded_mf.getvalue()
-            try:
-                df_mf_bets, df_mf_pl = parse_marketfeeder_statement(data_mf)
-                st.session_state["mf_bets_df"] = df_mf_bets
-                st.session_state["mf_market_pl_df"] = df_mf_pl
-                st.session_state["mf_loaded"] = True
-                st.rerun()
-            except Exception as e:
-                st.session_state["import_feedback"] = f"Erro ao ler statement: {e}"
+            mf_hash = _hash_uploaded_file(io.BytesIO(data_mf))
+            last_mf_hash = st.session_state.get("last_mf_statement_hash")
+            if mf_hash != last_mf_hash:
+                try:
+                    df_mf_bets, df_mf_pl, total_comm = parse_marketfeeder_statement(data_mf)
+                    st.session_state["mf_bets_df"] = df_mf_bets
+                    st.session_state["mf_market_pl_df"] = df_mf_pl
+                    st.session_state["mf_commission_total"] = total_comm
+                    st.session_state["mf_loaded"] = True
+                    st.session_state["last_mf_statement_hash"] = mf_hash
+                    st.rerun()
+                except Exception as e:
+                    st.session_state["import_feedback"] = f"Erro ao ler statement: {e}"
     with col_clear:
         if st.button("Limpar consolidadas", key="clear_consolidated_btn"):
             st.session_state["pending_clear_consolidated"] = True
@@ -2145,7 +2164,9 @@ def main() -> None:
             stake_series = pd.to_numeric(mf_bets["stake"], errors="coerce").fillna(0)
             greens = int((profit_series > 0).sum())
             reds = int((profit_series <= 0).sum())
-            pnl = float(profit_series.sum())
+            pnl_bruto = float(profit_series.sum())
+            commission = float(st.session_state.get("mf_commission_total", 0.0))
+            pnl = pnl_bruto + commission
             total_stake = float(stake_series.sum())
             roi = (pnl / total_stake) if total_stake > 0 else 0.0
             drawdown = _calc_drawdown_series(profit_series)
@@ -2157,11 +2178,13 @@ def main() -> None:
             with c3:
                 st.metric("Reds", reds)
             with c4:
-                st.metric("PnL", f"{pnl:.2f}")
+                st.metric("PnL (liquido)", f"{pnl:.2f}")
             with c5:
-                st.metric("ROI", f"{roi:.2%}")
+                st.metric("ROI (liquido)", f"{roi:.2%}")
             with c6:
                 st.metric("Drawdown", f"{drawdown:.2f}")
+            if commission != 0:
+                st.caption(f"Comissao descontada: {commission:.2f}. PnL bruto apostas: {pnl_bruto:.2f}.")
             st.subheader("Resultados (statement)")
             st.dataframe(
                 mf_bets[["placed_dt", "track_clean", "off_time", "grade_distance", "selection_trap", "selection_name", "stake", "price", "profit", "trigger"]].rename(columns={"track_clean": "track"}),
@@ -2178,7 +2201,9 @@ def main() -> None:
         if st.button("Limpar statement", key="clear_mf_statement_btn"):
             st.session_state["mf_bets_df"] = pd.DataFrame()
             st.session_state["mf_market_pl_df"] = pd.DataFrame()
+            st.session_state["mf_commission_total"] = 0.0
             st.session_state["mf_loaded"] = False
+            st.session_state["last_mf_statement_hash"] = None
             st.rerun()
         if df.empty:
             return
@@ -4335,9 +4360,10 @@ def _test_parse_marketfeeder_statement() -> None:
         b"Back,LIVE,09/02/2025 10:30:00,,Greyhound Racing / SIS / 10:32 Harlow 9th Feb - D5 238m - Win,\"3. Some Dog\",1.5,2.5,1.25,100.5,trigger1\n"
         b"Market P/L,LIVE,09/02/2025 11:00:00,,Greyhound Racing,,,,,2.5,103,\n"
     )
-    df_bets, df_pl = parse_marketfeeder_statement(csv_minimal)
+    df_bets, df_pl, total_comm = parse_marketfeeder_statement(csv_minimal)
     assert isinstance(df_bets, pd.DataFrame), "df_bets deve ser DataFrame"
     assert isinstance(df_pl, pd.DataFrame), "df_market_pl deve ser DataFrame"
+    assert isinstance(total_comm, (int, float)), "total_commission deve ser numero"
     assert len(df_bets) == 1, "deve haver 1 aposta Back"
     assert len(df_pl) == 1, "deve haver 1 linha Market P/L"
     assert "entry_type" in df_bets.columns
