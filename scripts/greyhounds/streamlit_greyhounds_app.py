@@ -665,19 +665,33 @@ def strategy_to_csv_bytes(strategy_dict: dict) -> bytes:
 
 
 def parse_strategies_csv(uploaded_file: Any) -> List[dict]:
-    """Lê CSV e devolve lista de dicts; colunas que parecem JSON são parseadas."""
+    """Lê CSV e devolve lista de dicts; colunas que parecem JSON são parseadas. Guard rail: se for statement MarketFeeder, retorna [] (use import_feedback no caller)."""
     if uploaded_file is None:
         return []
+    raw = uploaded_file.read() if hasattr(uploaded_file, "read") else b""
+    if hasattr(uploaded_file, "seek"):
+        uploaded_file.seek(0)
+    if _is_likely_marketfeeder_statement_csv(raw):
+        return []
     try:
-        df = pd.read_csv(uploaded_file, encoding="utf-8")
+        df = pd.read_csv(io.BytesIO(raw), encoding="utf-8")
     except Exception:
         try:
-            uploaded_file.seek(0)
-            df = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+            df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
         except Exception:
             return []
     if df.empty:
         return []
+    # Validar colunas tipicas de estrategia (evitar aplicar CSV que nao e estrategia)
+    first_row = df.columns.tolist() if len(df.columns) > 0 else []
+    strategy_like = any(
+        c for c in first_row
+        if str(c).strip() in ("rule_select_label", "source_select_label", "market", "entry_type", "strategy_name")
+    )
+    if not strategy_like and len(first_row) >= 1:
+        first_cell = str(first_row[0]).strip() if first_row else ""
+        if first_cell in ("Back", "Market P/L"):
+            return []
     out = []
     for _, row in df.iterrows():
         d = {}
@@ -705,6 +719,152 @@ def _hash_uploaded_file(uploaded_file: Any) -> str:
     """Retorna hash SHA256 em hex do conteudo do arquivo (usa getvalue para nao consumir ponteiro)."""
     data = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
     return hashlib.sha256(data).hexdigest()
+
+
+# --- MarketFeeder statement CSV (sem header): type, env, placed_dt, sport, event_path, selection, stake, price, profit, balance, trigger
+_MF_STATEMENT_COLS = [
+    "type", "env", "placed_dt", "sport", "event_path", "selection", "stake", "price", "profit", "balance", "trigger"
+]
+
+
+def _parse_event_path(event_path: str) -> dict:
+    """
+    Extrai provider, track_raw, off_time, grade_distance de event_path.
+    Ex.: "Greyhound Racing / SIS/TRP/Sky Sports Racing / 10:32 Harlow 9th Feb - D5 238m - ..."
+    """
+    out = {"provider": "", "track_raw": "", "off_time": "", "grade_distance": ""}
+    s = str(event_path or "").strip()
+    if not s:
+        return out
+    # provider: segunda parte depois de "Greyhound Racing / "
+    m_prov = re.search(r"Greyhound Racing\s*/\s*([^/]+?)(?:\s*/\s*|$)", s)
+    if m_prov:
+        out["provider"] = m_prov.group(1).strip()
+    # off_time: HH:MM no trecho "/ 10:32 Harlow ..."
+    m_time = re.search(r"/\s*(\d{1,2}:\d{2})\s+([A-Za-z\s]+?)\s+\d{1,2}(?:st|nd|rd|th)\s+\w+\s+-", s)
+    if m_time:
+        out["off_time"] = m_time.group(1).strip()
+        out["track_raw"] = m_time.group(2).strip()
+    if not out["track_raw"]:
+        # fallback: nome de pista antes de " 9th Feb" etc
+        m_track = re.search(r"\d{1,2}:\d{2}\s+([A-Za-z\s]+?)\s+\d{1,2}(?:st|nd|rd|th)", s)
+        if m_track:
+            out["track_raw"] = m_track.group(1).strip()
+        m_off = re.search(r"(\d{1,2}:\d{2})\s+[A-Za-z]", s)
+        if m_off:
+            out["off_time"] = m_off.group(1).strip()
+    # grade_distance: "D5 238m" ou "A5 400m" em " - D5 238m - "
+    m_grade = re.search(r"\s-\s+([A-Z]\d+\s*\d*m)\s*-", s)
+    if m_grade:
+        out["grade_distance"] = m_grade.group(1).strip()
+    return out
+
+
+def parse_marketfeeder_statement(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Le CSV do MarketFeeder (sem header), normaliza colunas e separa apostas (Back/Lay) e Market P/L.
+    Retorna (df_bets, df_market_pl). Commission fica em df_bets como tipo mas pode ser filtrado; aqui nao retornamos df_commission.
+    """
+    import csv
+    buf = io.BytesIO(file_bytes)
+    reader = csv.reader(io.TextIOWrapper(buf, encoding="utf-8", errors="replace"), quoting=csv.QUOTE_MINIMAL)
+    rows = list(reader)
+    if not rows:
+        return (pd.DataFrame(columns=_MF_STATEMENT_COLS), pd.DataFrame(columns=_MF_STATEMENT_COLS))
+
+    # Construir DataFrame sem header: 11 colunas
+    n_cols = len(_MF_STATEMENT_COLS)
+    data = []
+    for row in rows:
+        if len(row) < n_cols:
+            row = row + [""] * (n_cols - len(row))
+        else:
+            row = row[:n_cols]
+        data.append(row)
+    df = pd.DataFrame(data, columns=_MF_STATEMENT_COLS)
+
+    # Converter placed_dt (dd/mm/yyyy HH:MM:SS)
+    df["placed_dt"] = pd.to_datetime(df["placed_dt"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
+    for col in ("stake", "price", "profit", "balance"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df_bets = df[df["type"].astype(str).str.strip().isin(("Back", "Lay"))].copy()
+    df_market_pl = df[df["type"].astype(str).str.strip() == "Market P/L"].copy()
+
+    if df_bets.empty:
+        return (df_bets, df_market_pl)
+
+    # Colunas derivadas em df_bets
+    df_bets["entry_type"] = df_bets["type"].astype(str).str.strip().str.lower()
+    # selection_trap: int do prefixo "3. " se existir
+    trap_series = df_bets["selection"].astype(str).str.extract(r"^\s*(\d+)\.\s*", expand=False)
+    df_bets["selection_trap"] = pd.to_numeric(trap_series, errors="coerce").astype("Int64")
+    # selection_name: remover prefixo "N. "
+    df_bets["selection_name"] = df_bets["selection"].astype(str).str.replace(r"^\s*\d+\.\s*", "", regex=True).str.strip()
+
+    # Parse event_path
+    parsed = df_bets["event_path"].astype(str).map(_parse_event_path)
+    df_bets["provider"] = parsed.map(lambda x: x["provider"])
+    df_bets["track_raw"] = parsed.map(lambda x: x["track_raw"])
+    df_bets["off_time"] = parsed.map(lambda x: x["off_time"])
+    df_bets["grade_distance"] = parsed.map(lambda x: x["grade_distance"])
+    df_bets["track_clean"] = df_bets["track_raw"].astype(str).map(normalize_track_name)
+
+    # race_time_iso: data de placed_dt + off_time (mesmo dia; simples)
+    def _combine_race_time(row: pd.Series) -> str:
+        dt = row.get("placed_dt")
+        off = str(row.get("off_time") or "").strip()
+        if pd.isna(dt) or not off:
+            return ""
+        try:
+            d = dt.date() if hasattr(dt, "date") else dt
+            parts = off.split(":")
+            h = int(parts[0]) if len(parts) > 0 else 0
+            m = int(parts[1]) if len(parts) > 1 else 0
+            t = datetime.time(h, m, 0)
+            combined = datetime.datetime.combine(d, t)
+            return combined.strftime("%Y-%m-%dT%H:%M")
+        except Exception:
+            return ""
+
+    df_bets["race_time_iso"] = df_bets.apply(_combine_race_time, axis=1)
+    race_date_series = pd.to_datetime(df_bets["race_time_iso"], format="%Y-%m-%dT%H:%M", errors="coerce").dt.strftime("%Y-%m-%d")
+    df_bets["race_date"] = race_date_series.fillna("")
+    sel_name_clean = df_bets["selection_name"].fillna("").astype(str).str.strip()
+    df_bets["join_key_stmt"] = (
+        df_bets["race_date"].astype(str) + "|" +
+        df_bets["track_clean"].fillna("").astype(str) + "|" +
+        df_bets["off_time"].fillna("").astype(str) + "|" +
+        sel_name_clean + "|" +
+        df_bets["entry_type"].astype(str)
+    )
+    return (df_bets, df_market_pl)
+
+
+def _is_likely_marketfeeder_statement_csv(file_bytes: bytes) -> bool:
+    """Retorna True se a primeira celula da primeira linha for 'Back' ou 'Market P/L' (CSV sem header do MarketFeeder)."""
+    import csv
+    buf = io.BytesIO(file_bytes)
+    try:
+        reader = csv.reader(io.TextIOWrapper(buf, encoding="utf-8", errors="replace"), quoting=csv.QUOTE_MINIMAL)
+        first_row = next(reader, None)
+    except Exception:
+        return False
+    if not first_row:
+        return False
+    first_cell = str(first_row[0]).strip() if first_row else ""
+    return first_cell in ("Back", "Market P/L")
+
+
+def _calc_drawdown_series(series: pd.Series) -> float:
+    """Drawdown maximo (peak-to-trough) sobre serie cumulativa de profit."""
+    if series.empty:
+        return 0.0
+    cum = series.cumsum()
+    running_max = cum.cummax()
+    drawdown = cum - running_max
+    return float(drawdown.min()) if not drawdown.empty else 0.0
 
 
 CORE_STATE_KEYS = [
@@ -1303,8 +1463,16 @@ def main() -> None:
         st.session_state["consolidated_uploader_nonce"] = 0
     if "applied_strategy" not in st.session_state:
         st.session_state["applied_strategy"] = None
-    if "pending_remove_consolidated" not in st.session_state:
-        st.session_state["pending_remove_consolidated"] = None
+        if "pending_remove_consolidated" not in st.session_state:
+            st.session_state["pending_remove_consolidated"] = None
+    if "mf_bets_df" not in st.session_state:
+        st.session_state["mf_bets_df"] = pd.DataFrame()
+    if "mf_market_pl_df" not in st.session_state:
+        st.session_state["mf_market_pl_df"] = pd.DataFrame()
+    if "mf_loaded" not in st.session_state:
+        st.session_state["mf_loaded"] = False
+    if "show_internal_signals_table" not in st.session_state:
+        st.session_state["show_internal_signals_table"] = False
 
     def _reset_rule_dependent_state() -> None:
         keys_to_clear = [
@@ -1800,7 +1968,7 @@ def main() -> None:
 
     import_feedback_msg = st.session_state.pop("import_feedback", None)
 
-    col_restore, col_exp, col_imp, col_imp_cons, col_clear = st.columns(5)
+    col_restore, col_exp, col_imp, col_imp_cons, col_mf, col_clear = st.columns(6)
     with col_restore:
         if st.button("Restaurar filtros", key="restore_filters_btn", disabled=is_consolidated):
             st.session_state["pending_restore_filters"] = True
@@ -1856,14 +2024,17 @@ def main() -> None:
                 if last_h == h and not in_progress:
                     pass
                 else:
-                    strategies = parse_strategies_csv(io.BytesIO(data))
-                    if strategies:
-                        for d in strategies:
-                            d["import_filename"] = filename
-                        st.session_state["pending_strategy_import"] = strategies[0]
-                        st.session_state["last_import_hash"] = h
-                        st.session_state["import_in_progress"] = True
-                        st.rerun()
+                    if _is_likely_marketfeeder_statement_csv(data):
+                        st.session_state["import_feedback"] = "Esse arquivo parece ser um statement do MarketFeeder. Use o uploader de statement."
+                    else:
+                        strategies = parse_strategies_csv(io.BytesIO(data))
+                        if strategies:
+                            for d in strategies:
+                                d["import_filename"] = filename
+                            st.session_state["pending_strategy_import"] = strategies[0]
+                            st.session_state["last_import_hash"] = h
+                            st.session_state["import_in_progress"] = True
+                            st.rerun()
     with col_imp_cons:
         _consolidated_uploader_key = f"import_consolidated_csv_{st.session_state['consolidated_uploader_nonce']}"
         uploaded_consolidated = st.file_uploader(
@@ -1873,8 +2044,12 @@ def main() -> None:
         if uploaded_files:
             hashes = st.session_state.get("consolidated_import_hashes", set())
             any_new = False
+            skipped_statement = False
             for uf in uploaded_files:
                 data = uf.getvalue()
+                if _is_likely_marketfeeder_statement_csv(data):
+                    skipped_statement = True
+                    continue
                 h = _hash_uploaded_file(io.BytesIO(data))
                 if h in hashes:
                     continue
@@ -1886,9 +2061,24 @@ def main() -> None:
                     hashes.add(h)
                     any_new = True
             st.session_state["consolidated_import_hashes"] = hashes
+            if skipped_statement:
+                st.session_state["import_feedback"] = "Um ou mais arquivos parecem ser statement do MarketFeeder; use o uploader de statement."
             if any_new:
                 st.session_state.pop("consolidated_union_result", None)
                 st.rerun()
+    with col_mf:
+        mf_uploader_key = "import_marketfeeder_statement_csv"
+        uploaded_mf = st.file_uploader("Importar statement MarketFeeder (CSV)", type=["csv"], key=mf_uploader_key)
+        if uploaded_mf is not None:
+            data_mf = uploaded_mf.getvalue()
+            try:
+                df_mf_bets, df_mf_pl = parse_marketfeeder_statement(data_mf)
+                st.session_state["mf_bets_df"] = df_mf_bets
+                st.session_state["mf_market_pl_df"] = df_mf_pl
+                st.session_state["mf_loaded"] = True
+                st.rerun()
+            except Exception as e:
+                st.session_state["import_feedback"] = f"Erro ao ler statement: {e}"
     with col_clear:
         if st.button("Limpar consolidadas", key="clear_consolidated_btn"):
             st.session_state["pending_clear_consolidated"] = True
@@ -1940,9 +2130,58 @@ def main() -> None:
         st.write("Esperado:", str(expected), "exists=", expected.exists())
         st.write("df.shape:", df.shape)
         st.write("df.columns(sample):", list(df.columns)[:80])
-    if df.empty:
+    if df.empty and not st.session_state.get("mf_loaded"):
         st.info("Nenhum sinal encontrado para a selecao. Gere antes com: python scripts/greyhounds/generate_greyhound_signals.py --source {src} --market {mkt} --rule {rule} --entry_type both".format(src=source, mkt=market, rule=rule))
         return
+
+    # Secao Statement MarketFeeder (quando importado)
+    if st.session_state.get("mf_loaded"):
+        mf_bets = st.session_state.get("mf_bets_df", pd.DataFrame())
+        mf_pl = st.session_state.get("mf_market_pl_df", pd.DataFrame())
+        st.warning("Statement importado: a tabela abaixo vem do MarketFeeder. A tabela interna vem do dataset de sinais.")
+        if not mf_bets.empty:
+            sinais = len(mf_bets)
+            profit_series = pd.to_numeric(mf_bets["profit"], errors="coerce").fillna(0)
+            stake_series = pd.to_numeric(mf_bets["stake"], errors="coerce").fillna(0)
+            greens = int((profit_series > 0).sum())
+            reds = int((profit_series <= 0).sum())
+            pnl = float(profit_series.sum())
+            total_stake = float(stake_series.sum())
+            roi = (pnl / total_stake) if total_stake > 0 else 0.0
+            drawdown = _calc_drawdown_series(profit_series)
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            with c1:
+                st.metric("Sinais (statement)", sinais)
+            with c2:
+                st.metric("Greens", greens)
+            with c3:
+                st.metric("Reds", reds)
+            with c4:
+                st.metric("PnL", f"{pnl:.2f}")
+            with c5:
+                st.metric("ROI", f"{roi:.2%}")
+            with c6:
+                st.metric("Drawdown", f"{drawdown:.2f}")
+            st.subheader("Resultados (statement)")
+            st.dataframe(
+                mf_bets[["placed_dt", "track_clean", "off_time", "grade_distance", "selection_trap", "selection_name", "stake", "price", "profit", "trigger"]].rename(columns={"track_clean": "track"}),
+                use_container_width=True,
+            )
+        if not mf_pl.empty:
+            with st.expander("Market P/L (statement)", expanded=False):
+                st.dataframe(mf_pl, use_container_width=True)
+        st.checkbox(
+            "Exibir tabela interna (sinais)",
+            key="show_internal_signals_table",
+            help="Quando ativo, exibe a tabela de resultados gerada a partir do dataset de sinais (fonte interna).",
+        )
+        if st.button("Limpar statement", key="clear_mf_statement_btn"):
+            st.session_state["mf_bets_df"] = pd.DataFrame()
+            st.session_state["mf_market_pl_df"] = pd.DataFrame()
+            st.session_state["mf_loaded"] = False
+            st.rerun()
+        if df.empty:
+            return
 
     df_filtered = st.session_state["_df_filtered"]
     filt = st.session_state["_filt"]
@@ -3074,7 +3313,10 @@ def main() -> None:
             df_block[c] = ""
         table_label = f"Tabela {title_suffix}"
         with st.expander(table_label, expanded=False):
-            st.dataframe(df_block[show_cols], use_container_width=True)
+            if st.session_state.get("mf_loaded") and not st.session_state.get("show_internal_signals_table"):
+                st.caption("Tabela interna oculta. Ative 'Exibir tabela interna (sinais)' para ver.")
+            else:
+                st.dataframe(df_block[show_cols], use_container_width=True)
 
     def _render_monthly_table(df_block: pd.DataFrame, entry_kind: str) -> None:
         """Tabela mensal com mesmas métricas do cabeçalho."""
@@ -3593,7 +3835,10 @@ def main() -> None:
             filt[c] = ""
         table_label = f"Tabela de resultados ({entry_type.upper()})"
         with st.expander(table_label, expanded=False):
-            st.dataframe(filt[show_cols], use_container_width=True)
+            if st.session_state.get("mf_loaded") and not st.session_state.get("show_internal_signals_table"):
+                st.caption("Tabela interna oculta. Ative 'Exibir tabela interna (sinais)' para ver.")
+            else:
+                st.dataframe(filt[show_cols], use_container_width=True)
 
     # Graficos pequenos: evolucao por pista e por categoria (um bloco por tipo de entrada)
     def _render_small_charts(df_block: pd.DataFrame, entry_kind: str) -> None:
@@ -4083,7 +4328,33 @@ def main() -> None:
         _render_cross_nr_track(filt[filt["entry_type"] == entry_type], entry_type)
 
 
+def _test_parse_marketfeeder_statement() -> None:
+    """Testes simples (asserts) do parse do statement MarketFeeder. Executar: python -c \"from scripts.greyhounds.streamlit_greyhounds_app import _test_parse_marketfeeder_statement; _test_parse_marketfeeder_statement()\"."""
+    # CSV minimo sem header: type, env, placed_dt, sport, event_path, selection, stake, price, profit, balance, trigger (11 colunas)
+    csv_minimal = (
+        b"Back,LIVE,09/02/2025 10:30:00,,Greyhound Racing / SIS / 10:32 Harlow 9th Feb - D5 238m - Win,\"3. Some Dog\",1.5,2.5,1.25,100.5,trigger1\n"
+        b"Market P/L,LIVE,09/02/2025 11:00:00,,Greyhound Racing,,,,,2.5,103,\n"
+    )
+    df_bets, df_pl = parse_marketfeeder_statement(csv_minimal)
+    assert isinstance(df_bets, pd.DataFrame), "df_bets deve ser DataFrame"
+    assert isinstance(df_pl, pd.DataFrame), "df_market_pl deve ser DataFrame"
+    assert len(df_bets) == 1, "deve haver 1 aposta Back"
+    assert len(df_pl) == 1, "deve haver 1 linha Market P/L"
+    assert "entry_type" in df_bets.columns
+    assert "selection_trap" in df_bets.columns
+    assert "selection_name" in df_bets.columns
+    assert "join_key_stmt" in df_bets.columns
+    assert df_bets["entry_type"].iloc[0] == "back"
+    assert df_bets["selection_trap"].iloc[0] == 3
+    assert "Some Dog" in str(df_bets["selection_name"].iloc[0])
+    assert _is_likely_marketfeeder_statement_csv(csv_minimal)
+    assert not _is_likely_marketfeeder_statement_csv(b"strategy_name,rule_select_label\n,x")
+    profit_series = pd.to_numeric(df_bets["profit"], errors="coerce").fillna(0)
+    assert _calc_drawdown_series(profit_series) <= 0
+
+
 if __name__ == "__main__":
+    _test_parse_marketfeeder_statement()
     main()
 
 
