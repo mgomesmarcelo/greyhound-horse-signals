@@ -877,13 +877,15 @@ def _calc_drawdown_series(series: pd.Series) -> float:
     return float(drawdown.min()) if not drawdown.empty else 0.0
 
 
+# Chaves de data nao fazem parte da estrategia exportada/importada; sao sempre o filtro global do dashboard
+DATE_KEYS_IGNORED_ON_IMPORT = ("date_mode", "date_start_input", "date_end_input", "date_range_slider")
+
 CORE_STATE_KEYS = [
     "tracks_ms", "cats_ms", "subcats_ms",
     "weekdays_ms", "hour_bucket_ms",
     "trap_ms", "num_runners_ms",
     "bsp_low", "bsp_high",
     "min_total_volume",
-    "date_mode", "date_start_input", "date_end_input", "date_range_slider",
 ]
 
 RULE_EXTRA_KEYS: dict[str, List[str]] = {
@@ -908,6 +910,8 @@ def strategies_list_to_csv_bytes(strategies: List[dict]) -> bytes:
     # Excluir pnl/roi se existirem (CSVs antigos podem ter)
     all_keys.discard("pnl")
     all_keys.discard("roi")
+    for k in DATE_KEYS_IGNORED_ON_IMPORT:
+        all_keys.discard(k)
     ordered_basic = [c for c in _EXPORT_BASIC_ORDER if c in all_keys]
     rest = sorted(all_keys - set(ordered_basic))
     columns = ordered_basic + rest
@@ -989,19 +993,10 @@ def _apply_strategy_to_state(strategy_dict: dict) -> None:
         | set(RULE_EXTRA_KEYS.get(imported_rule_slug, []))
     )
     for key, value in strategy_dict.items():
+        if key in DATE_KEYS_IGNORED_ON_IMPORT:
+            continue
         if key not in allowed:
             continue
-        if key in ("date_start_input", "date_end_input") and isinstance(value, str):
-            try:
-                value = pd.to_datetime(value).date()
-            except Exception:
-                pass
-        if key == "date_range_slider":
-            if isinstance(value, list) and len(value) == 2:
-                try:
-                    value = (pd.to_datetime(value[0]).to_pydatetime(), pd.to_datetime(value[1]).to_pydatetime())
-                except Exception:
-                    pass
         if key == "only_value_bets" and isinstance(value, str):
             value = value.strip().lower() in ("true", "1", "yes")
         st.session_state[key] = value
@@ -1050,29 +1045,7 @@ def _build_mask_from_strategy(df: pd.DataFrame, strategy_dict: dict) -> pd.Serie
         entry_series = df["entry_type"].astype(str).str.strip().str.lower()
         mask &= (entry_series == entry).fillna(False)
 
-    # Datas
-    date_mode = strategy_dict.get("date_mode")
-    range_start = range_end = None
-    if date_mode == "Barra":
-        slider = strategy_dict.get("date_range_slider")
-        if isinstance(slider, (list, tuple)) and len(slider) >= 2:
-            try:
-                range_start = pd.to_datetime(slider[0]).date()
-                range_end = pd.to_datetime(slider[1]).date()
-            except Exception:
-                pass
-    if range_start is None or range_end is None:
-        start_val = strategy_dict.get("date_start_input")
-        end_val = strategy_dict.get("date_end_input")
-        if start_val is not None and end_val is not None:
-            try:
-                range_start = pd.to_datetime(start_val).date()
-                range_end = pd.to_datetime(end_val).date()
-            except Exception:
-                pass
-    if range_start is not None and range_end is not None and "date" in df.columns:
-        date_parsed = pd.to_datetime(df["date"], errors="coerce").dt.date
-        mask &= (date_parsed >= range_start) & (date_parsed <= range_end)
+    # Datas nao vêm do strategy_dict; o consolidado usa o filtro global do dashboard (df já filtrado por data)
 
     # Volume (forecast_odds nao usa volume: ignorar min_total_volume)
     if rule_slug_early != "forecast_odds":
