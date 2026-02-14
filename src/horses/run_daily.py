@@ -7,9 +7,9 @@ from loguru import logger
 
 from src.horses.config import settings
 from src.horses.scrape_betfair_races import main as scrape_betfair_races
+from src.horses.scrape_timeform_update import main as scrape_timeform_update
 from src.horses.scrape_sportinglife_update import main as scrape_sportinglife_update
 from src.horses.scrape_sportinglife_backfill import main as scrape_sportinglife_backfill
-from src.horses.scrape_timeform_update import main as scrape_timeform_update
 
 Step = Tuple[str, Callable[[], None]]
 
@@ -37,9 +37,9 @@ def main() -> None:
 
     steps: list[Step] = [
         ("scrape_betfair_races", scrape_betfair_races),
+        ("scrape_timeform_update", scrape_timeform_update),
         ("scrape_sportinglife_update", scrape_sportinglife_update),
         ("scrape_sportinglife_backfill", scrape_sportinglife_backfill),
-        ("scrape_timeform_update", scrape_timeform_update),
     ]
 
     _run_steps(steps)

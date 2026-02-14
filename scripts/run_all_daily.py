@@ -6,13 +6,13 @@ if __package__ in (None, ""):
     if str(project_root) not in sys.path:
         sys.path.append(str(project_root))
 
-from src.horses.run_daily import main as run_horses_daily
 from src.greyhounds.run_daily import main as run_greyhounds_daily
+from src.horses.run_daily import main as run_horses_daily
 
 
 def main():
-    run_horses_daily()
     run_greyhounds_daily()
+    run_horses_daily()
     print("Pipeline diario concluido com sucesso.")
 
 
