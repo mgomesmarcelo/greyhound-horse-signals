@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 import time
 from pathlib import Path
 
@@ -29,6 +29,13 @@ def _daily_output_csv_path() -> Path:
     return output_dir / f"betfair_top3_{today_str()}.csv"
 
 
+def _timeform_top3_csv_path() -> Path:
+    """CSV onde load_timeform_top3() le os dados (para horses a fonte e Betfair)."""
+    output_dir = HORSES_DATA_DIR / "timeform_top3"
+    ensure_dir(output_dir)
+    return output_dir / f"timeform_top3_{today_str()}.csv"
+
+
 def main() -> None:
     logger.remove()
     logger.add(sys.stderr, level=settings.LOG_LEVEL)
@@ -43,6 +50,7 @@ def main() -> None:
     driver = build_chrome_driver()
     try:
         output_csv = _daily_output_csv_path()
+        top3_csv = _timeform_top3_csv_path()
         for row in races:
             track = str(row.get("track_name", "unknown_track"))
             race_url = str(row.get("race_url", ""))
@@ -65,12 +73,28 @@ def main() -> None:
             )
 
             upsert_row_by_keys(output_csv, result, key_fields=["track_name", "race_time_iso", "source"])
+
+            names = result.get("TimeformPrev_list")
+            if isinstance(names, str):
+                names = [n.strip() for n in names.split(";") if n.strip()]
+            if not isinstance(names, list):
+                names = []
+            if names:
+                top3_row = {
+                    "track_name": track,
+                    "race_time_iso": race_time_iso,
+                    "TimeformTop1": names[0] if len(names) > 0 else "",
+                    "TimeformTop2": names[1] if len(names) > 1 else "",
+                    "TimeformTop3": names[2] if len(names) > 2 else "",
+                }
+                upsert_row_by_keys(top3_csv, top3_row, key_fields=["track_name", "race_time_iso"])
+
             logger.debug(f"Atualizado: {output_csv}")
             time.sleep(1.0)
     finally:
         driver.quit()
 
-    logger.info(f"Coleta Betfair concluida. CSV gerado: {output_csv}")
+    logger.info("Coleta Betfair concluida. CSVs gerados: {} e {}", output_csv, top3_csv)
 
 
 if __name__ == "__main__":

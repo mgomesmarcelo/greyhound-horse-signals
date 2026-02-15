@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 from pathlib import Path
 
 if __package__ in (None, ""):
