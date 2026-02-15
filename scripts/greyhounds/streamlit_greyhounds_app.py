@@ -6,7 +6,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -2997,13 +2997,20 @@ def main() -> None:
         help="Altere entre datas ou sequencia de apostas",
     )
 
-    def render_block(title_suffix: str, df_block: pd.DataFrame, entry_kind: str) -> None:
+    def render_block(
+        title_suffix: str,
+        df_block: pd.DataFrame,
+        entry_kind: str,
+        extra_after_subheader: Optional[Callable[[], None]] = None,
+    ) -> None:
         base_amount = float(st.session_state.get("base_amount", 1.0))
         ref_factor = _REF_FACTOR
         scale_factor = get_scale(base_amount, ref_factor)
         summary = _compute_summary_metrics(df_block, entry_kind, base_amount)
 
         st.subheader(title_suffix)
+        if extra_after_subheader is not None:
+            extra_after_subheader()
 
         # Linha 1: Pistas, Sinais, Greens, Reds, Media BSP, Assertividade
         c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -3331,6 +3338,24 @@ def main() -> None:
 
         working["month_period"] = working["race_ts"].dt.to_period("M")
         working["month_label"] = working["race_ts"].apply(_format_month_label)
+        add_vr = "value_ratio" in working.columns
+        add_pnl_disp = "pnl_stake_ref" in working.columns or "pnl_stake_fixed_10" in working.columns
+
+        def _vr_stats(g: pd.DataFrame) -> dict[str, float]:
+            s = pd.to_numeric(g["value_ratio"], errors="coerce")
+            s = s.replace([float("inf"), float("-inf")], float("nan")).dropna()
+            if s.empty:
+                return {"n": 0, "mean": float("nan"), "std": float("nan"), "var": float("nan")}
+            return {"n": int(len(s)), "mean": float(s.mean()), "std": float(s.std()), "var": float(s.var())}
+
+        def _pnl_disp_stats(g: pd.DataFrame) -> dict[str, float]:
+            pnl_series = get_col(g, "pnl_stake_ref", "pnl_stake_fixed_10")
+            s = pd.to_numeric(pnl_series, errors="coerce")
+            s = s.replace([float("inf"), float("-inf")], float("nan")).dropna()
+            if s.empty:
+                return {"n": 0, "mean_return": float("nan"), "std_return": float("nan"), "var": float("nan")}
+            return {"n": int(len(s)), "mean_return": float(s.mean()), "std_return": float(s.std()), "var": float(s.var())}
+
         rows: list[dict[str, float | str]] = []
         for (period_val, label), grp in working.groupby(["month_period", "month_label"]):
             summary = _compute_summary_metrics(grp, entry_kind, base_amount)
@@ -3359,6 +3384,18 @@ def main() -> None:
                         "Drawdown max (Liability)": summary.get("drawdown_liab", 0.0),
                     }
                 )
+            if add_vr:
+                vr = _vr_stats(grp)
+                row["VR n"] = vr["n"]
+                row["VR mean"] = vr["mean"]
+                row["VR std"] = vr["std"]
+                row["VR var"] = vr["var"]
+            if add_pnl_disp:
+                pnl_d = _pnl_disp_stats(grp)
+                row["Ret n"] = pnl_d["n"]
+                row["Ret mean"] = pnl_d["mean_return"]
+                row["Ret std"] = pnl_d["std_return"]
+                row["Ret var"] = pnl_d["var"]
             rows.append(row)
 
         monthly_df = pd.DataFrame(rows)
@@ -3414,8 +3451,10 @@ def main() -> None:
                     continue
                 if c in ("Assertividade", "ROI Stake", "ROI acum.", "ROI (3M)") or "ROI" in c:
                     _fmt_monthly[c] = "{:.2%}"
-                elif c in ("Pistas", "Sinais", "Greens", "Reds"):
+                elif c in ("Pistas", "Sinais", "Greens", "Reds") or c == "VR n" or c == "Ret n":
                     _fmt_monthly[c] = "{:.0f}"
+                elif c in ("VR mean", "VR std", "VR var") or c in ("Ret mean", "Ret std", "Ret var"):
+                    _fmt_monthly[c] = "{:.4f}"
                 else:
                     _fmt_monthly[c] = "{:.2f}"
             st.dataframe(monthly_df.style.format(_fmt_monthly), use_container_width=True)
@@ -3476,10 +3515,121 @@ def main() -> None:
     # Campo base (único) pos-filtros, antes de renderizar resultados
     _render_base_amount_input()
 
+    # Dispersao do value_ratio (forecast_odds ou consolidado com coluna value_ratio)
+    if "value_ratio" in filt.columns and not filt.empty:
+
+        def _value_ratio_stats(df_block: pd.DataFrame) -> dict[str, float]:
+            s = pd.to_numeric(df_block["value_ratio"], errors="coerce")
+            s = s.replace([float("inf"), float("-inf")], float("nan")).dropna()
+            if s.empty:
+                return {"n": 0, "mean": float("nan"), "std": float("nan"), "var": float("nan")}
+            return {"n": int(len(s)), "mean": float(s.mean()), "std": float(s.std()), "var": float(s.var())}
+
+        st.subheader("Dispersao do value_ratio")
+        if entry_type == "both":
+            df_back = filt[filt["entry_type"] == "back"]
+            s_back = _value_ratio_stats(df_back)
+            st.markdown("**BACK**")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("n (quantidade de apostas)", s_back["n"])
+            with c2:
+                st.metric("mean (média do value_ratio)", f"{s_back['mean']:.4f}" if not pd.isna(s_back["mean"]) else "-")
+            with c3:
+                st.metric("std (desvio padrão)", f"{s_back['std']:.4f}" if not pd.isna(s_back["std"]) else "-")
+            with c4:
+                st.metric("var (variância)", f"{s_back['var']:.4f}" if not pd.isna(s_back["var"]) else "-")
+        else:
+            s = _value_ratio_stats(filt)
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("n (quantidade de apostas)", s["n"])
+            with c2:
+                st.metric("mean (média do value_ratio)", f"{s['mean']:.4f}" if not pd.isna(s["mean"]) else "-")
+            with c3:
+                st.metric("std (desvio padrão)", f"{s['std']:.4f}" if not pd.isna(s["std"]) else "-")
+            with c4:
+                st.metric("var (variância)", f"{s['var']:.4f}" if not pd.isna(s["var"]) else "-")
+
+    # Dispersao do retorno por aposta (pnl_stake_ref)
+    _has_pnl_col = not filt.empty and ("pnl_stake_ref" in filt.columns or "pnl_stake_fixed_10" in filt.columns)
+    if _has_pnl_col:
+
+        def _pnl_return_stats(df_block: pd.DataFrame) -> dict[str, float]:
+            pnl_series = get_col(df_block, "pnl_stake_ref", "pnl_stake_fixed_10")
+            s = pd.to_numeric(pnl_series, errors="coerce")
+            s = s.replace([float("inf"), float("-inf")], float("nan")).dropna()
+            if s.empty:
+                return {"n": 0, "mean_return": float("nan"), "std_return": float("nan"), "var": float("nan")}
+            return {
+                "n": int(len(s)),
+                "mean_return": float(s.mean()),
+                "std_return": float(s.std()),
+                "var": float(s.var()),
+            }
+
+        st.subheader("Dispersao do retorno por aposta (pnl_stake_ref)")
+        if entry_type == "both":
+            df_back = filt[filt["entry_type"] == "back"]
+            s_back = _pnl_return_stats(df_back)
+            st.markdown("**BACK**")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("n (quantidade de apostas)", s_back["n"])
+            with c2:
+                st.metric("mean (retorno médio por bet)", f"{s_back['mean_return']:.4f}" if not pd.isna(s_back["mean_return"]) else "-")
+            with c3:
+                st.metric("std (volatilidade por bet)", f"{s_back['std_return']:.4f}" if not pd.isna(s_back["std_return"]) else "-")
+            with c4:
+                st.metric("var (variância)", f"{s_back['var']:.4f}" if not pd.isna(s_back["var"]) else "-")
+        else:
+            s = _pnl_return_stats(filt)
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("n (quantidade de apostas)", s["n"])
+            with c2:
+                st.metric("mean (retorno médio por bet)", f"{s['mean_return']:.4f}" if not pd.isna(s["mean_return"]) else "-")
+            with c3:
+                st.metric("std (volatilidade por bet)", f"{s['std_return']:.4f}" if not pd.isna(s["std_return"]) else "-")
+            with c4:
+                st.metric("var (variância)", f"{s['var']:.4f}" if not pd.isna(s["var"]) else "-")
+
     # Enriquecimento feito antes; agora renderizacao por bloco
     if entry_type == "both":
         render_block("Resultados BACK", filt[filt["entry_type"] == "back"], "back")
-        render_block("Resultados LAY", filt[filt["entry_type"] == "lay"], "lay")
+        def _render_dispersao_lay() -> None:
+            if "value_ratio" in filt.columns and not filt.empty:
+                st.subheader("Dispersao do value_ratio")
+                st.markdown("**LAY**")
+                s_lay = _value_ratio_stats(filt[filt["entry_type"] == "lay"])
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("n (quantidade de apostas)", s_lay["n"])
+                with c2:
+                    st.metric("mean (média do value_ratio)", f"{s_lay['mean']:.4f}" if not pd.isna(s_lay["mean"]) else "-")
+                with c3:
+                    st.metric("std (desvio padrão)", f"{s_lay['std']:.4f}" if not pd.isna(s_lay["std"]) else "-")
+                with c4:
+                    st.metric("var (variância)", f"{s_lay['var']:.4f}" if not pd.isna(s_lay["var"]) else "-")
+            if _has_pnl_col:
+                st.subheader("Dispersao do retorno por aposta (pnl_stake_ref)")
+                st.markdown("**LAY**")
+                s_lay_pnl = _pnl_return_stats(filt[filt["entry_type"] == "lay"])
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("n (quantidade de apostas)", s_lay_pnl["n"])
+                with c2:
+                    st.metric("mean (retorno médio por bet)", f"{s_lay_pnl['mean_return']:.4f}" if not pd.isna(s_lay_pnl["mean_return"]) else "-")
+                with c3:
+                    st.metric("std (volatilidade por bet)", f"{s_lay_pnl['std_return']:.4f}" if not pd.isna(s_lay_pnl["std_return"]) else "-")
+                with c4:
+                    st.metric("var (variância)", f"{s_lay_pnl['var']:.4f}" if not pd.isna(s_lay_pnl["var"]) else "-")
+        render_block(
+            "Resultados LAY",
+            filt[filt["entry_type"] == "lay"],
+            "lay",
+            extra_after_subheader=_render_dispersao_lay,
+        )
         if not is_consolidated:
             base_amount_both = float(st.session_state.get("base_amount", 1.0))
             s_back = _compute_summary_metrics(filt[filt["entry_type"] == "back"], "back", base_amount_both)
