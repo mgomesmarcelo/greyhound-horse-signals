@@ -20,13 +20,18 @@ def main(argv: list[str] | None = None) -> int:
     logger.add(sys.stderr, level=settings.LOG_LEVEL)
 
     parser = argparse.ArgumentParser(description="Gerar sinais para horses (Timeform/Sporting Life).")
-    parser.add_argument("--source", choices=["top3", "forecast", "both"], default="both")
+    parser.add_argument(
+        "--source",
+        choices=["top3", "forecast", "both", "all"],
+        default="both",
+        help="Fonte: top3, forecast. both e all equivalem a top3+forecast.",
+    )
     parser.add_argument("--market", choices=["win", "place", "both"], default="both")
     parser.add_argument(
         "--rule",
-        choices=["lider_volume_total", "terceiro_queda50", "both"],
+        choices=["lider_volume_total", "terceiro_queda50", "forecast_odds", "both"],
         default="both",
-        help="Regra de seleção do alvo: líder por volume ou terceiro com queda de 50%.",
+        help="Regra: lider por volume, terceiro queda 50%%, forecast_odds (source=forecast, provider=timeform ou sportinglife), ou both.",
     )
     parser.add_argument("--entry_type", choices=["lay", "back", "both"], default="both", help="Tipo de entrada (gera um único arquivo quando 'both').")
     parser.add_argument(
@@ -72,17 +77,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(out_path)
 
-    sources = [args.source] if args.source != "both" else ["top3", "forecast"]
+    sources = [args.source] if args.source not in ("both", "all") else ["top3", "forecast"]
     markets = [args.market] if args.market != "both" else ["win", "place"]
     entry_type_cli = args.entry_type
     if args.strategy:
         entry_type_cli = args.strategy  # compatibilidade legada
-    rules = [args.rule] if args.rule != "both" else ["lider_volume_total", "terceiro_queda50"]
+    rules = [args.rule] if args.rule != "both" else ["lider_volume_total", "terceiro_queda50", "forecast_odds"]
     providers = [args.provider] if args.provider != "both" else ["timeform", "sportinglife"]
 
     for source_val in sources:
         for market_val in markets:
             for rule_val in rules:
+                if rule_val == "forecast_odds" and source_val != "forecast":
+                    logger.debug("Pulando rule=forecast_odds (source=%s; exige source=forecast)", source_val)
+                    continue
                 for provider_val in providers:
                     _run_for(source_val, market_val, rule_val, entry_type_cli, provider_val)
 

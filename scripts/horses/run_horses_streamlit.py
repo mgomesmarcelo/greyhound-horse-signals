@@ -1,3 +1,4 @@
+"""Launcher do dashboard Streamlit de cavalos. Executa streamlit run sobre streamlit_horses_app.py."""
 from __future__ import annotations
 
 import argparse

@@ -1,8 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 
@@ -35,7 +35,7 @@ def write_links_csv(day_dir: Path, rows: Iterable[Dict[str, object]]) -> Path:
 
 def append_or_create_csv(csv_path: Path, row: Dict[str, object]) -> None:
     if csv_path.exists():
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path, encoding=settings.CSV_ENCODING)
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
         df.to_csv(csv_path, index=False, encoding=settings.CSV_ENCODING)
     else:
@@ -45,7 +45,7 @@ def append_or_create_csv(csv_path: Path, row: Dict[str, object]) -> None:
 def upsert_single_row_csv(csv_path: Path, update_row: Dict[str, object]) -> None:
     if csv_path.exists():
         try:
-            df_existing = pd.read_csv(csv_path)
+            df_existing = pd.read_csv(csv_path, encoding=settings.CSV_ENCODING)
             base: Dict[str, object] = {}
             if not df_existing.empty:
                 base = df_existing.iloc[-1].to_dict()
@@ -61,7 +61,7 @@ def condense_csv_to_single_row(csv_path: Path) -> None:
     if not csv_path.exists():
         return
     try:
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path, encoding=settings.CSV_ENCODING)
         if df.empty:
             df.to_csv(csv_path, index=False, encoding=settings.CSV_ENCODING)
             return
@@ -82,7 +82,7 @@ def condense_csv_to_single_row(csv_path: Path) -> None:
 def upsert_row_by_keys(csv_path: Path, new_row: Dict[str, object], key_fields: List[str]) -> None:
     if csv_path.exists():
         try:
-            df = pd.read_csv(csv_path)
+            df = pd.read_csv(csv_path, encoding=settings.CSV_ENCODING)
             if not df.empty and all(k in df.columns for k in key_fields):
                 mask = pd.Series([True] * len(df))
                 for key in key_fields:
@@ -98,3 +98,20 @@ def upsert_row_by_keys(csv_path: Path, new_row: Dict[str, object], key_fields: L
         except Exception:
             pass
     pd.DataFrame([new_row]).to_csv(csv_path, index=False, encoding=settings.CSV_ENCODING)
+
+
+def write_dataframe_snapshots(
+    df: pd.DataFrame,
+    raw_path: Path,
+    parquet_path: Path,
+    *,
+    encoding: str | None = None,
+    parquet_compression: Optional[str] = "snappy",
+) -> None:
+    """Persiste o DataFrame como CSV (raw) e Parquet (processed)."""
+    if encoding is None:
+        encoding = settings.CSV_ENCODING
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(raw_path, index=False, encoding=encoding)
+    df.to_parquet(parquet_path, index=False, compression=parquet_compression)
