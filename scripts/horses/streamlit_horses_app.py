@@ -233,7 +233,6 @@ def _apply_strategy_to_state(strategy_dict: dict) -> None:
     imported_rule_slug = _rule_label_to_slug(imported_rule_label)
     if imported_rule_slug == "forecast_odds":
         strategy_dict = dict(strategy_dict)
-        strategy_dict["provider"] = "timeform"
         strategy_dict["source_select_label"] = "Forecast"
     allowed = (
         {"rule_select_label", "source_select_label", "provider", "market", "entry_type"}
@@ -1718,18 +1717,14 @@ def main() -> None:
         rule = HORSE_RULE_LABELS_INV.get(selected_rule_label, "terceiro_queda50")
 
     with col_prov:
-        if rule == "forecast_odds":
-            provider = "timeform"
-            st.caption("timeform (fixo)")
-        else:
-            prov_options = ["timeform", "sportinglife"]
-            idx = 1 if st.session_state.get("provider") == "sportinglife" else 0
-            provider = st.selectbox(
-                "Provedor",
-                prov_options,
-                index=idx,
-                key="provider",
-            )
+        prov_options = ["timeform", "sportinglife"]
+        idx = 1 if st.session_state.get("provider") == "sportinglife" else 0
+        provider = st.selectbox(
+            "Provedor",
+            prov_options,
+            index=idx,
+            key="provider",
+        )
 
     with col_src:
         source_options = ["top3", "forecast"]
@@ -2643,13 +2638,18 @@ def main() -> None:
             rank_vals = []
         if rank_vals:
             if "forecast_rank_ms" not in st.session_state:
-                st.session_state["forecast_rank_ms"] = [3, 4] if 3 in rank_vals or 4 in rank_vals else rank_vals[:2]
+                st.session_state["forecast_rank_ms"] = list(rank_vals)
             existing_ranks = st.session_state.get("forecast_rank_ms") or []
             sanitized_ranks = [r for r in existing_ranks if r in rank_vals]
             if not sanitized_ranks and existing_ranks:
-                sanitized_ranks = [3, 4] if (3 in rank_vals or 4 in rank_vals) else rank_vals[:2]
+                sanitized_ranks = list(rank_vals)
             st.session_state["forecast_rank_ms"] = sanitized_ranks
             st.caption("Forecast Odds: rank e value ratio")
+            btn_all, btn_clear, _ = st.columns([1, 1, 6])
+            with btn_all:
+                st.button("Todas", key="forecast_rank_all", on_click=lambda: st.session_state.update({"forecast_rank_ms": list(rank_vals)}))
+            with btn_clear:
+                st.button("Limpar", key="forecast_rank_none", on_click=lambda: st.session_state.update({"forecast_rank_ms": []}))
             col_rank, _ = st.columns([2, 8])
             with col_rank:
                 st.multiselect(
