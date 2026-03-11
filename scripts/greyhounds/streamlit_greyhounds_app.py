@@ -479,8 +479,8 @@ def _apply_filters_to_df_filtered(
     if rule != "forecast_odds":
         filt = filt[volume_series.fillna(0.0) >= min_total_volume]
 
-    sel_traps = session_state.get("trap_ms", None)
-    if sel_traps is not None:
+    if "trap_ms" in session_state:
+        sel_traps = session_state["trap_ms"]
         if sel_traps:
             trap_series_filt = pd.to_numeric(filt.get("trap_number", pd.Series(dtype=float)), errors="coerce").astype("Int64")
             filt = filt[trap_series_filt.isin(sel_traps)]
@@ -505,7 +505,7 @@ def _apply_filters_to_df_filtered(
     cat_letters = sorted([c for c in filt["category"].dropna().unique().tolist() if isinstance(c, str) and c]) if not filt.empty and "category" in filt.columns else []
     sub_tokens = []
     if "category_token" in filt.columns and not filt.empty:
-        sel_cats_state = session_state.get("sel_cats") or session_state.get("cats_ms")
+        sel_cats_state = session_state.get("cats_ms") if "cats_ms" in session_state else session_state.get("sel_cats")
         token_source = filt[filt["category"].isin(sel_cats_state)] if sel_cats_state and "category" in filt.columns else filt
         raw_tokens = [t for t in token_source["category_token"].dropna().astype(str).unique().tolist() if isinstance(t, str) and t]
         def _sub_sort(tok: str) -> tuple:
@@ -533,8 +533,8 @@ def _apply_filters_to_df_filtered(
         else:
             filt = filt.iloc[0:0]
 
-    sel_nr = session_state.get("sel_num_runners") or session_state.get("num_runners_ms")
-    if sel_nr is not None:
+    if "num_runners_ms" in session_state or "sel_num_runners" in session_state:
+        sel_nr = session_state.get("num_runners_ms") if "num_runners_ms" in session_state else session_state.get("sel_num_runners")
         if sel_nr and "num_runners" in filt.columns:
             filt = filt[filt["num_runners"].isin(sel_nr)]
         else:
@@ -560,9 +560,12 @@ def _apply_filters_to_df_filtered(
         if session_state.get("only_value_bets", False) and "value_ratio" in filt.columns:
             filt = filt[filt["value_ratio"].fillna(0.0) >= 1.0]
 
-    sel_tracks = session_state.get("tracks_ms", None)
-    if sel_tracks and "track_name" in filt.columns:
-        filt = filt[filt["track_name"].isin(sel_tracks)]
+    if "tracks_ms" in session_state:
+        sel_tracks = session_state["tracks_ms"]
+        if sel_tracks and "track_name" in filt.columns:
+            filt = filt[filt["track_name"].isin(sel_tracks)]
+        else:
+            filt = filt.iloc[0:0]
     if rule == "terceiro_queda50" and "pct_diff_second_vs_third" in filt.columns:
         filt = filt[filt["pct_diff_second_vs_third"].fillna(0) > 50.0]
 
@@ -578,15 +581,15 @@ def _apply_filters_to_df_filtered(
         if bsp_col in filt.columns:
             filt = filt[(filt[bsp_col] >= bsp_low) & (filt[bsp_col] <= bsp_high)]
 
-    sel_cats = session_state.get("sel_cats", [])
-    if cat_letters and sel_cats is not None:
+    if cat_letters and ("cats_ms" in session_state or "sel_cats" in session_state):
+        sel_cats = session_state.get("cats_ms") if "cats_ms" in session_state else session_state.get("sel_cats")
         if sel_cats and "category" in filt.columns:
             filt = filt[filt["category"].isin(sel_cats)]
         else:
             filt = filt.iloc[0:0]
 
-    sel_subcats = session_state.get("sel_subcats", [])
-    if sub_tokens and sel_subcats is not None:
+    if sub_tokens and ("subcats_ms" in session_state or "sel_subcats" in session_state):
+        sel_subcats = session_state.get("subcats_ms") if "subcats_ms" in session_state else session_state.get("sel_subcats")
         if sel_subcats and "category_token" in filt.columns:
             filt = filt[filt["category_token"].isin(sel_subcats)]
         else:
