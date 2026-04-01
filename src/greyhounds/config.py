@@ -12,6 +12,7 @@ SOURCE_LABELS: dict[str, str] = {
     "top3": "Timeform Top 3",
     "forecast": "Timeform Forecast",
     "betfair_resultado": "Betfair Resultado Direto",
+    "xbtips": "XB Tips",
 }
 SOURCE_LABELS_INV: dict[str, str] = {v: k for k, v in SOURCE_LABELS.items()}
 
@@ -19,6 +20,8 @@ RULE_LABELS: dict[str, str] = {
     "lider_volume_total": "líder volume total",
     "terceiro_queda50": "terceiro_queda50",
     "forecast_odds": "Forecast Odds (Timeform)",
+    "lay_recommendation": "XB Tips - Lay Recommendation",
+    "back_recommendation": "XB Tips - Back Recommendation",
 }
 RULE_LABELS_INV: dict[str, str] = {v: k for k, v in RULE_LABELS.items()}
 

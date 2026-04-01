@@ -22,6 +22,7 @@ from src.greyhounds.config import RULE_LABELS, RULE_LABELS_INV, ENTRY_TYPE_LABEL
 from src.greyhounds.utils.text import normalize_track_name
 from src.greyhounds.utils.strategy_name import format_strategy_name
 from scripts.greyhounds.units_helper import get_ref_factor, get_scale, get_col, to_bool_series
+from scripts.greyhounds.stop_loss import apply_daily_stop_loss
 
 # Fator de referência global (definido em tempo de execução com base no dataset carregado).
 _REF_FACTOR: float = 10.0
@@ -1463,6 +1464,10 @@ def main() -> None:
         st.session_state["mf_commission_total"] = 0.0
     if "show_internal_signals_table" not in st.session_state:
         st.session_state["show_internal_signals_table"] = False
+    if "stop_loss_enabled" not in st.session_state:
+        st.session_state["stop_loss_enabled"] = False
+    if "stop_loss_threshold" not in st.session_state:
+        st.session_state["stop_loss_threshold"] = 10.0
 
     def _reset_rule_dependent_state() -> None:
         keys_to_clear = [
@@ -1834,6 +1839,8 @@ def main() -> None:
         ("terceiro_queda50", RULE_LABELS.get("terceiro_queda50", "terceiro_queda50")),
         ("lider_volume_total", RULE_LABELS.get("lider_volume_total", "líder volume total")),
         ("forecast_odds", RULE_LABELS.get("forecast_odds", "Forecast Odds (Timeform)")),
+        ("lay_recommendation", RULE_LABELS.get("lay_recommendation", "XB Tips - Lay Recommendation")),
+        ("back_recommendation", RULE_LABELS.get("back_recommendation", "XB Tips - Back Recommendation")),
     ]
     # Diagnóstico temporário (descomente para ver qual config está sendo importado):
     # import src.greyhounds.config as _cfg
@@ -1862,7 +1869,7 @@ def main() -> None:
             rule = "terceiro_queda50"
 
     with col_src:
-        source_options = ["top3", "forecast", "betfair_resultado"]
+        source_options = ["top3", "forecast", "betfair_resultado", "xbtips"]
         source_label_options = [SOURCE_LABELS.get(opt, opt) for opt in source_options]
         if "source_select_label" not in st.session_state:
             st.session_state["source_select_label"] = source_label_options[0]
@@ -2988,8 +2995,60 @@ def main() -> None:
     if not is_consolidated and entry_type != "both":
         filt = filt[filt["entry_type"] == entry_type]
 
-    filt = st.session_state["_filt"]
-    df_filtered = st.session_state["_df_filtered"]
+    # Stop loss: aplicar ANTES dos widgets. Em "Ambos", aplicar separadamente a back e a lay (por dia).
+    _stop_enabled = st.session_state.get("stop_loss_enabled", False)
+    _stop_threshold = float(st.session_state.get("stop_loss_threshold", 10.0))
+    if _stop_enabled and _stop_threshold > 0 and not filt.empty:
+        if entry_type == "both":
+            back_mask = filt["entry_type"] == "back"
+            lay_mask = filt["entry_type"] == "lay"
+            filt_back, stats_back = apply_daily_stop_loss(filt[back_mask].copy(), _stop_threshold)
+            filt_lay, stats_lay = apply_daily_stop_loss(filt[lay_mask].copy(), _stop_threshold)
+            filt = pd.concat([filt_back, filt_lay], ignore_index=True)
+            filt = filt.sort_values("race_time_iso").reset_index(drop=True)
+            st.session_state["_stop_loss_stats"] = {
+                "dias_stopados": stats_back["dias_stopados"] + stats_lay["dias_stopados"],
+                "dias_stopados_back": stats_back["dias_stopados"],
+                "dias_stopados_lay": stats_lay["dias_stopados"],
+            }
+        else:
+            filt, _stop_stats = apply_daily_stop_loss(filt, _stop_threshold)
+            st.session_state["_stop_loss_stats"] = _stop_stats
+    else:
+        st.session_state["_stop_loss_stats"] = {"dias_stopados": 0, "dias_stopados_back": 0, "dias_stopados_lay": 0}
+    st.session_state["_filt_display"] = filt
+    filt = st.session_state["_filt_display"]
+    _filt_display = filt
+
+    # Stop loss por dia: UI (widgets atualizam session_state para a proxima execucao)
+    stop_col1, stop_col2, stop_col3 = st.columns([1, 1, 4])
+    with stop_col1:
+        st.checkbox(
+            "Aplicar stop loss por dia",
+            value=_stop_enabled,
+            key="stop_loss_enabled",
+            help="Quando ativo, apostas do dia sao zeradas apos o prejuizo acumulado do dia atingir o limiar.",
+        )
+    with stop_col2:
+        st.number_input(
+            "Limiar (unidades)",
+            min_value=0.0,
+            max_value=1000.0,
+            value=_stop_threshold,
+            step=1.0,
+            format="%.0f",
+            key="stop_loss_threshold",
+            help="Parar apostas do dia quando prejuizo acumulado do dia atingir este valor (em unidades).",
+            disabled=not _stop_enabled,
+        )
+    with stop_col3:
+        if _stop_enabled:
+            _n = st.session_state["_stop_loss_stats"].get("dias_stopados", 0)
+            st.caption(f"Dias stopados: {_n}")
+            if entry_type == "both":
+                _nb = st.session_state["_stop_loss_stats"].get("dias_stopados_back", 0)
+                _nl = st.session_state["_stop_loss_stats"].get("dias_stopados_lay", 0)
+                st.caption("Em 'Ambos', o stop e aplicado separadamente a back e a lay (por dia). Back: %d | Lay: %d" % (_nb, _nl))
 
     # Seletor global do eixo X para graficos de evolucao
     x_axis_mode = st.radio(
@@ -3149,6 +3208,15 @@ def main() -> None:
                         .mark_rule(color="red", strokeWidth=1)
                         .encode(y="y:Q")
                     )
+                    layer_list_dd = [zero_line_dd]
+                    if _stop_enabled and _stop_threshold > 0:
+                        threshold_y = -float(_stop_threshold) * scale_factor
+                        threshold_line_dd = (
+                            alt.Chart(pd.DataFrame({"y": [threshold_y]}))
+                            .mark_rule(color="orange", strokeWidth=1, strokeDash=[4, 2])
+                            .encode(y="y:Q")
+                        )
+                        layer_list_dd.append(threshold_line_dd)
                     min_line = (
                         alt.Chart(stake_dd)
                         .mark_line()
@@ -3169,8 +3237,10 @@ def main() -> None:
                             color=alt.value("#06D6A0"),
                         )
                     )
+                    layer_list_dd.extend([min_line, close_line])
+                    st.caption("Linha vermelha: zero. Linha laranja tracejada: limiar do stop (quando ativo). O minimo pode atingir o limiar no momento em que o stop e acionado.")
                     st.altair_chart(
-                        alt.layer(zero_line_dd, min_line, close_line).configure_view(stroke="#888", strokeWidth=1),
+                        alt.layer(*layer_list_dd).configure_view(stroke="#888", strokeWidth=1),
                         use_container_width=True,
                     )
 
@@ -3530,7 +3600,7 @@ def main() -> None:
 
         st.subheader("Dispersao do value_ratio")
         if entry_type == "both":
-            df_back = filt[filt["entry_type"] == "back"]
+            df_back = _filt_display[_filt_display["entry_type"] == "back"]
             s_back = _value_ratio_stats(df_back)
             st.markdown("**BACK**")
             c1, c2, c3, c4 = st.columns(4)
@@ -3573,7 +3643,7 @@ def main() -> None:
 
         st.subheader("Dispersao do retorno por aposta (pnl_stake_ref)")
         if entry_type == "both":
-            df_back = filt[filt["entry_type"] == "back"]
+            df_back = _filt_display[_filt_display["entry_type"] == "back"]
             s_back = _pnl_return_stats(df_back)
             st.markdown("**BACK**")
             c1, c2, c3, c4 = st.columns(4)
@@ -3597,14 +3667,14 @@ def main() -> None:
             with c4:
                 st.metric("var (variância)", f"{s['var']:.4f}" if not pd.isna(s["var"]) else "-")
 
-    # Enriquecimento feito antes; agora renderizacao por bloco
+    # Enriquecimento feito antes; agora renderizacao por bloco (usa _filt_display = filt com stop aplicado)
     if entry_type == "both":
-        render_block("Resultados BACK", filt[filt["entry_type"] == "back"], "back")
+        render_block("Resultados BACK", _filt_display[_filt_display["entry_type"] == "back"], "back")
         def _render_dispersao_lay() -> None:
-            if "value_ratio" in filt.columns and not filt.empty:
+            if "value_ratio" in _filt_display.columns and not _filt_display.empty:
                 st.subheader("Dispersao do value_ratio")
                 st.markdown("**LAY**")
-                s_lay = _value_ratio_stats(filt[filt["entry_type"] == "lay"])
+                s_lay = _value_ratio_stats(_filt_display[_filt_display["entry_type"] == "lay"])
                 c1, c2, c3, c4 = st.columns(4)
                 with c1:
                     st.metric("n (quantidade de apostas)", s_lay["n"])
@@ -3617,7 +3687,7 @@ def main() -> None:
             if _has_pnl_col:
                 st.subheader("Dispersao do retorno por aposta (pnl_stake_ref)")
                 st.markdown("**LAY**")
-                s_lay_pnl = _pnl_return_stats(filt[filt["entry_type"] == "lay"])
+                s_lay_pnl = _pnl_return_stats(_filt_display[_filt_display["entry_type"] == "lay"])
                 c1, c2, c3, c4 = st.columns(4)
                 with c1:
                     st.metric("n (quantidade de apostas)", s_lay_pnl["n"])
@@ -3629,14 +3699,14 @@ def main() -> None:
                     st.metric("var (variância)", f"{s_lay_pnl['var']:.4f}" if not pd.isna(s_lay_pnl["var"]) else "-")
         render_block(
             "Resultados LAY",
-            filt[filt["entry_type"] == "lay"],
+            _filt_display[_filt_display["entry_type"] == "lay"],
             "lay",
             extra_after_subheader=_render_dispersao_lay,
         )
         if not is_consolidated:
             base_amount_both = float(st.session_state.get("base_amount", 1.0))
-            s_back = _compute_summary_metrics(filt[filt["entry_type"] == "back"], "back", base_amount_both)
-            s_lay = _compute_summary_metrics(filt[filt["entry_type"] == "lay"], "lay", base_amount_both)
+            s_back = _compute_summary_metrics(_filt_display[_filt_display["entry_type"] == "back"], "back", base_amount_both)
+            s_lay = _compute_summary_metrics(_filt_display[_filt_display["entry_type"] == "lay"], "lay", base_amount_both)
             total_pnl_both = s_back["pnl_stake"] + s_lay["pnl_stake"]
             total_base_both = s_back["base_stake"] + s_lay["base_stake"]
             st.session_state["export_pnl"] = total_pnl_both
@@ -3794,6 +3864,15 @@ def main() -> None:
                         .mark_rule(color="red", strokeWidth=1)
                         .encode(y="y:Q")
                     )
+                    layer_list_dd = [zero_line_dd]
+                    if _stop_enabled and _stop_threshold > 0:
+                        threshold_y = -float(_stop_threshold) * scale_factor
+                        threshold_line_dd = (
+                            alt.Chart(pd.DataFrame({"y": [threshold_y]}))
+                            .mark_rule(color="orange", strokeWidth=1, strokeDash=[4, 2])
+                            .encode(y="y:Q")
+                        )
+                        layer_list_dd.append(threshold_line_dd)
                     min_line = (
                         alt.Chart(stake_dd)
                         .mark_line()
@@ -3814,8 +3893,10 @@ def main() -> None:
                             color=alt.value("#06D6A0"),
                         )
                     )
+                    layer_list_dd.extend([min_line, close_line])
+                    st.caption("Linha vermelha: zero. Linha laranja tracejada: limiar do stop (quando ativo). O minimo pode atingir o limiar no momento em que o stop e acionado.")
                     st.altair_chart(
-                        alt.layer(zero_line_dd, min_line, close_line).configure_view(stroke="#888", strokeWidth=1),
+                        alt.layer(*layer_list_dd).configure_view(stroke="#888", strokeWidth=1),
                         use_container_width=True,
                     )
 
@@ -4467,12 +4548,12 @@ def main() -> None:
 
     # Renderizacao dos blocos na ordem BACK depois LAY, agrupando cross charts junto
     if entry_type == "both":
-        _render_small_charts(filt[filt["entry_type"] == "back"], "back")
-        _render_cross_nr_category(filt[filt["entry_type"] == "back"], "back")
-        _render_cross_nr_track(filt[filt["entry_type"] == "back"], "back")
-        _render_small_charts(filt[filt["entry_type"] == "lay"], "lay")
-        _render_cross_nr_category(filt[filt["entry_type"] == "lay"], "lay")
-        _render_cross_nr_track(filt[filt["entry_type"] == "lay"], "lay")
+        _render_small_charts(_filt_display[_filt_display["entry_type"] == "back"], "back")
+        _render_cross_nr_category(_filt_display[_filt_display["entry_type"] == "back"], "back")
+        _render_cross_nr_track(_filt_display[_filt_display["entry_type"] == "back"], "back")
+        _render_small_charts(_filt_display[_filt_display["entry_type"] == "lay"], "lay")
+        _render_cross_nr_category(_filt_display[_filt_display["entry_type"] == "lay"], "lay")
+        _render_cross_nr_track(_filt_display[_filt_display["entry_type"] == "lay"], "lay")
     else:
         _render_small_charts(filt[filt["entry_type"] == entry_type], entry_type)
         _render_cross_nr_category(filt[filt["entry_type"] == entry_type], entry_type)
