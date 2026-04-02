@@ -7,11 +7,14 @@ sys.path.append(str(PROJECT_ROOT))
 
 from src.greyhounds.utils.text import normalize_track_name, clean_greyhound_name
 from src.greyhounds.analysis.signals import load_betfair_win
+from src.greyhounds.utils.files import write_dataframe_snapshots
 
 def process_xbtips_to_signals():
     raw_dir = PROJECT_ROOT / "data" / "greyhounds" / "xbtips" / "raw"
     out_dir = PROJECT_ROOT / "data" / "greyhounds" / "signals"
     out_dir.mkdir(exist_ok=True, parents=True)
+    processed_dir = PROJECT_ROOT / "data" / "greyhounds" / "processed" / "signals"
+    processed_dir.mkdir(exist_ok=True, parents=True)
     
     if not raw_dir.exists():
         print("Pasta raw nao encontrada.")
@@ -86,13 +89,18 @@ def process_xbtips_to_signals():
             "roi_row_stake_fixed_10": 0.0,
             "roi_row_liability_fixed_10": 0.0,
             "roi_row_exposure_fixed_10": 0.0,
+            # Enriquecimento (evita build_num_runners_index no dashboard)
+            "num_runners": pd.NA,
+            "category": row["category"] if "category" in row.index else "",
         }
         
         group = bf_win_index.get((track_key, race_iso))
         if group:
-            # Calcule total volume da corrida para nao ser filtrado pelo Streamlit (min >= 2000 por padrao)
+            # Total volume da corrida
             total_vol = sum(r.pptradedvol for r in group.values())
             rec["total_matched_volume"] = total_vol
+            # num_runners direto do grupo (evita _build_num_runners_index no dashboard)
+            rec["num_runners"] = len(group)
             
             # Try to match by name
             runner = group.get(dog_clean)
@@ -171,19 +179,26 @@ def process_xbtips_to_signals():
     # Save lay recommendations
     df_lay = sig_df[sig_df["entry_type"] == "lay"]
     if not df_lay.empty:
-        # Filtra corrompidos onde BSP não foi localizado para ficar limpo
         df_lay = df_lay.dropna(subset=["lay_target_bsp"])
-        out_lay = out_dir / "signals_xbtips_win_lay_recommendation.csv"
-        df_lay.to_csv(out_lay, index=False)
-        print(f"Gerado {out_lay.name} ({len(df_lay)} linhas)")
-        
+        base_lay = "signals_xbtips_win_lay_recommendation"
+        write_dataframe_snapshots(
+            df_lay,
+            raw_path=out_dir / f"{base_lay}.csv",
+            parquet_path=processed_dir / f"{base_lay}.parquet",
+        )
+        print(f"Gerado {base_lay}.csv ({len(df_lay)} linhas) + .parquet")
+
     # Save back recommendations
     df_back = sig_df[sig_df["entry_type"] == "back"]
     if not df_back.empty:
         df_back = df_back.dropna(subset=["back_target_bsp"])
-        out_back = out_dir / "signals_xbtips_win_back_recommendation.csv"
-        df_back.to_csv(out_back, index=False)
-        print(f"Gerado {out_back.name} ({len(df_back)} linhas)")
+        base_back = "signals_xbtips_win_back_recommendation"
+        write_dataframe_snapshots(
+            df_back,
+            raw_path=out_dir / f"{base_back}.csv",
+            parquet_path=processed_dir / f"{base_back}.parquet",
+        )
+        print(f"Gerado {base_back}.csv ({len(df_back)} linhas) + .parquet")
 
 if __name__ == "__main__":
     process_xbtips_to_signals()
