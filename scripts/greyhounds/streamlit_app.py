@@ -14,6 +14,7 @@ import re
 from dateutil import parser as date_parser
 import altair as alt
 
+st.set_page_config(page_title="Greyhounds", layout="wide")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(PROJECT_ROOT))
 
@@ -561,6 +562,11 @@ def _apply_filters_to_df_filtered(
         if session_state.get("only_value_bets", False) and "value_ratio" in filt.columns:
             filt = filt[filt["value_ratio"].fillna(0.0) >= 1.0]
 
+    if rule == "lay_gemini":
+        min_conf = float(session_state.get("min_confidence", 0.0))
+        if "score" in filt.columns:
+            filt = filt[pd.to_numeric(filt["score"], errors="coerce").fillna(0.0) >= min_conf]
+
     if "tracks_ms" in session_state:
         sel_tracks = session_state["tracks_ms"]
         if sel_tracks and "track_name" in filt.columns:
@@ -894,13 +900,14 @@ CORE_STATE_KEYS = [
 
 RULE_EXTRA_KEYS: dict[str, List[str]] = {
     "forecast_odds": ["forecast_rank_ms", "value_ratio_min", "value_ratio_max", "only_value_bets"],
+    "lay_gemini": ["min_confidence"],
 }
 
 # Ordem estavel para export do pacote: basicos primeiro, depois resto alfabetico
 _EXPORT_BASIC_ORDER = (
     ["strategy_name", "created_at", "import_filename", "rule_select_label", "source_select_label", "market", "entry_type"]
     + list(CORE_STATE_KEYS)
-    + ["forecast_rank_ms", "value_ratio_min", "value_ratio_max", "only_value_bets"]
+    + ["forecast_rank_ms", "value_ratio_min", "value_ratio_max", "only_value_bets", "min_confidence"]
 )
 
 
@@ -1424,7 +1431,6 @@ def load_signals_enriched(
 
 
 def main() -> None:
-    st.set_page_config(page_title="Sinais LAY/BACK - Galgos", layout="wide")
     # Inicializacao do modo consolidado e estrategias
     if "consolidated_strategies" not in st.session_state:
         st.session_state["consolidated_strategies"] = []
@@ -1546,6 +1552,97 @@ def main() -> None:
         st.session_state["applied_strategy"] = None
 
     st.title("Sinais LAY/BACK - Estrategias Greyhounds")
+    
+    if "view_entradas" not in st.session_state:
+        # Verifica se a URL tem ?view=sinais para abrir direto
+        if "view" in st.query_params and st.query_params["view"] == "sinais":
+            st.session_state["view_entradas"] = True
+        else:
+            st.session_state["view_entradas"] = False
+        
+    def _toggle_entradas():
+        st.session_state["view_entradas"] = not st.session_state["view_entradas"]
+        # Atualiza a URL para facilitar os favoritos
+        if st.session_state["view_entradas"]:
+            st.query_params["view"] = "sinais"
+        else:
+            st.query_params.clear()
+
+    col_nav, col_monitor, col_gen, _ = st.columns([2, 3, 2, 5])
+    col_nav.link_button("🐎 Ir para Cavalos", "http://localhost:8502", use_container_width=True)
+    
+    btn_label = "🔙 Voltar ao Laboratório" if st.session_state["view_entradas"] else "📝 Monitor de Entradas do Dia"
+    col_monitor.button(btn_label, use_container_width=True, on_click=_toggle_entradas)
+    
+    if st.session_state["view_entradas"]:
+        if col_gen.button("🔄 Gerar Sinais de Hoje", use_container_width=True, key="btn_force_gen_sinais"):
+            import subprocess
+            sport_sel = "greyhounds" if st.session_state.get("radio_sport_entradas", "Galgos") == "Galgos" else "horses"
+            with st.spinner("Gerando sinais..."):
+                subprocess.run([sys.executable, "scripts/generate_daily_entries.py", "--sport", sport_sel])
+            st.rerun()
+        st.markdown("Visualize de forma rápida e leve todos os sinais gerados pelo robô para o dia.")
+        
+        c_sport, c_date = st.columns([1, 1])
+        with c_sport:
+            sport_pt = st.radio("🎯 Selecione o Esporte", ["Galgos", "Cavalos"], horizontal=True, key="radio_sport_entradas")
+            sport = "greyhounds" if sport_pt == "Galgos" else "horses"
+        
+        with c_date:
+            selected_date = st.date_input("📅 Data dos Sinais", datetime.date.today(), key="date_entradas")
+        
+        date_str = selected_date.isoformat()
+        tips_dir = PROJECT_ROOT / "data" / "daily_tips" / sport
+        
+        st.divider()
+        
+        if not tips_dir.exists():
+            st.info(f"📁 O diretório de entradas para {sport_pt} não existe ainda ou está vazio.")
+        else:
+            cons_file = tips_dir / f"{date_str}_CONSOLIDADO.csv"
+            if cons_file.exists():
+                try:
+                    df_s = pd.read_csv(cons_file, dtype={"MarketId": str})
+                    if df_s.empty:
+                        st.warning(f"O arquivo `{cons_file.name}` foi encontrado, mas está vazio.")
+                    else:
+                        c_f1, c_f2 = st.columns(2)
+                        with c_f1:
+                            tracks_s = sorted(df_s["EventName"].dropna().unique().tolist())
+                            sel_tracks_s = st.multiselect("🔍 Filtrar por Pista", tracks_s, placeholder="Todas as pistas...", key="ms_tracks_s")
+                        with c_f2:
+                            if "BetType" in df_s.columns:
+                                bet_types_s = sorted(df_s["BetType"].dropna().unique().tolist())
+                                sel_bets_s = st.multiselect("🔍 Filtrar por Tipo", bet_types_s, placeholder="Back/Lay...", key="ms_bets_s")
+                            else:
+                                sel_bets_s = []
+
+                        df_view = df_s.copy()
+                        if sel_tracks_s:
+                            df_view = df_view[df_view["EventName"].isin(sel_tracks_s)]
+                        if sel_bets_s:
+                            df_view = df_view[df_view["BetType"].isin(sel_bets_s)]
+
+                        cols_to_show = ["StartTime", "MarketId", "MarketType", "EventName", "SelectionName", "BetType", "MinPrice", "MaxPrice", "Provider"]
+                        cols_to_show = [c for c in cols_to_show if c in df_view.columns]
+                        
+                        df_display = df_view[cols_to_show]
+                        
+                        st.success(f"**{len(df_view)}** entradas encontradas para {sport_pt} em {date_str}.")
+                        st.dataframe(df_display, use_container_width=True, hide_index=True, height=600)
+                except Exception as e:
+                    st.error(f"Erro ao ler o arquivo consolidado: {e}")
+            else:
+                st.info(f"Nenhum arquivo consolidado encontrado para **{date_str}** em **{sport_pt}**.")
+                all_files_today = list(tips_dir.glob(f"{date_str}_*.csv"))
+                if all_files_today:
+                    st.write("Foram encontrados os seguintes arquivos individuais:")
+                    for f in all_files_today:
+                        st.code(f.name)
+                else:
+                    st.write("Nenhuma entrada de robô gerada para esse dia.")
+
+        st.stop()
 
     # (Sem CSS custom)  Restaurado layout padrao do Streamlit
 
@@ -1831,6 +1928,77 @@ def main() -> None:
                     use_container_width=True,
                 )
 
+    def _render_bsp_range_perf(df_block: pd.DataFrame, entry_kind: str) -> None:
+        """Barra por faixa de BSP com mesma logica dos demais graficos de desempenho."""
+        bsp_col = "lay_target_bsp" if entry_kind == "lay" else "back_target_bsp"
+        if entry_kind not in ("back", "lay"):
+            bsp_col = "back_target_bsp"
+        if df_block.empty or bsp_col not in df_block.columns:
+            return
+        base_amount = float(st.session_state.get("base_amount", 1.0))
+        ref_factor = _REF_FACTOR
+        scale_factor = get_scale(base_amount, ref_factor)
+        plot = df_block.copy()
+        plot["_bsp"] = pd.to_numeric(plot[bsp_col], errors="coerce")
+        plot = plot.dropna(subset=["_bsp"])
+        if plot.empty:
+            return
+
+        bins = [0, 2.00, 4.00, 6.00, 10.00, 15.00, 20.00, 30.00, 50.00, float("inf")]
+        labels = ["1.01-2.00", "2.01-4.00", "4.01-6.00", "6.01-10.00", "10.01-15.00", "15.01-20.00", "20.01-30.00", "30.01-50.00", "50.01+"]
+        plot["bsp_range"] = pd.cut(plot["_bsp"], bins=bins, labels=labels, right=True)
+        plot = plot.dropna(subset=["bsp_range"])
+        if plot.empty:
+            return
+
+        plot["_pnl_stake"] = get_col(plot, "pnl_stake_ref", "pnl_stake_fixed_10")
+        plot["_pnl_liab"] = get_col(plot, "pnl_liability_ref", "pnl_liability_fixed_10")
+        by_range = plot.groupby("bsp_range", as_index=False, observed=True)[["_pnl_stake", "_pnl_liab"]].sum()
+        if by_range.empty:
+            return
+        by_range["bsp_range"] = pd.Categorical(by_range["bsp_range"], categories=labels, ordered=True)
+        by_range = by_range.sort_values("bsp_range")
+        by_range["pnl_stake"] = by_range["_pnl_stake"] * scale_factor
+        if entry_kind == "lay":
+            by_range["pnl_liab"] = by_range["_pnl_liab"] * scale_factor
+
+        zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+        bar_stake = (
+            alt.Chart(by_range)
+            .mark_bar()
+            .encode(
+                x=alt.X("bsp_range:N", sort=labels, title=""),
+                y=alt.Y("pnl_stake:Q", title="PnL"),
+            )
+            .properties(width=small_width * 2, height=small_height)
+        )
+        stake_chart = alt.layer(zero_line, bar_stake)
+        with st.expander("Desempenho por faixa de BSP (PnL agregado)", expanded=False):
+            if entry_kind == "lay":
+                zero_line_liab = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeWidth=1).encode(y="y:Q")
+                bar_liab = (
+                    alt.Chart(by_range)
+                    .mark_bar(color="#8888FF")
+                    .encode(
+                        x=alt.X("bsp_range:N", sort=labels, title=""),
+                        y=alt.Y("pnl_liab:Q", title="PnL"),
+                    )
+                    .properties(width=small_width * 2, height=small_height)
+                )
+                liab_chart = alt.layer(zero_line_liab, bar_liab)
+                st.altair_chart(
+                    alt.vconcat(
+                        stake_chart.properties(title="Stake"),
+                        liab_chart.properties(title="Liability"),
+                    ).resolve_scale(y="independent").configure_view(stroke="#888", strokeWidth=1),
+                    use_container_width=True,
+                )
+            else:
+                st.altair_chart(
+                    stake_chart.configure_view(stroke="#888", strokeWidth=1).properties(title="Stake"),
+                    use_container_width=True,
+                )
+
     # seletores de regra, fonte, mercado e tipo de entrada
     # Controles principais mais compactos; coluna extra para respiro
     col_rule, col_src, col_mkt, col_entry, _ = st.columns([1, 1, 1, 1, 2])
@@ -1841,6 +2009,7 @@ def main() -> None:
         ("forecast_odds", RULE_LABELS.get("forecast_odds", "Forecast Odds (Timeform)")),
         ("lay_recommendation", RULE_LABELS.get("lay_recommendation", "XB Tips - Lay Recommendation")),
         ("back_recommendation", RULE_LABELS.get("back_recommendation", "XB Tips - Back Recommendation")),
+        ("lay_gemini", RULE_LABELS.get("lay_gemini", "Gemini Flash - Lay Analyst")),
     ]
     # Diagnóstico temporário (descomente para ver qual config está sendo importado):
     # import src.greyhounds.config as _cfg
@@ -1869,7 +2038,7 @@ def main() -> None:
             rule = "terceiro_queda50"
 
     with col_src:
-        source_options = ["top3", "forecast", "betfair_resultado", "xbtips"]
+        source_options = ["top3", "forecast", "betfair_resultado", "xbtips", "gemini"]
         source_label_options = [SOURCE_LABELS.get(opt, opt) for opt in source_options]
         if "source_select_label" not in st.session_state:
             st.session_state["source_select_label"] = source_label_options[0]
@@ -2085,6 +2254,24 @@ def main() -> None:
         if st.button("Limpar consolidadas", key="clear_consolidated_btn"):
             st.session_state["pending_clear_consolidated"] = True
             st.rerun()
+
+    st.divider()
+    st.subheader("🤖 Automação do Robô (Entradas de Hoje)")
+    st.write("Salve a estratégia que você acabou de configurar acima na pasta do robô. Toda madrugada, o robô irá gerar os sinais de HOJE automaticamente com base nessas estratégias salvas.")
+    if st.button("Salvar Estratégia Atual para o Robô", disabled=is_consolidated):
+            import os
+            from pathlib import Path
+            bot_dir = Path("config/bot_strategies/greyhounds")
+            bot_dir.mkdir(parents=True, exist_ok=True)
+            strat_name = snapshot.get("strategy_name", "Estrategia")
+            safe_name = "".join(c for c in strat_name if c.isalnum() or c in (' ', '_')).replace(' ', '_')
+            if not safe_name: safe_name = "Estrategia"
+            filename = f"{safe_name}.csv"
+            out_path = bot_dir / filename
+            with open(out_path, "wb") as f:
+                f.write(csv_bytes)
+            st.success(f"Estratégia salva para o Robô em: {bot_dir.name}/{filename}")
+    st.divider()
 
     # UI condicional: consolidado, estrategia aplicada ou default
     if is_consolidated:
@@ -2962,6 +3149,25 @@ def main() -> None:
             if not is_consolidated and only_value_bets:
                 filt = filt[filt["value_ratio"].fillna(0.0) >= 1.0]
 
+    if rule == "lay_gemini":
+        st.caption("Filtros Gemini")
+        if "min_confidence" not in st.session_state:
+            st.session_state["min_confidence"] = 0.0
+            
+        col_gem, _ = st.columns([1, 2])
+        with col_gem:
+            min_confidence = st.slider(
+                "Confiança Mínima",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(st.session_state["min_confidence"]),
+                step=0.05,
+                key="min_confidence",
+                disabled=is_consolidated,
+            )
+        if not is_consolidated and "score" in filt.columns:
+            filt = filt[pd.to_numeric(filt["score"], errors="coerce").fillna(0.0) >= min_confidence]
+
     if not is_consolidated and sel_tracks:
         filt = filt[filt["track_name"].isin(sel_tracks)]
     if not is_consolidated and rule == "terceiro_queda50":
@@ -3025,7 +3231,6 @@ def main() -> None:
     with stop_col1:
         st.checkbox(
             "Aplicar stop loss por dia",
-            value=_stop_enabled,
             key="stop_loss_enabled",
             help="Quando ativo, apostas do dia sao zeradas apos o prejuizo acumulado do dia atingir o limiar.",
         )
@@ -3034,7 +3239,6 @@ def main() -> None:
             "Limiar (unidades)",
             min_value=0.0,
             max_value=1000.0,
-            value=_stop_threshold,
             step=1.0,
             format="%.0f",
             key="stop_loss_threshold",
@@ -3342,6 +3546,7 @@ def main() -> None:
         _render_trap_perf(df_block, entry_kind)
         _render_hour_bucket_perf(df_block, entry_kind)
         _render_forecast_rank_perf(df_block, entry_kind)
+        _render_bsp_range_perf(df_block, entry_kind)
 
         # Relatorio mensal (entre desempenho semanal e tabela)
         _render_monthly_table(df_block, entry_kind)
@@ -3999,6 +4204,7 @@ def main() -> None:
         _render_trap_perf(filt, entry_type)
         _render_hour_bucket_perf(filt, entry_type)
         _render_forecast_rank_perf(filt, entry_type)
+        _render_bsp_range_perf(filt, entry_type)
 
         # Relatorio mensal (entre desempenho semanal e tabela)
         _render_monthly_table(filt, entry_type)

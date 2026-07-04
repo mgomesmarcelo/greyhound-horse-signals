@@ -16,7 +16,7 @@ def main() -> None:
     project_root = Path(__file__).resolve().parents[2]
     os.chdir(project_root)
 
-    script_path = project_root / "scripts" / "greyhounds" / "streamlit_greyhounds_app.py"
+    script_path = project_root / "scripts" / "greyhounds" / "streamlit_app.py"
     if not script_path.exists():
         print(f"Arquivo não encontrado: {script_path}", file=sys.stderr)
         sys.exit(1)

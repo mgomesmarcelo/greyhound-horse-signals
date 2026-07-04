@@ -1534,6 +1534,8 @@ def load_signals_enriched(
 def main() -> None:
     st.set_page_config(page_title="Sinais LAY/BACK - Cavalos", layout="wide")
     st.title("Sinais LAY/BACK - Estratégias Cavalos")
+    col_nav, _ = st.columns([2, 10])
+    col_nav.link_button("🐕 Ir para Galgos", "http://localhost:8501", use_container_width=True)
 
     small_width = 360
     small_height = 180
@@ -1972,6 +1974,33 @@ def main() -> None:
         if st.button("Limpar consolidadas", key="clear_consolidated_btn"):
             st.session_state["pending_clear_consolidated"] = True
             st.rerun()
+
+    st.divider()
+    st.subheader("🤖 Automação do Robô (Entradas de Hoje)")
+    st.write("Salve a estratégia que você acabou de configurar acima na pasta do robô. Toda madrugada, o robô irá gerar os sinais de HOJE automaticamente com base nessas estratégias salvas.")
+    col_bot1, col_bot2 = st.columns(2)
+    with col_bot1:
+        if st.button("Salvar Estratégia Atual para o Robô", disabled=is_consolidated, use_container_width=True):
+            import os
+            from pathlib import Path
+            bot_dir = Path("config/bot_strategies/horses")
+            bot_dir.mkdir(parents=True, exist_ok=True)
+            strat_name = snapshot.get("strategy_name", "Estrategia")
+            safe_name = "".join(c for c in strat_name if c.isalnum() or c in (' ', '_')).replace(' ', '_')
+            if not safe_name: safe_name = "Estrategia"
+            filename = f"{safe_name}.csv"
+            out_path = bot_dir / filename
+            with open(out_path, "wb") as f:
+                f.write(csv_bytes)
+            st.success(f"Estratégia salva para o Robô em: {bot_dir.name}/{filename}")
+    with col_bot2:
+        if st.button("Forçar Geração de Sinais de Hoje Agora", use_container_width=True):
+            import subprocess
+            from datetime import date
+            today_str = date.today().isoformat()
+            subprocess.run([sys.executable, "scripts/generate_daily_entries.py", "--sport", "horses"])
+            st.success(f"Sinais gerados na pasta data/daily_tips/horses/")
+    st.divider()
 
     pending_after_upload = st.session_state.get("pending_strategy_import")
     if isinstance(pending_after_upload, list) and len(pending_after_upload) > 1:
