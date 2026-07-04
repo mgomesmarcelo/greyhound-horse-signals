@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import random
 import re
@@ -145,7 +145,20 @@ def scrape_timeform_for_races(race_rows: Iterable[Dict[str, str]]) -> List[Dict[
     driver = build_chrome_driver()
     results: List[Dict[str, object]] = []
     try:
-        driver.get(_TIMEFORM_HOME)
+        success_home = False
+        for attempt in range(3):
+            try:
+                driver.get(_TIMEFORM_HOME)
+                success_home = True
+                break
+            except Exception as e:
+                logger.warning(f"Falha ao acessar Timeform Home (tentativa {attempt + 1}/3): {e}")
+                time.sleep(2)
+        
+        if not success_home:
+            logger.error("Abortando scrape Timeform apos 3 tentativas na home.")
+            return results
+
         _accept_cookies(driver)
         _sleep_jitter("home")
 
@@ -168,25 +181,29 @@ def scrape_timeform_for_races(race_rows: Iterable[Dict[str, str]]) -> List[Dict[
             if not url:
                 continue
 
-            driver.get(url)
-            _sleep_jitter("race")
-            forecast = _extract_forecast(driver)
-            if forecast:
-                result_row: Dict[str, object] = {
-                    "track_name": track,
-                    "race_time_iso": race_time_iso,
-                    "TimeformForecast": forecast,
-                }
-                top3 = _extract_top3(driver)
-                if len(top3) > 0:
-                    result_row["TimeformTop1"] = top3[0]
-                if len(top3) > 1:
-                    result_row["TimeformTop2"] = top3[1]
-                if len(top3) > 2:
-                    result_row["TimeformTop3"] = top3[2]
-                results.append(result_row)
-                logger.debug(f"TimeformForecast coletado: {track} {race_time_iso}")
-            _sleep_jitter("post-race")
+            try:
+                driver.get(url)
+                _sleep_jitter("race")
+                forecast = _extract_forecast(driver)
+                if forecast:
+                    result_row: Dict[str, object] = {
+                        "track_name": track,
+                        "race_time_iso": race_time_iso,
+                        "TimeformForecast": forecast,
+                    }
+                    top3 = _extract_top3(driver)
+                    if len(top3) > 0:
+                        result_row["TimeformTop1"] = top3[0]
+                    if len(top3) > 1:
+                        result_row["TimeformTop2"] = top3[1]
+                    if len(top3) > 2:
+                        result_row["TimeformTop3"] = top3[2]
+                    results.append(result_row)
+                    logger.debug(f"TimeformForecast coletado: {track} {race_time_iso}")
+                _sleep_jitter("post-race")
+            except Exception as e:
+                logger.warning(f"Erro ao raspar corrida {track} {race_time_iso} em {url}: {e}")
+                continue
 
         logger.info(f"Raspagem Timeform concluida. Corridas com forecast: {len(results)}")
         return results

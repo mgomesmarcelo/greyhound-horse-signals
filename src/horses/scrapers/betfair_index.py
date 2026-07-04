@@ -1,7 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Dict, List
 from urllib.parse import urljoin
+import time
 
 from loguru import logger
 from selenium.webdriver.common.by import By
@@ -77,54 +78,85 @@ def scrape_betfair_index() -> List[Dict[str, str]]:
     logger.info("Iniciando scrape do indice da Betfair: {}", settings.BETFAIR_HORSE_RACING_URL)
     driver = build_chrome_driver()
     try:
-        driver.get(settings.BETFAIR_HORSE_RACING_URL)
+        success = False
+        for attempt in range(3):
+            try:
+                driver.get(settings.BETFAIR_HORSE_RACING_URL)
+                success = True
+                break
+            except Exception as e:
+                logger.warning(f"Falha ao acessar Betfair (tentativa {attempt + 1}/3): {e}")
+                time.sleep(2)
+        
+        if not success:
+            logger.error("Abortando scrape da Betfair apos 3 tentativas.")
+            return []
+
         _aceitar_cookies(driver)
         _selecionar_aba_gb_ire(driver)
 
         rows: List[Dict[str, str]] = []
-        try:
-            wait = WebDriverWait(driver, settings.SELENIUM_EXPLICIT_WAIT_SEC + 10)
-            wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".meeting-label")))
-            meetings = driver.find_elements(By.CSS_SELECTOR, ".country-content li.meeting-item, li.meeting-item")
-            if not meetings:
-                meetings = driver.find_elements(By.CSS_SELECTOR, ".meeting-label")
-                logger.debug("Fallback: usando labels de meeting.")
-            for meeting in meetings:
-                track_name = ""
-                try:
-                    track_name = meeting.find_element(By.CSS_SELECTOR, ".meeting-label").text.strip()
-                except Exception:
+        for retry in range(3):
+            try:
+                wait = WebDriverWait(driver, settings.SELENIUM_EXPLICIT_WAIT_SEC + 10)
+                wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".meeting-label")))
+                meetings = driver.find_elements(By.CSS_SELECTOR, ".country-content li.meeting-item, li.meeting-item")
+                if not meetings:
+                    meetings = driver.find_elements(By.CSS_SELECTOR, ".meeting-label")
+                    logger.debug("Fallback: usando labels de meeting.")
+                
+                rows_temp = []
+                for meeting in meetings:
+                    track_name = ""
                     try:
-                        track_name = meeting.text.strip()
+                        track_name = meeting.find_element(By.CSS_SELECTOR, ".meeting-label").text.strip()
+                    except Exception:
+                        try:
+                            track_name = meeting.text.strip()
+                        except Exception:
+                            pass
+
+                    race_links = []
+                    try:
+                        race_links = meeting.find_elements(By.CSS_SELECTOR, "ul.race-list li.race-information a.race-link")
                     except Exception:
                         pass
+                    for anchor in race_links:
+                        try:
+                            time_label = anchor.find_element(By.CSS_SELECTOR, ".label").text.strip()
+                        except Exception:
+                            time_label = ""
 
-                race_links = []
-                try:
-                    race_links = meeting.find_elements(By.CSS_SELECTOR, "ul.race-list li.race-information a.race-link")
-                except Exception:
-                    pass
-                for anchor in race_links:
-                    try:
-                        time_label = anchor.find_element(By.CSS_SELECTOR, ".label").text.strip()
-                    except Exception:
-                        time_label = ""
+                        href = anchor.get_attribute("href") or anchor.get_attribute("ng-href") or anchor.get_attribute("data-href")
+                        if not href:
+                            href = anchor.get_attribute("attr.href") or ""
 
-                    href = anchor.get_attribute("href") or anchor.get_attribute("ng-href") or anchor.get_attribute("data-href")
-                    if not href:
-                        href = anchor.get_attribute("attr.href") or ""
+                        if href and not href.startswith("http"):
+                            href = urljoin(settings.BETFAIR_BASE_URL, href.lstrip("/"))
 
-                    if href and not href.startswith("http"):
-                        href = urljoin(settings.BETFAIR_BASE_URL, href.lstrip("/"))
-
-                    rows.append({
-                        "track_name": track_name,
-                        "race_time_label": time_label,
-                        "race_time_iso": hhmm_to_today_iso(time_label) if time_label else "",
-                        "race_url": href,
-                    })
-        except TimeoutException:
-            logger.error("Timeout aguardando meetings. A pagina pode estar bloqueando headless/precisando de consentimento diferente.")
+                        rows_temp.append({
+                            "track_name": track_name,
+                            "race_time_label": time_label,
+                            "race_time_iso": hhmm_to_today_iso(time_label) if time_label else "",
+                            "race_url": href,
+                        })
+                
+                if len(rows_temp) > 0:
+                    rows = rows_temp
+                    break
+                else:
+                    logger.warning(f"Nenhuma corrida extraida na tentativa {retry + 1}/3. Recarregando...")
+                    driver.refresh()
+                    time.sleep(3)
+                    _selecionar_aba_gb_ire(driver)
+            except TimeoutException:
+                logger.warning(f"Timeout aguardando meetings na tentativa {retry + 1}/3. A pagina pode estar vazia. Recarregando...")
+                if retry < 2:
+                    driver.refresh()
+                    time.sleep(3)
+                    _selecionar_aba_gb_ire(driver)
+                else:
+                    logger.error("Falha definitiva ao carregar meetings apos 3 tentativas de refresh.")
 
         logger.info("Total de corridas encontradas: {}", len(rows))
         return rows

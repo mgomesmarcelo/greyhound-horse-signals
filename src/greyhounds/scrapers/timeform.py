@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import random
 import re
@@ -11,6 +11,7 @@ from loguru import logger
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from bs4 import BeautifulSoup
 
 from urllib.parse import urljoin
 
@@ -146,6 +147,43 @@ def _extract_top3(driver) -> List[str]:
     except Exception:
         return []
 
+def _extract_race_card(driver) -> Dict[str, object]:
+    """Extracts Traps and Race Category directly from the loaded Timeform page."""
+    try:
+        html = driver.page_source
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        category = ""
+        
+        # 1. Tenta pegar a categoria diretamente do elemento exato do Timeform
+        grade_b = soup.find('b', title="The grade/class of this race")
+        if grade_b:
+            category = grade_b.get_text(strip=True).replace('(', '').replace(')', '')
+            
+        # 2. Fallback: procura no texto da página, mas agora incluindo IV e outras siglas
+        if not category:
+            text = soup.get_text(" ", strip=True)
+            m = re.search(r'\b(A\d|D\d|S\d|B\d|HP|OR\d*|IT\d*|IV|HC)\b', text, re.IGNORECASE)
+            if m:
+                category = m.group(1).upper()
+            
+        runners = []
+        bodies = soup.find_all('tbody', class_='rpb')
+        for b in bodies:
+            trap = b.get('data-trap')
+            name_el = b.find('a', class_='rpb-greyhound')
+            if trap and name_el:
+                dog_name = clean_greyhound_name(name_el.get_text(strip=True))
+                runners.append({
+                    "trap": int(trap) if trap.isdigit() else trap,
+                    "name": dog_name
+                })
+                
+        return {"category": category, "runners": runners}
+    except Exception as e:
+        logger.debug(f"Failed to extract full race card: {e}")
+        return {"category": "", "runners": []}
+
 
 def _convert_forecast_to_decimal(raw: str) -> str:
     items = [part.strip() for part in raw.split(",") if part.strip()]
@@ -174,7 +212,20 @@ def scrape_timeform_for_races(race_rows: Iterable[Dict[str, str]]) -> Iterable[D
     logger.info("Iniciando raspagem Timeform para corridas filtradas pelo Betfair race_links.csv")
     driver = build_chrome_driver()
     try:
-        driver.get(_TIMEFORM_HOME)
+        success_home = False
+        for attempt in range(3):
+            try:
+                driver.get(_TIMEFORM_HOME)
+                success_home = True
+                break
+            except Exception as e:
+                logger.warning(f"Falha ao acessar Timeform Home (tentativa {attempt + 1}/3): {e}")
+                time.sleep(2)
+        
+        if not success_home:
+            logger.error("Abortando scrape Timeform apos 3 tentativas na home.")
+            return
+
         _accept_cookies(driver)
         _sleep_jitter("home")
 
@@ -199,26 +250,36 @@ def scrape_timeform_for_races(race_rows: Iterable[Dict[str, str]]) -> Iterable[D
             if not url:
                 continue
 
-            driver.get(url)
-            _sleep_jitter("race")
-            forecast = _extract_forecast(driver)
-            if forecast:
-                out_row: Dict[str, object] = {
-                    "track_name": track,
-                    "race_time_iso": race_time_iso,
-                    "TimeformForecast": forecast,
-                }
-                top3 = _extract_top3(driver)
-                if len(top3) > 0:
-                    out_row["TimeformTop1"] = top3[0]
-                if len(top3) > 1:
-                    out_row["TimeformTop2"] = top3[1]
-                if len(top3) > 2:
-                    out_row["TimeformTop3"] = top3[2]
-                logger.debug(f"TimeformForecast coletado: {track} {race_time_iso}")
-                count += 1
-                yield out_row
-            _sleep_jitter("post-race")
+            try:
+                driver.get(url)
+                _sleep_jitter("race")
+                forecast = _extract_forecast(driver)
+                if forecast:
+                    out_row: Dict[str, object] = {
+                        "track_name": track,
+                        "race_time_iso": race_time_iso,
+                        "TimeformForecast": forecast,
+                    }
+                    top3 = _extract_top3(driver)
+                    if len(top3) > 0:
+                        out_row["TimeformTop1"] = top3[0]
+                    if len(top3) > 1:
+                        out_row["TimeformTop2"] = top3[1]
+                    if len(top3) > 2:
+                        out_row["TimeformTop3"] = top3[2]
+                    
+                    # Extract Race Card (Category and Traps)
+                    card_details = _extract_race_card(driver)
+                    out_row["RaceCategory"] = card_details.get("category", "")
+                    out_row["Runners"] = card_details.get("runners", [])
+                    
+                    logger.debug(f"TimeformForecast coletado: {track} {race_time_iso}")
+                    count += 1
+                    yield out_row
+                _sleep_jitter("post-race")
+            except Exception as e:
+                logger.warning(f"Erro ao raspar corrida {track} {race_time_iso} em {url}: {e}")
+                continue
 
         logger.info(f"Raspagem Timeform concluida. Corridas com forecast: {count}")
         return
@@ -257,6 +318,25 @@ def _build_timeform_top3_df(rows: Iterable[Dict[str, object]]) -> pd.DataFrame:
         return pd.DataFrame([], columns=["track_name", "race_time_iso", "TimeformTop1", "TimeformTop2", "TimeformTop3"])
     return pd.DataFrame(data)
 
+def _build_timeform_cards_df(rows: Iterable[Dict[str, object]]) -> pd.DataFrame:
+    data = []
+    for row in rows:
+        track = row.get("track_name")
+        time_iso = row.get("race_time_iso")
+        category = row.get("RaceCategory", "")
+        runners = row.get("Runners", [])
+        for runner in runners:
+            data.append({
+                "track_name": track,
+                "race_time_iso": time_iso,
+                "category": category,
+                "trap": runner.get("trap"),
+                "greyhound_name": runner.get("name")
+            })
+            
+    if not data:
+        return pd.DataFrame([], columns=["track_name", "race_time_iso", "category", "trap", "greyhound_name"])
+    return pd.DataFrame(data)
 
 def save_timeform_forecast(
     rows: Iterable[Dict[str, object]],
@@ -274,5 +354,14 @@ def save_timeform_top3(
     parquet_path: Path,
 ) -> pd.DataFrame:
     df = _build_timeform_top3_df(rows)
+    write_dataframe_snapshots(df, raw_path=raw_path, parquet_path=parquet_path)
+    return df
+
+def save_timeform_cards(
+    rows: Iterable[Dict[str, object]],
+    raw_path: Path,
+    parquet_path: Path,
+) -> pd.DataFrame:
+    df = _build_timeform_cards_df(rows)
     write_dataframe_snapshots(df, raw_path=raw_path, parquet_path=parquet_path)
     return df

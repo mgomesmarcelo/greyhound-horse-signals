@@ -27,7 +27,16 @@ TARGET_COLUMNS = [
     "win_lose",
     "bsp",
     "pptradedvol",
+    "region",
 ]
+
+def _detect_region(menu_hint: str) -> str:
+    text = str(menu_hint or "").upper()
+    if "(AUS)" in text:
+        return "AUS"
+    if "(NZL)" in text:
+        return "NZL"
+    return "UK"
 
 _BSP_TWO_DEC_REGEX = re.compile(r"^\d+\.\d{2}$")
 _BANNED_REGEX = re.compile(r"\((?:AUS|NZL)\)")
@@ -103,12 +112,6 @@ def is_already_clean(df: pd.DataFrame) -> bool:
     if df.columns.tolist() != TARGET_COLUMNS:
         return False
 
-    # BANNED_REGEX só nas colunas textuais relevantes (bem mais barato)
-    for col in ("menu_hint", "event_name", "selection_name"):
-        if col in df.columns:
-            if df[col].astype(str).str.contains(_BANNED_REGEX, na=False).any():
-                return False
-
     # BSP precisa estar no formato X.XX (ou vazio)
     if "bsp" not in df.columns:
         return False
@@ -148,29 +151,11 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         if col not in out.columns:
             out[col] = ""
 
+    # adiciona a regiao baseada no menu_hint
+    out["region"] = out["menu_hint"].apply(_detect_region)
+
     # mantém somente as colunas alvo e na ordem
     out = out[TARGET_COLUMNS]
-
-    # remove linhas com (AUS|NZL) em campos textuais
-    mask_banned = False
-    for col in ("menu_hint", "event_name", "selection_name"):
-        mask_banned_col = out[col].astype(str).str.contains(_BANNED_REGEX, na=False)
-        mask_banned = mask_banned_col if isinstance(mask_banned, bool) else (mask_banned | mask_banned_col)
-
-    if not isinstance(mask_banned, bool) and mask_banned.any():
-        out = out.loc[~mask_banned].reset_index(drop=True)
-
-    def _is_banned_track(menu_hint: str) -> bool:
-        text = str(menu_hint or "").strip()
-        lower = text.lower()
-        if any(lower.startswith(prefix) for prefix in BANNED_TRACK_PREFIXES):
-            return True
-        normalized = normalize_track_name(text)
-        return normalized.lower() in BANNED_TRACK_NAMES
-
-    track_mask = out["menu_hint"].apply(_is_banned_track)
-    if track_mask.any():
-        out = out.loc[~track_mask].reset_index(drop=True)
 
     # formata BSP como texto X.XX
     out["bsp"] = out["bsp"].map(format_bsp_to_two_decimals)
@@ -210,7 +195,7 @@ def clean_results_dir(result_dir: Path, force: bool = False) -> int:
 
         df = normalize_columns(df)
 
-        missing = [col for col in TARGET_COLUMNS if col not in df.columns]
+        missing = [col for col in TARGET_COLUMNS if col not in df.columns and col != "region"]
         if missing:
             logger.error(
                 "Pulado {}: colunas ausentes após normalização ({})",

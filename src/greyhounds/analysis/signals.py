@@ -30,8 +30,8 @@ def _strip_trap_prefix(name: str) -> str:
     return _TRAP_PREFIX_RE.sub("", name or "").strip()
 
 
-def _extract_trap_number(name: str) -> int | None:
-    """Extrai número da trap a partir do prefixo do nome, limitado a 1-6."""
+def _extract_trap_number(name: str, max_trap: int = 6) -> int | None:
+    """Extrai número da trap a partir do prefixo do nome, limitado a max_trap."""
     match = _TRAP_NUMBER_RE.match(name or "")
     if not match:
         return None
@@ -39,7 +39,7 @@ def _extract_trap_number(name: str) -> int | None:
         val = int(match.group(1))
     except (TypeError, ValueError):
         return None
-    return val if 1 <= val <= 6 else None
+    return val if 1 <= val <= max_trap else None
 
 
 def _extract_track_from_menu_hint(menu_hint: str) -> str:
@@ -74,33 +74,57 @@ def _parse_forecast_all(text: str) -> List[Dict]:
     """Parseia o texto completo do TimeformForecast e retorna lista de itens com odds e rank.
 
     Formato esperado: "TimeformForecast : 2.88 Coolruss Izzy, 5.00 Day Tripper, ..."
-    Nao ha trap no forecast. Itens malformados sao ignorados (apenas o item, nao a corrida).
+    Ou (Betfair cru): "Spread The Glory 2.3 Hawkfield Bailey 3.3"
+    Nao ha trap no forecast. Itens malformados sao ignorados.
     """
     if not isinstance(text, str):
         return []
     stripped = re.sub(r"(?i)\btimeformforecast\s*:\s*", "", text.strip())
-    parts = [part.strip() for part in stripped.split(",") if isinstance(part, str) and part.strip()]
+    
     items: List[Dict] = []
-    for rank, part in enumerate(parts, start=1):
-        match = _FORECAST_ITEM_RE.match(part)
-        if not match:
-            continue
-        try:
-            odds_val = float(match.group(1))
-        except (TypeError, ValueError):
-            continue
-        name_raw = (match.group(2) or "").strip()
-        if not name_raw:
-            continue
-        name_clean = clean_greyhound_name(name_raw)
-        if not name_clean:
-            continue
-        items.append({
-            "forecast_rank": rank,
-            "forecast_odds": odds_val,
-            "forecast_name_clean": name_clean,
-            "forecast_name_raw": name_raw,
-        })
+    
+    if "," in stripped:
+        parts = [part.strip() for part in stripped.split(",") if isinstance(part, str) and part.strip()]
+        for rank, part in enumerate(parts, start=1):
+            match = _FORECAST_ITEM_RE.match(part)
+            if not match:
+                continue
+            try:
+                odds_val = float(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            name_raw = (match.group(2) or "").strip()
+            if not name_raw:
+                continue
+            name_clean = clean_greyhound_name(name_raw)
+            if not name_clean:
+                continue
+            items.append({
+                "forecast_rank": rank,
+                "forecast_odds": odds_val,
+                "forecast_name_clean": name_clean,
+                "forecast_name_raw": name_raw,
+            })
+    else:
+        matches = re.findall(r"([A-Za-z\s\'-]+?)\s+(\d+\.\d+|\d+)", stripped)
+        for rank, m in enumerate(matches, start=1):
+            name_raw = m[0].strip()
+            if not name_raw:
+                continue
+            name_clean = clean_greyhound_name(name_raw)
+            if not name_clean:
+                continue
+            try:
+                odds_val = float(m[1])
+            except (TypeError, ValueError):
+                continue
+            items.append({
+                "forecast_rank": rank,
+                "forecast_odds": odds_val,
+                "forecast_name_clean": name_clean,
+                "forecast_name_raw": name_raw,
+            })
+            
     return items
 
 
@@ -108,20 +132,34 @@ def _parse_forecast_top3(text: str) -> List[str]:
     if not isinstance(text, str):
         return []
     stripped = re.sub(r"(?i)\btimeformforecast\s*:\s*", "", text.strip())
-    parts = [part.strip() for part in stripped.split(",") if isinstance(part, str) and part.strip()]
+    
     names: List[str] = []
-    for part in parts:
-        match = re.match(r"^\s*\d+(?:\.\d+)?\s+(.+)$", part)
-        if match:
-            candidate = match.group(1).strip()
-        else:
-            candidate = re.sub(r"\s*\([^\)]*\)\s*$", "", part).strip()
-        candidate = _strip_trap_prefix(candidate)
-        cleaned = clean_greyhound_name(candidate)
-        if cleaned and cleaned not in names:
-            names.append(cleaned)
-        if len(names) >= 3:
-            break
+    
+    if "," in stripped:
+        parts = [part.strip() for part in stripped.split(",") if isinstance(part, str) and part.strip()]
+        for part in parts:
+            match = re.match(r"^\s*\d+(?:\.\d+)?\s+(.+)$", part)
+            if match:
+                candidate = match.group(1).strip()
+            else:
+                candidate = re.sub(r"\s*\([^\)]*\)\s*$", "", part).strip()
+            candidate = _strip_trap_prefix(candidate)
+            cleaned = clean_greyhound_name(candidate)
+            if cleaned and cleaned not in names:
+                names.append(cleaned)
+            if len(names) >= 3:
+                break
+    else:
+        matches = re.findall(r"([A-Za-z\s\'-]+?)\s+(\d+\.\d+|\d+)", stripped)
+        for m in matches:
+            candidate = m[0].strip()
+            candidate = _strip_trap_prefix(candidate)
+            cleaned = clean_greyhound_name(candidate)
+            if cleaned and cleaned not in names:
+                names.append(cleaned)
+            if len(names) >= 3:
+                break
+                
     return names
 
 
@@ -167,7 +205,9 @@ def _cache_dir() -> Path:
     return d
 
 
-def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
+from typing import Any
+
+def load_betfair_win(region_filter: str | None = None) -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
     all_files = _iter_result_paths("dwbfgreyhoundwin*")
     index: Dict[Tuple[str, str], Dict[str, RunnerBF]] = {}
 
@@ -186,7 +226,10 @@ def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
             logger.error("Falha ao ler {}: {}", path.name, exc)
             continue
 
-        required_cols = ["menu_hint", "event_dt", "selection_name", "pptradedvol", "bsp", "win_lose"]
+        if region_filter is not None and "region" in df.columns:
+            df = df[df["region"] == region_filter].copy()
+
+        required_cols = ["event_id", "menu_hint", "event_dt", "selection_name", "pptradedvol", "bsp", "win_lose"]
         for col in required_cols:
             if col not in df.columns:
                 df[col] = ""
@@ -197,12 +240,14 @@ def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
         df["selection_name_clean"] = (
             df["selection_name_raw"].map(_strip_trap_prefix).map(clean_greyhound_name)
         )
-        df["trap_number"] = df["selection_name_raw"].map(_extract_trap_number)
+        df["trap_number"] = df["selection_name_raw"].apply(
+            lambda x: _extract_trap_number(x, max_trap=10 if region_filter in ("AUS", "NZL") else 6)
+        )
         df["pptradedvol"] = pd.to_numeric(df["pptradedvol"], errors="coerce").fillna(0.0)
         df["bsp"] = pd.to_numeric(df["bsp"], errors="coerce")
         df["win_lose"] = pd.to_numeric(df["win_lose"], errors="coerce").fillna(0).astype(int)
 
-        for (track_key, race_iso), group in df.groupby(["track_key", "race_iso"], dropna=False):
+        for (track_key, race_iso), group in df.groupby(["track_key", "race_iso"]):
             if not track_key or not race_iso:
                 continue
             runners: Dict[str, RunnerBF] = index.setdefault((track_key, race_iso), {})
@@ -223,7 +268,7 @@ def load_betfair_win() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
     return index
 
 
-def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
+def load_betfair_place(region_filter: str | None = None) -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
     all_files = _iter_result_paths("dwbfgreyhoundplace*")
     index: Dict[Tuple[str, str], Dict[str, RunnerBF]] = {}
 
@@ -242,7 +287,10 @@ def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
             logger.error("Falha ao ler {}: {}", path.name, exc)
             continue
 
-        required_cols = ["menu_hint", "event_dt", "selection_name", "pptradedvol", "bsp", "win_lose"]
+        if region_filter is not None and "region" in df.columns:
+            df = df[df["region"] == region_filter].copy()
+
+        required_cols = ["event_id", "menu_hint", "event_dt", "selection_name", "pptradedvol", "bsp", "win_lose"]
         for col in required_cols:
             if col not in df.columns:
                 df[col] = ""
@@ -253,12 +301,14 @@ def load_betfair_place() -> Dict[Tuple[str, str], Dict[str, RunnerBF]]:
         df["selection_name_clean"] = (
             df["selection_name_raw"].map(_strip_trap_prefix).map(clean_greyhound_name)
         )
-        df["trap_number"] = df["selection_name_raw"].map(_extract_trap_number)
+        df["trap_number"] = df["selection_name_raw"].apply(
+            lambda x: _extract_trap_number(x, max_trap=10 if region_filter in ("AUS", "NZL") else 6)
+        )
         df["pptradedvol"] = pd.to_numeric(df["pptradedvol"], errors="coerce").fillna(0.0)
         df["bsp"] = pd.to_numeric(df["bsp"], errors="coerce")
         df["win_lose"] = pd.to_numeric(df["win_lose"], errors="coerce").fillna(0).astype(int)
 
-        for (track_key, race_iso), group in df.groupby(["track_key", "race_iso"], dropna=False):
+        for (track_key, race_iso), group in df.groupby(["track_key", "race_iso"]):
             if not track_key or not race_iso:
                 continue
             runners: Dict[str, RunnerBF] = index.setdefault((track_key, race_iso), {})
@@ -665,8 +715,8 @@ def _forecast_all_df_to_tf_rows(df: pd.DataFrame) -> List[dict]:
     return rows
 
 
-def _signal_race_selection_key(row: dict) -> Tuple[str, str, str]:
-    """Chave (race_id, selection_id) para um sinal: race_time_iso, track_name, nome do galgo."""
+def _signal_race_selection_key(row: dict) -> Tuple[str, str, str, str]:
+    """Chave (race_id, selection_id, entry_type) para um sinal: race_time_iso, track_name, nome do galgo, entry_type."""
     race_iso = row.get("race_time_iso") or ""
     track = row.get("track_name") or ""
     sel = (
@@ -675,22 +725,23 @@ def _signal_race_selection_key(row: dict) -> Tuple[str, str, str]:
         or row.get("lay_target_name")
         or ""
     )
-    return (race_iso, track, sel)
+    entry_type = row.get("entry_type") or ""
+    return (race_iso, track, sel, entry_type)
 
 
 def _dedupe_forecast_odds_signals_by_race_selection(
     result: List[dict], track_key: str, race_iso: str
 ) -> List[dict]:
-    """Garante no maximo um sinal por (race_id, selection_id). Duplicatas: mantem o primeiro, log warning."""
+    """Garante no maximo um sinal por (race_id, selection_id, entry_type). Duplicatas: mantem o primeiro, log warning."""
     if not result:
         return result
-    seen: Dict[Tuple[str, str, str], bool] = {}
+    seen: Dict[Tuple[str, str, str, str], bool] = {}
     unique: List[dict] = []
     for row in result:
         key = _signal_race_selection_key(row)
         if key in seen:
             logger.warning(
-                "forecast_odds: duplicata ignorada (nao deveria haver back e lay para o mesmo galgo/corrida): race_iso={!r} track={!r} selection={!r} entry_type={!r}",
+                "forecast_odds: duplicata ignorada (mesmo tipo de entrada para o mesmo galgo/corrida): race_iso={!r} track={!r} selection={!r} entry_type={!r}",
                 race_iso,
                 track_key,
                 key[2],
@@ -703,17 +754,17 @@ def _dedupe_forecast_odds_signals_by_race_selection(
 
 
 def _assert_forecast_odds_unique_race_selection(df: pd.DataFrame) -> None:
-    """Valida que forecast_odds nao tem duas linhas para o mesmo (race_id, selection_id). Log error se tiver."""
+    """Valida que forecast_odds nao tem duas linhas para o mesmo (race_id, selection_id, entry_type). Log error se tiver."""
     if df.empty or "race_time_iso" not in df.columns:
         return
-    keys: List[Tuple[str, str, str]] = []
+    keys: List[Tuple[str, str, str, str]] = []
     for _, row in df.iterrows():
         keys.append(_signal_race_selection_key(row))
     if len(keys) != len(set(keys)):
         counts = Counter(keys)
         dupes = [k for k, c in counts.items() if c > 1]
         logger.error(
-            "forecast_odds: violacao de unicidade (race_id, selection_id): existem {} chaves duplicadas; exemplos: {}",
+            "forecast_odds: violacao de unicidade (race_id, selection_id, entry_type): existem {} chaves duplicadas; exemplos: {}",
             len(dupes),
             dupes[:5],
         )
@@ -732,8 +783,10 @@ def _calc_signals_forecast_odds_for_race(
     -> back; se value_ratio <= FORECAST_ODDS_LAY_MAX_VALUE_RATIO -> lay; senao nao gera sinal (zona morta).
     PnL/ROI e schema iguais ao dashboard.
     """
-    track_key = tf_row["track_key"]
-    race_iso = tf_row["race_iso"]
+    track_key = tf_row.get("track_key", "")
+    race_iso = tf_row.get("race_iso", "")
+
+
     forecast_items = tf_row.get("forecast_items") or []
     raw = tf_row.get("raw") or {}
 
@@ -913,15 +966,15 @@ def _calc_signals_forecast_odds_for_race(
             ),
         }
 
-        # Direcao por value_ratio (back_target_bsp / forecast_odds): acima do minimo -> back;
-        # abaixo do maximo -> lay; entre os dois -> sem sinal
+        # Avaliacao independente para back e lay baseada nos limites do config
         if pd.isna(value_ratio):
             continue
+            
         if value_ratio >= settings.FORECAST_ODDS_BACK_MIN_VALUE_RATIO:
             result.append(out_back)
-        elif value_ratio <= settings.FORECAST_ODDS_LAY_MAX_VALUE_RATIO:
+            
+        if value_ratio <= settings.FORECAST_ODDS_LAY_MAX_VALUE_RATIO:
             result.append(out_lay)
-        # else: zona morta (entre lay_max e back_min), nao gera sinal
 
     # Garantia: no maximo um sinal por (race_id, selection_id) para forecast_odds
     result = _dedupe_forecast_odds_signals_by_race_selection(result, track_key, race_iso)
@@ -974,8 +1027,15 @@ def _calc_signals_for_race(
     leader_share_min: float = 0.5,
     cat_index: Dict[Tuple[str, str], Dict[str, str]] | None = None,
 ) -> List[dict]:
-    track_key = tf_row["track_key"]
-    race_iso = tf_row["race_iso"]
+    track_key = tf_row.get("track_key", "")
+    race_iso = tf_row.get("race_iso", "")
+    event_id = tf_row.get("event_id")
+    
+    if event_id and event_id in bf_win_index:
+        resolved = bf_win_index[event_id]
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            track_key, race_iso = resolved
+
     top_names = [name for name in tf_row["top_names"] if isinstance(name, str) and name]
     group = bf_win_index.get((track_key, race_iso))
     if not group:
@@ -1203,13 +1263,14 @@ def generate_signals(
     entry_type: str = "both",
     bf_win_index: Dict[Tuple[str, str], Dict[str, RunnerBF]] | None = None,
     bf_place_index: Dict[Tuple[str, str], Dict[str, RunnerBF]] | None = None,
+    region: str = "UK",
 ) -> pd.DataFrame:
     timings: Dict[str, float] = {}
 
     if bf_win_index is None:
-        bf_win_index = load_betfair_win()
+        bf_win_index = load_betfair_win(region_filter=region)
     if bf_place_index is None and market == "place":
-        bf_place_index = load_betfair_place()
+        bf_place_index = load_betfair_place(region_filter=region)
 
     t0 = time.perf_counter()
     cat_index = build_category_index_from_results()
@@ -1223,6 +1284,7 @@ def generate_signals(
         df_forecast = load_timeform_forecast_all()
         tf_rows = _forecast_all_df_to_tf_rows(df_forecast)
         use_forecast_odds = True
+
     elif source == "forecast":
         tf_rows = load_timeform_forecast_top3()
         use_forecast_odds = False

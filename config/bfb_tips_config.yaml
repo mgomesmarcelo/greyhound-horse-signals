@@ -1,0 +1,30 @@
+configuracoes_gerais:
+  diretorio_forecast: "data/greyhounds/TimeformForecast"
+  diretorio_output_bfb: "data/greyhounds/bfb_tips"
+  diretorio_logs_auditoria: "data/greyhounds/bfb_tips_logs"
+
+estrategias:
+  - nome: "Back_Win_Teste1"
+    mercado: "win"              # win ou placed
+    tipo_entrada: "back"        # back ou lay
+    filtros:
+      bsp_low: 5.0                # MinPrice para o BFB
+      bsp_high: 12.0              # MaxPrice para o BFB
+      value_ratio_min: 1.20       # Filtro do cão: odd_forecast / odd_real
+      value_ratio_max: 5.00       # Filtro do cão: odd_forecast / odd_real
+      forecast_rank_ms: [1, 2]    # Ranks aceitos do forecast
+      tracks_ms: ["Hove", "Monmore"] # Pistas aceitas (vazio = todas)
+      trap_ms: [1, 6]             # Traps aceitas
+      cats_ms: ["A", "D"]         # Categorias
+      num_runners_ms: [6]         # Número de cães na corrida
+      weekdays_ms: ["Seg", "Ter", "Qua", "Qui", "Sex", "Sab", "Dom"] # Só gera tips nestes dias
+
+  - nome: "Lay_Placed_Falso_Favorito"
+    mercado: "placed"           # win ou placed
+    tipo_entrada: "lay"         # back ou lay
+    filtros:
+      bsp_low: 1.5                # MinPrice para o BFB
+      bsp_high: 3.0               # MaxPrice para o BFB
+      value_ratio_min: 0.00       # Filtro do cão: odd_forecast / odd_real
+      value_ratio_max: 0.85       # Ex: odd real precisa ser MAIOR que odd forecast
+      forecast_rank_ms: [1]       # Apenas o favorito do forecast

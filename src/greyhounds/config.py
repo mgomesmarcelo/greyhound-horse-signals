@@ -13,6 +13,7 @@ SOURCE_LABELS: dict[str, str] = {
     "forecast": "Timeform Forecast",
     "betfair_resultado": "Betfair Resultado Direto",
     "xbtips": "XB Tips",
+    "gemini": "Gemini Flash AI",
 }
 SOURCE_LABELS_INV: dict[str, str] = {v: k for k, v in SOURCE_LABELS.items()}
 
@@ -22,6 +23,7 @@ RULE_LABELS: dict[str, str] = {
     "forecast_odds": "Forecast Odds (Timeform)",
     "lay_recommendation": "XB Tips - Lay Recommendation",
     "back_recommendation": "XB Tips - Back Recommendation",
+    "lay_gemini": "Gemini Flash - Lay Analyst",
 }
 RULE_LABELS_INV: dict[str, str] = {v: k for k, v in RULE_LABELS.items()}
 
@@ -32,6 +34,7 @@ TIMEFORM_TOP3_DIR = ensure_data_dir("greyhounds", "timeform_top3")
 TIMEFORM_FORECAST_DIR = ensure_data_dir("greyhounds", "TimeformForecast")
 RESULT_DIR = ensure_data_dir("greyhounds", "Result")
 RACE_LINKS_DIR = ensure_data_dir("greyhounds", "race_links")
+GEMINI_RAW_DIR = ensure_data_dir("greyhounds", "gemini_raw")
 
 PROCESSED_DIR = ensure_data_dir("greyhounds", "processed")
 PROCESSED_SIGNALS_DIR = ensure_data_dir("greyhounds", "processed", "signals")
@@ -67,8 +70,11 @@ class Settings:
     CSV_ENCODING: str = "utf-8-sig"
     LOG_LEVEL: str = "INFO"
     # forecast_odds: limites de value_ratio para gerar sinal (zona entre os dois = sem sinal)
-    FORECAST_ODDS_BACK_MIN_VALUE_RATIO: float = 1.00
-    FORECAST_ODDS_LAY_MAX_VALUE_RATIO: float = 1.00
+    FORECAST_ODDS_BACK_MIN_VALUE_RATIO: float = 0.00
+    FORECAST_ODDS_LAY_MAX_VALUE_RATIO: float = 1000.00
+    # Gemini Flash AI
+    GEMINI_MODEL: str = "gemini-3.1-flash-lite-preview"
+    GEMINI_TEMPERATURE: float = 0.2
 
 
 settings = Settings()
@@ -83,6 +89,7 @@ __all__ = [
     "TIMEFORM_FORECAST_DIR",
     "RESULT_DIR",
     "RACE_LINKS_DIR",
+    "GEMINI_RAW_DIR",
     "PROCESSED_DIR",
     "PROCESSED_SIGNALS_DIR",
     "PROCESSED_TIMEFORM_TOP3_DIR",

@@ -543,8 +543,8 @@ def _forecast_all_df_to_tf_rows(df: pd.DataFrame) -> List[dict]:
     return out
 
 
-def _signal_race_selection_key(row: dict) -> Tuple[str, str, str]:
-    """Chave (race_id, selection_id): race_time_iso, track_name, nome do cavalo."""
+def _signal_race_selection_key(row: dict) -> Tuple[str, str, str, str]:
+    """Chave (race_id, selection_id, entry_type): race_time_iso, track_name, nome do cavalo, entry_type."""
     race_iso = row.get("race_time_iso") or ""
     track = row.get("track_name") or ""
     sel = (
@@ -553,16 +553,17 @@ def _signal_race_selection_key(row: dict) -> Tuple[str, str, str]:
         or row.get("lay_target_name")
         or ""
     )
-    return (race_iso, track, sel)
+    entry_type = row.get("entry_type") or ""
+    return (race_iso, track, sel, entry_type)
 
 
 def _dedupe_forecast_odds_signals_by_race_selection(
     result: List[dict], track_key: str, race_iso: str
 ) -> List[dict]:
-    """No maximo um sinal por (race_id, selection_id). Duplicatas: mantem o primeiro."""
+    """No maximo um sinal por (race_id, selection_id, entry_type). Duplicatas: mantem o primeiro."""
     if not result:
         return result
-    seen: Dict[Tuple[str, str, str], bool] = {}
+    seen: Dict[Tuple[str, str, str, str], bool] = {}
     unique: List[dict] = []
     for row in result:
         key = _signal_race_selection_key(row)
@@ -578,18 +579,18 @@ def _dedupe_forecast_odds_signals_by_race_selection(
 
 
 def _assert_forecast_odds_unique_race_selection(df: pd.DataFrame) -> None:
-    """Valida que forecast_odds nao tem duas linhas para o mesmo (race_id, selection_id)."""
+    """Valida que forecast_odds nao tem duas linhas para o mesmo (race_id, selection_id, entry_type)."""
     if df.empty or "race_time_iso" not in df.columns:
         return
     from collections import Counter
-    keys: List[Tuple[str, str, str]] = []
+    keys: List[Tuple[str, str, str, str]] = []
     for _, row in df.iterrows():
         keys.append(_signal_race_selection_key(row.to_dict()))
     if len(keys) != len(set(keys)):
         counts = Counter(keys)
         dupes = [k for k, c in counts.items() if c > 1]
         logger.error(
-            "forecast_odds: violacao de unicidade (race_id, selection_id): {} duplicatas; exemplos: {}",
+            "forecast_odds: violacao de unicidade (race_id, selection_id, entry_type): {} duplicatas; exemplos: {}",
             len(dupes), dupes[:5],
         )
 
@@ -738,11 +739,14 @@ def _calc_signals_forecast_odds_for_race(
             ),
         }
 
+        # Avaliacao independente para back e lay baseada nos limites do config
         if pd.isna(value_ratio):
             continue
+            
         if value_ratio >= settings.FORECAST_ODDS_BACK_MIN_VALUE_RATIO:
             result.append(out_back)
-        elif value_ratio <= settings.FORECAST_ODDS_LAY_MAX_VALUE_RATIO:
+            
+        if value_ratio <= settings.FORECAST_ODDS_LAY_MAX_VALUE_RATIO:
             result.append(out_lay)
 
     result = _dedupe_forecast_odds_signals_by_race_selection(result, track_key, race_iso)

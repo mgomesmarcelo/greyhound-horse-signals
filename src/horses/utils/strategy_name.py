@@ -31,7 +31,10 @@ def format_strategy_name(
         entry = "both"
 
     if tracks_ms is not None and len(tracks_ms) > 0:
-        pistas_s = f"pistas:{len(tracks_ms)}"
+        if len(tracks_ms) == 1:
+            pistas_s = f"pista:{tracks_ms[0]}"
+        else:
+            pistas_s = f"pistas:{len(tracks_ms)}"
     else:
         pistas_s = "pistas:ALL"
 

@@ -41,11 +41,12 @@ def main(argv: list[str] | None = None) -> int:
         default=0.5,
         help="Participação mínima do líder para a regra lider_volume_total.",
     )
+    parser.add_argument("--region", default="UK", help="Regiao-alvo para gerar sinais (UK, AUS, NZL)")
     args = parser.parse_args(argv)
 
     markets = [args.market] if args.market != "both" else ["win", "place"]
-    bf_win_index = load_betfair_win()
-    bf_place_index = load_betfair_place() if "place" in markets else None
+    bf_win_index = load_betfair_win(region_filter=args.region)
+    bf_place_index = load_betfair_place(region_filter=args.region) if "place" in markets else None
 
     def _run_for(
         source_value: str,
@@ -62,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
             entry_type=args.entry_type,
             bf_win_index=bf_win,
             bf_place_index=bf_place,
+            region=args.region,
         )
         out_path = write_signals_csv(df, source=source_value, market=market_value, rule=rule_value)
         rule_label = RULE_LABELS.get(rule_value, rule_value)
