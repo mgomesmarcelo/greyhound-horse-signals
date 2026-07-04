@@ -1,12 +1,14 @@
-﻿# Projeto Unificado
+# Projeto Unificado
 
-Suite de raspagem, limpeza e análise de corridas de cavalos e galgos, com dashboards Streamlit e rotinas diárias para geração de sinais de aposta.
+Suite de raspagem, limpeza e análise de corridas de cavalos e galgos, com dashboards Streamlit, rotinas diárias para geração de sinais de aposta e integração direta com o **BF Bot Manager**.
 
 ## Visão geral
 - Coleta dados brutos da Betfair, Timeform e Sporting Life usando Selenium.
 - Padroniza e versiona arquivos em `data/` (CSV e Parquet) para histórico e consumo analítico.
 - Gera sinais configuráveis (estratégias LAY/BACK, mercados WIN/PLACE) e indicadores auxiliares.
+- **Exportação automatizada de dicas** configuradas por estratégias de *Value Ratio* e *Rank* diretamente para o formato CSV aceito pelo BF Bot Manager.
 - Disponibiliza dashboards interativos em Streamlit para inspeção rápida das corridas e dos sinais.
+- Possui estrutura para rodar como servidor em ambiente de nuvem (VPS) via API.
 
 ## Pré-requisitos
 - Python 3.9 ou superior.
@@ -16,38 +18,17 @@ Suite de raspagem, limpeza e análise de corridas de cavalos e galgos, com dashb
 ### Instalação rápida
 1. `python -m venv .venv`
 2. `.\.venv\Scripts\activate` (Windows) ou `source .venv/bin/activate` (Linux/macOS)
-3. `pip install -r requirements.txt` ou `pip install -e .`
-4. (Opcional) crie um `.env` na raiz para armazenar credenciais e chaves utilizadas pelos scrapers.
+3. `pip install -r requirements.txt`
+4. Configure as chaves de acesso essenciais no `.env` (opcional).
+5. Defina e personalize suas estratégias de aposta no arquivo `config/bfb_tips_config.yaml`.
 
 ## Estrutura do projeto
-- `src/core/`: helpers compartilhados (configuração de diretórios e caminhos).
-- `src/horses/`: scrapers, análises e utilitários específicos de corridas de cavalos.
-- `src/greyhounds/`: scrapers, análises e utilitários específicos de corridas de galgos.
-- `scripts/`: pontos de entrada em linha de comando (raspagem diária, geração de sinais, dashboards); subpastas separam cavalos (`scripts/horses/`) e galgos.
-- `data/`: armazenamento local (bruto e processado). A estrutura base é criada automaticamente:
-
-```
-data/
-  horses/
-    Result/
-    signals/
-    timeform_top3/
-    TimeformForecast/
-    betfair_top3/
-    sportinglife_top3/
-  greyhounds/
-    Result/
-    signals/
-    race_links/
-    timeform_top3/
-    TimeformForecast/
-    processed/
-      Result/
-      signals/
-      race_links/
-      timeform_top3/
-      TimeformForecast/
-```
+- `config/`: Arquivos de configuração de estratégias (ex: `bfb_tips_config.yaml`).
+- `src/core/`: Helpers compartilhados (configuração de diretórios e caminhos).
+- `src/horses/` e `src/greyhounds/`: Scrapers, análises e utilitários específicos.
+- `scripts/`: Pontos de entrada em linha de comando (raspagem diária, geração de sinais, dashboards).
+- `scripts/vps_setup/`: Scripts em lotes (`.bat`) para automação de inicialização na VPS.
+- `data/`: Armazenamento local (bruto e processado). A estrutura base é criada automaticamente.
 
 ## Fluxo de trabalho recomendado
 
@@ -63,43 +44,34 @@ data/
 
 ### Galgos (`greyhounds`)
 - **Raspagem diária:** `python -m src.greyhounds.run_daily`  
-  Busca o índice da Betfair e atualizações Timeform.
+  Busca o índice da Betfair e as atualizações do Timeform (utilizando o novo `betfair_race.py`).
 - **Limpeza opcional:** `python scripts/greyhounds/clean_greyhound_results.py [--force]`
-- **Geração de sinais:**  
-  `python scripts/greyhounds/generate_greyhound_signals.py --source both --market both --rule both --entry_type both`
+- **Geração de Sinais para BF Bot Manager:**  
+  `python scripts/greyhounds/gerar_dicas_bfb.py`  
+  Lê os forecasts raspados, aplica as regras definidas no `config/bfb_tips_config.yaml` (Filtros de Pista, Categoria, Ratio, etc) e salva os arquivos CSV na pasta de output pronta para o BFB ler. Também registra a auditoria na pasta de logs.
 - **Dashboard Streamlit:**  
-  `python scripts/greyhounds/run_greyhounds_streamlit.py --port 8501 --address 0.0.0.0`
+  `python scripts/greyhounds/run_greyhounds_streamlit.py --port 8501 --address 0.0.0.0` (acessa o `streamlit_app.py`)
 
 ### Pipeline completo
-- `python -m scripts.run_all_daily` executa `run_daily` de cavalos e galgos em sequência.
+- `python -m scripts.run_all_daily` executa a esteira `run_daily` tanto de cavalos quanto galgos em sequência.
 
-## Dashboards Streamlit
-- `scripts/horses/run_horses_streamlit.py`: filtros por pista, intervalo de datas, fonte (Timeform/Sporting Life) e estratégia; gráficos de ROI, drawdown e distribuição de odds.
-- `scripts/greyhounds/run_greyhounds_streamlit.py`: visão consolidada de sinais por regra, mercado e fonte; ranking de pistas/categorias, análise de desempenho e curvas acumuladas.
-- Parâmetros úteis:
-  - `--port`: porta HTTP (ex.: `--port 8502`).
-  - `--address`: endereço para bind (use `0.0.0.0` ao publicar na rede).
+## Infraestrutura e VPS (API)
+- **Servidor API:** `python scripts/api_server.py`  
+  Inicia o servidor backend FastAPI responsável pela integração sistêmica na nuvem.
+- **Automação VPS (`scripts/vps_setup/`):**
+  - `start_api.bat`: Inicia o servidor web.
+  - `start_dashboard_galgos.bat` / `start_dashboard_cavalos.bat`: Ativam o ambiente virtual e hospedam os dashboards em background.
+  - `run_automacao_diaria.bat`: Automação da esteira agendada.
 
 ## Scripts auxiliares
-- `python scripts/download_betfair_prices.py [opções]`  
-  Sincroniza históricos públicos Betfair SP para cavalos e galgos. Principais flags:
-  - `--dry-run` lista arquivos faltantes sem baixar.
-  - `--delay 2` ajusta a pausa entre downloads (default 1.5s).
-  - `--horses-start-date YYYY-MM-DD` / `--greyhounds-start-date YYYY-MM-DD` força a data inicial.
-  - `--max-downloads N` limita a quantidade por execução.
-- `python scripts/greyhounds/convert_greyhound_history.py --dataset <nome> [--force]`  
-  Converte CSV históricos de galgos para Parquet (datasets: `signals`, `timeform_top3`, `timeform_forecast`, `race_links`, `betfair_result`).
-- `python scripts/validate_data_layout.py`  
-  Validação leve dos nomes de arquivos e colunas esperadas em `data/`.
-- `python scripts/greyhounds/analyze_track_aliases.py`  
-  Gera relatório de aliases de pistas de galgos em `data/greyhounds/reports/track_alias_report.json` a partir dos CSVs brutos (`data/greyhounds/Result`).
+- **Segurança da Banca:** `python scripts/greyhounds/stop_loss.py`  
+  Script dedicado para gerenciar as métricas de segurança de parada (Stop Loss).
+- **Dados Históricos:** `python scripts/download_betfair_prices.py [opções]`  
+  Sincroniza os históricos públicos do Betfair SP.
+- **Otimização:** `python scripts/greyhounds/convert_greyhound_history.py --dataset <nome> [--force]`  
+  Converte CSVs históricos enormes para o formato Parquet.
 
-## Configurações
-- Ajuste `settings.LOG_LEVEL` em `src/horses/config.py` ou `src/greyhounds/config.py` para controlar a verbosidade dos logs.
-- As mesmas configurações permitem ligar/desligar `SELENIUM_HEADLESS` e alterar timeouts ou diretórios base.
-- As rotinas utilizam `utf-8-sig` por padrão nas leituras/escritas CSV; mantenha o encoding ao criar arquivos externos.
-
-## Boas práticas
-- Execute os scrapers em horários espaçados para evitar bloqueios nas fontes externas.
-- Revise os diretórios `data/processed/` após processamentos antigos usando `convert_greyhound_history.py`.
-- Mantenha o Chrome atualizado para garantir compatibilidade do Selenium.
+## Configurações e Boas Práticas
+- **Estratégias BFB:** Modifique o `config/bfb_tips_config.yaml` sempre que quiser afinar seus thresholds (como `value_ratio_min`, ranges de Odds e regras de horário).
+- **Logs:** Ajuste `settings.LOG_LEVEL` em `src/horses/config.py` ou `src/greyhounds/config.py` para controlar a verbosidade.
+- Execute os scrapers em horários mais espaçados para evitar bloqueios (rate limits) e mantenha sempre o Chrome atualizado para não quebrar o Selenium.
