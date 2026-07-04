@@ -33,3 +33,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# playwright
+.playwright_user_data/
