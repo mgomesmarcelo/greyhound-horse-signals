@@ -39,18 +39,18 @@ _RAW_SIGNALS_SUBDIR = _SIGNALS_DATA_DIR / "signals"
 _ESSENTIAL_SIGNALS_COLUMNS = ("market", "entry_type", "race_time_iso", "track_name", "category_token")
 
 
-def _signals_basename(source_slug: str, market: str, rule_slug: str) -> str:
+def _signals_basename(region: str, source_slug: str, market: str, rule_slug: str) -> str:
     """Retorna o nome base do arquivo de signals (sem extensao)."""
-    return f"signals_{source_slug}_{market}_{rule_slug}"
+    return f"signals_{region.lower()}_{source_slug}_{market}_{rule_slug}"
 
 
-def _resolve_signals_path(source_slug: str, market: str, rule_slug: str) -> Tuple[Path, str]:
+def _resolve_signals_path(region: str, source_slug: str, market: str, rule_slug: str) -> Tuple[Path, str]:
     """
     Procura parquet em processed/signals e, se nao existir, csv em signals.
     Retorna (path, "parquet") ou (path, "csv").
     Levanta FileNotFoundError com mensagem clara se nenhum existir.
     """
-    base = _signals_basename(source_slug, market, rule_slug)
+    base = _signals_basename(region, source_slug, market, rule_slug)
     parquet_path = _PROCESSED_SIGNALS_SUBDIR / f"{base}.parquet"
     if parquet_path.exists():
         return (parquet_path, "parquet")
@@ -63,19 +63,20 @@ def _resolve_signals_path(source_slug: str, market: str, rule_slug: str) -> Tupl
     )
 
 
-def get_group_key(strategy_dict: dict) -> Tuple[str, str, str]:
+def get_group_key(strategy_dict: dict) -> Tuple[str, str, str, str]:
     """
-    Extrai (source_slug, market, rule_slug) de um strategy_dict.
-    Usa source_select_label, market, rule_select_label; normaliza labels para slug quando necessario.
+    Extrai (region, source_slug, market, rule_slug) de um strategy_dict.
+    Usa source_select_label, market, rule_select_label, region_select.
     """
+    region_val = strategy_dict.get("region_select", st.session_state.get("region_select", "UK"))
     source_val = strategy_dict.get("source_select_label", "top3")
     market_val = strategy_dict.get("market", "win")
     rule_val = strategy_dict.get("rule_select_label", "terceiro_queda50")
     source_slug = SOURCE_LABELS_INV.get(source_val, source_val) if isinstance(source_val, str) else "top3"
     rule_slug = RULE_LABELS_INV.get(rule_val, rule_val) if isinstance(rule_val, str) else "terceiro_queda50"
-    if rule_slug == rule_val and rule_val == "Forecast Odds (Timeform)":
+    if rule_slug == rule_val and "Forecast Odds" in str(rule_val):
         rule_slug = "forecast_odds"
-    return (source_slug, market_val, rule_slug)
+    return (region_val, source_slug, market_val, rule_slug)
 
 
 def _shorten_filename(name: Optional[str], max_len: int = 55) -> str:
@@ -107,7 +108,14 @@ def _format_strategy_line(strategy_dict: dict, tail: str = "") -> str:
     if fname:
         fname = _shorten_filename(fname)
     prefix = f"[{fname}] -> " if fname else ""
-    return f"{prefix}**{sname}**"
+    
+    greens = strategy_dict.get("_greens")
+    reds = strategy_dict.get("_reds")
+    stats = ""
+    if greens is not None and reds is not None:
+        stats = f" *(Greens: {greens} | Reds: {reds})*"
+
+    return f"{prefix}**{sname}**{stats}"
 
 
 def _visualize_label(strategy_dict: dict) -> str:
@@ -122,6 +130,7 @@ def _visualize_label(strategy_dict: dict) -> str:
 
 @st.cache_data(show_spinner=False)
 def load_signals_df(
+    region: str,
     source_slug: str,
     market: str,
     rule_slug: str,
@@ -134,7 +143,7 @@ def load_signals_df(
     signals_mtime e usado apenas na chave de cache para invalidar quando o arquivo mudar.
     """
     del signals_mtime  # usado somente para a chave de cache
-    path, fmt = _resolve_signals_path(source_slug, market, rule_slug)
+    path, fmt = _resolve_signals_path(region, source_slug, market, rule_slug)
     if fmt == "parquet":
         df = pd.read_parquet(path)
     else:
@@ -478,8 +487,7 @@ def _apply_filters_to_df_filtered(
     volume_key = "min_total_volume"
     min_total_volume = float(session_state.get(volume_key, 2000.0))
     volume_series = pd.to_numeric(filt.get("total_matched_volume", pd.Series(dtype=float)), errors="coerce")
-    if rule != "forecast_odds":
-        filt = filt[volume_series.fillna(0.0) >= min_total_volume]
+    filt = filt[volume_series.fillna(0.0) >= min_total_volume]
 
     if "trap_ms" in session_state:
         sel_traps = session_state["trap_ms"]
@@ -1033,6 +1041,8 @@ def _compute_hour_bucket_series(series: pd.Series) -> pd.Series:
     ts = pd.to_datetime(series, format=_RACE_TIME_ISO_FORMAT, errors="coerce")
     minutes = ts.dt.hour * 60 + ts.dt.minute
     bucket = pd.Series(index=series.index, dtype="object")
+    bucket[(minutes >= 0) & (minutes <= 4 * 60 - 1)] = "00:00-03:59"
+    bucket[(minutes >= 4 * 60) & (minutes <= 8 * 60 - 1)] = "04:00-07:59"
     bucket[(minutes >= 8 * 60) & (minutes <= 12 * 60)] = "08:00-12:00"
     bucket[(minutes >= 12 * 60 + 1) & (minutes <= 16 * 60)] = "12:01-16:00"
     bucket[(minutes >= 16 * 60 + 1) & (minutes <= 20 * 60)] = "16:01-20:00"
@@ -1058,15 +1068,14 @@ def _build_mask_from_strategy(df: pd.DataFrame, strategy_dict: dict) -> pd.Serie
 
     # Datas nao vêm do strategy_dict; o consolidado usa o filtro global do dashboard (df já filtrado por data)
 
-    # Volume (forecast_odds nao usa volume: ignorar min_total_volume)
-    if rule_slug_early != "forecast_odds":
-        min_vol = strategy_dict.get("min_total_volume")
-        if min_vol is not None and "total_matched_volume" in df.columns:
-            vol = pd.to_numeric(df["total_matched_volume"], errors="coerce").fillna(0.0)
-            try:
-                mask &= vol >= float(min_vol)
-            except (TypeError, ValueError):
-                pass
+    # Volume
+    min_vol = strategy_dict.get("min_total_volume")
+    if min_vol is not None and "total_matched_volume" in df.columns:
+        vol = pd.to_numeric(df["total_matched_volume"], errors="coerce").fillna(0.0)
+        try:
+            mask &= vol >= float(min_vol)
+        except (TypeError, ValueError):
+            pass
 
     # Pistas
     tracks = _strategy_list(strategy_dict, "tracks_ms")
@@ -1258,7 +1267,7 @@ def _build_consolidated_df_by_groups(
     dedup por grupo e concatena; dedup global. Retorna (df_union, total_before, total_after, overlap).
     total_before = soma dos tamanhos antes do dedup em cada grupo; total_after = len(df_union).
     """
-    grouped: dict[Tuple[str, str, str], List[dict]] = {}
+    grouped: dict[Tuple[str, str, str, str], List[dict]] = {}
     for s in strategies:
         gk = get_group_key(s)
         grouped.setdefault(gk, []).append(s)
@@ -1266,10 +1275,10 @@ def _build_consolidated_df_by_groups(
     frames: List[pd.DataFrame] = []
     total_before_sum = 0
 
-    for (source, market, rule), strategies_in_group in grouped.items():
+    for (region, source, market, rule), strategies_in_group in grouped.items():
         try:
-            signals_mtime = _get_signals_mtime(source, market, rule)
-            df_group = load_signals_enriched(source=source, market=market, rule=rule, signals_mtime=signals_mtime)
+            signals_mtime = _get_signals_mtime(region, source, market, rule)
+            df_group = load_signals_enriched(region=region, source=source, market=market, rule=rule, signals_mtime=signals_mtime)
         except FileNotFoundError:
             continue
         if df_group.empty:
@@ -1338,9 +1347,9 @@ def _build_num_runners_index() -> dict[tuple[str, str], int]:
     return _cached_num_runners_index(signature)
 
 
-def _get_signals_mtime(source: str, market: str, rule: str) -> float:
+def _get_signals_mtime(region: str, source: str, market: str, rule: str) -> float:
     try:
-        path, _ = _resolve_signals_path(source, market, rule)
+        path, _ = _resolve_signals_path(region, source, market, rule)
         return path.stat().st_mtime
     except FileNotFoundError:
         return 0.0
@@ -1379,6 +1388,7 @@ def load_signals(source: str = "top3", market: str = "win", rule: str = "terceir
 
 @st.cache_data(show_spinner=False)
 def load_signals_enriched(
+    region: str,
     source: str = "top3",
     market: str = "win",
     rule: str = "terceiro_queda50",
@@ -1391,6 +1401,7 @@ def load_signals_enriched(
     arquivo de sinais for atualizado em disco.
     """
     df = load_signals_df(
+        region=region,
         source_slug=source,
         market=market,
         rule_slug=rule,
@@ -1733,7 +1744,9 @@ def main() -> None:
         plot["_pnl_stake"] = get_col(plot, "pnl_stake_ref", "pnl_stake_fixed_10")
         plot["_pnl_liab"] = get_col(plot, "pnl_liability_ref", "pnl_liability_fixed_10")
         by_trap = plot.groupby("trap_number", as_index=False)[["_pnl_stake", "_pnl_liab"]].sum()
-        order_labels = ["1", "2", "3", "4", "5", "6"]
+        max_trap_in_data = by_trap["trap_number"].max() if not by_trap.empty else 6
+        max_limit = 10 if max_trap_in_data and max_trap_in_data > 6 else 6
+        order_labels = [str(i) for i in range(1, max_limit + 1)]
         by_trap["trap_label"] = by_trap["trap_number"].astype(int).astype(str)
         by_trap = by_trap[by_trap["trap_label"].isin(order_labels)]
         if by_trap.empty:
@@ -1793,13 +1806,15 @@ def main() -> None:
             ts = pd.to_datetime(series, format=_RACE_TIME_ISO_FORMAT, errors="coerce")
             minutes = ts.dt.hour * 60 + ts.dt.minute
             bucket = pd.Series(index=series.index, dtype="object")
+            bucket[(minutes >= 0) & (minutes <= 4 * 60 - 1)] = "00:00-03:59"
+            bucket[(minutes >= 4 * 60) & (minutes <= 8 * 60 - 1)] = "04:00-07:59"
             bucket[(minutes >= 8 * 60) & (minutes <= 12 * 60)] = "08:00-12:00"
             bucket[(minutes >= 12 * 60 + 1) & (minutes <= 16 * 60)] = "12:01-16:00"
             bucket[(minutes >= 16 * 60 + 1) & (minutes <= 20 * 60)] = "16:01-20:00"
             bucket[(minutes >= 20 * 60 + 1)] = "20:01-23:59"
             return bucket
 
-        bucket_order = ["08:00-12:00", "12:01-16:00", "16:01-20:00", "20:01-23:59"]
+        bucket_order = ["00:00-03:59", "04:00-07:59", "08:00-12:00", "12:01-16:00", "16:01-20:00", "20:01-23:59"]
         plot["hour_bucket"] = _bucket(plot["race_time_iso"])
         plot = plot.dropna(subset=["hour_bucket"])
         if plot.empty:
@@ -2000,55 +2015,75 @@ def main() -> None:
                 )
 
     # seletores de regra, fonte, mercado e tipo de entrada
-    # Controles principais mais compactos; coluna extra para respiro
-    col_rule, col_src, col_mkt, col_entry, _ = st.columns([1, 1, 1, 1, 2])
+    col_reg, col_src, col_rule, col_mkt, col_entry, _ = st.columns([1, 1, 1, 1, 1, 1])
 
-    rule_label_pairs = [
-        ("terceiro_queda50", RULE_LABELS.get("terceiro_queda50", "terceiro_queda50")),
-        ("lider_volume_total", RULE_LABELS.get("lider_volume_total", "líder volume total")),
-        ("forecast_odds", RULE_LABELS.get("forecast_odds", "Forecast Odds (Timeform)")),
-        ("lay_recommendation", RULE_LABELS.get("lay_recommendation", "XB Tips - Lay Recommendation")),
-        ("back_recommendation", RULE_LABELS.get("back_recommendation", "XB Tips - Back Recommendation")),
-        ("lay_gemini", RULE_LABELS.get("lay_gemini", "Gemini Flash - Lay Analyst")),
-    ]
-    # Diagnóstico temporário (descomente para ver qual config está sendo importado):
-    # import src.greyhounds.config as _cfg
-    # st.write("config.__file__:", getattr(_cfg, "__file__", "?"))
-    # st.write("RULE_LABELS.keys():", list(getattr(_cfg, "RULE_LABELS", {}).keys()))
-    rule_labels = [label for _, label in rule_label_pairs]
+    with col_reg:
+        if "region_select" not in st.session_state:
+            st.session_state["region_select"] = "UK"
+        
+        def _on_region_change() -> None:
+            _reset_rule_dependent_state()
+            
+        region = st.selectbox(
+            "Região",
+            ["UK", "AUS"],
+            key="region_select",
+            on_change=_on_region_change,
+        )
+
+    # Mapeamento dinâmico de restrições
+    VALID_SOURCES_BY_REGION = {
+        "UK": ["top3", "forecast", "betfair_resultado", "xbtips", "gemini"],
+        "AUS": ["iggy"]
+    }
+    VALID_RULES_BY_SOURCE = {
+        "top3": ["lider_volume_total", "terceiro_queda50"],
+        "forecast": ["forecast_odds"],
+        "betfair_resultado": ["lider_volume_total", "terceiro_queda50"],
+        "xbtips": ["lay_recommendation", "back_recommendation"],
+        "gemini": ["lay_gemini"],
+        "iggy": ["lider_volume_total", "terceiro_queda50", "forecast_odds"]
+    }
+
+    # Coluna 1: Fonte de Dados (invertida com Regra de Seleção para fluxo lógico)
+    source_options = VALID_SOURCES_BY_REGION.get(region, ["top3"])
+    source_label_options = [SOURCE_LABELS.get(opt, opt) for opt in source_options]
+
+    with col_src:
+        if "source_select_label" not in st.session_state or st.session_state["source_select_label"] not in source_label_options:
+            st.session_state["source_select_label"] = source_label_options[0]
+
+        def _on_source_change() -> None:
+            _reset_rule_dependent_state()
+
+        selected_source_label = st.selectbox(
+            "Fonte de dados",
+            source_label_options,
+            key="source_select_label",
+            on_change=_on_source_change,
+        )
+        source = SOURCE_LABELS_INV.get(selected_source_label, source_options[0])
+    source_label = SOURCE_LABELS.get(source, source)
+
+    # Coluna 2: Regra de Seleção (agora depende da Fonte de Dados)
+    rule_options = VALID_RULES_BY_SOURCE.get(source, ["terceiro_queda50"])
+    rule_label_options = [RULE_LABELS.get(opt, opt) for opt in rule_options]
 
     with col_rule:
-        if "rule_select_label" not in st.session_state:
-            st.session_state["rule_select_label"] = rule_labels[0]
+        if "rule_select_label" not in st.session_state or st.session_state["rule_select_label"] not in rule_label_options:
+            st.session_state["rule_select_label"] = rule_label_options[0]
 
         def _on_rule_change() -> None:
             _reset_rule_dependent_state()
 
         selected_rule_label = st.selectbox(
             "Regra de selecao",
-            rule_labels,
+            rule_label_options,
             key="rule_select_label",
             on_change=_on_rule_change,
         )
-        # label -> rule (robusto, mesmo se RULE_LABELS_INV estiver incompleto)
-        rule = RULE_LABELS_INV.get(selected_rule_label)
-        if not rule and selected_rule_label == "Forecast Odds (Timeform)":
-            rule = "forecast_odds"
-        if not rule:
-            rule = "terceiro_queda50"
+        rule = RULE_LABELS_INV.get(selected_rule_label, rule_options[0])
 
-    with col_src:
-        source_options = ["top3", "forecast", "betfair_resultado", "xbtips", "gemini"]
-        source_label_options = [SOURCE_LABELS.get(opt, opt) for opt in source_options]
-        if "source_select_label" not in st.session_state:
-            st.session_state["source_select_label"] = source_label_options[0]
-        selected_source_label = st.selectbox(
-            "Fonte de dados",
-            source_label_options,
-            key="source_select_label",
-        )
-        source = SOURCE_LABELS_INV.get(selected_source_label, "top3")
-    source_label = SOURCE_LABELS.get(source, source)
 
     with col_mkt:
         market = st.selectbox("Mercado", ["win", "place"], index=0)
@@ -2063,10 +2098,10 @@ def main() -> None:
     st.caption(f"Regra selecionada: {selected_rule_label} · Fonte de dados: {source_label}")
 
     # Carregar dados e construir filt antes do header (para export com PNL/ROI do mesmo run)
-    signals_mtime = _get_signals_mtime(source, market, rule)
+    signals_mtime = _get_signals_mtime(region, source, market, rule)
     df_early = None
     try:
-        df_early = load_signals_enriched(source=source, market=market, rule=rule, signals_mtime=signals_mtime)
+        df_early = load_signals_enriched(region=region, source=source, market=market, rule=rule, signals_mtime=signals_mtime)
     except FileNotFoundError:
         df_early = pd.DataFrame()
     if df_early is None or df_early.empty:
@@ -2108,9 +2143,9 @@ def main() -> None:
                 chosen = next((s for s in consolidated_strategies if _visualize_label(s) == viz_mode), None)
                 if chosen is not None:
                     try:
-                        source_g, market_g, rule_g = get_group_key(chosen)
-                        signals_mtime_g = _get_signals_mtime(source_g, market_g, rule_g)
-                        df_group = load_signals_enriched(source=source_g, market=market_g, rule=rule_g, signals_mtime=signals_mtime_g)
+                        region_g, source_g, market_g, rule_g = get_group_key(chosen)
+                        signals_mtime_g = _get_signals_mtime(region_g, source_g, market_g, rule_g)
+                        df_group = load_signals_enriched(region=region_g, source=source_g, market=market_g, rule=rule_g, signals_mtime=signals_mtime_g)
                         mask_i = _build_mask_from_strategy(df_group, chosen)
                         df_i = df_group[mask_i].copy()
                         df_i["dedup_key"] = _make_dedup_key(df_i)
@@ -2223,6 +2258,29 @@ def main() -> None:
                 if strategies:
                     for d in strategies:
                         d["import_filename"] = uf.name
+                        try:
+                            gk = get_group_key(d)
+                            region, source, market, rule = gk
+                            signals_mtime = _get_signals_mtime(region, source, market, rule)
+                            df_strat = load_signals_enriched(region=region, source=source, market=market, rule=rule, signals_mtime=signals_mtime)
+                            if not df_strat.empty:
+                                if "is_green" in df_strat.columns:
+                                    df_strat["is_green"] = to_bool_series(df_strat["is_green"])
+                                elif "win_lose" in df_strat.columns:
+                                    win_numeric = pd.to_numeric(df_strat["win_lose"], errors="coerce")
+                                    entry_series = df_strat.get("entry_type", pd.Series(dtype=str)).astype(str)
+                                    df_strat["is_green"] = False
+                                    df_strat.loc[entry_series == "back", "is_green"] = win_numeric.loc[entry_series == "back"] == 1
+                                    df_strat.loc[entry_series == "lay", "is_green"] = win_numeric.loc[entry_series == "lay"] == 0
+                                mask = _build_mask_from_strategy(df_strat, d)
+                                df_sel = df_strat[mask] if mask is not None else df_strat.iloc[0:0]
+                                if "is_green" in df_sel.columns:
+                                    greens = df_sel["is_green"].sum()
+                                    reds = len(df_sel) - greens
+                                    d["_greens"] = int(greens)
+                                    d["_reds"] = int(reds)
+                        except Exception:
+                            pass
                     st.session_state["consolidated_strategies"] = st.session_state.get("consolidated_strategies", []) + strategies
                     hashes.add(h)
                     any_new = True
@@ -2659,34 +2717,22 @@ def main() -> None:
             )
             st.caption("BSP max.")
 
-        # Volume total negociado mínimo (forecast_odds nao usa; outras regras sim)
+        # Volume total negociado mínimo
         volume_key = "min_total_volume"
         if volume_key not in st.session_state:
             st.session_state[volume_key] = 2000.0
         vcol, _ = st.columns([3, 7])
         with vcol:
-            if rule != "forecast_odds":
-                st.number_input(
-                    "Volume total negociado mínimo",
-                    min_value=0.0,
-                    max_value=1_000_000.0,
-                    step=100.0,
-                    format="%.0f",
-                    key=volume_key,
-                    help="Considera apenas corridas cuja soma de pptradedvol atinge o mínimo desejado.",
-                    disabled=is_consolidated,
-                )
-            else:
-                st.number_input(
-                    "Volume total negociado mínimo",
-                    min_value=0.0,
-                    max_value=1_000_000.0,
-                    step=100.0,
-                    format="%.0f",
-                    key=volume_key,
-                    help="Forecast Odds nao usa filtro de volume; campo desabilitado.",
-                    disabled=True,
-                )
+            st.number_input(
+                "Volume total negociado mínimo",
+                min_value=0.0,
+                max_value=1_000_000.0,
+                step=100.0,
+                format="%.0f",
+                key=volume_key,
+                help="Considera apenas corridas cuja soma de pptradedvol atinge o mínimo desejado.",
+                disabled=is_consolidated,
+            )
 
         # (campo movido para a frente do cabecalho de Stake)
 
@@ -2713,9 +2759,9 @@ def main() -> None:
             chosen = next((s for s in consolidated_strategies if _visualize_label(s) == viz_mode), None)
             if chosen is not None:
                 try:
-                    source_g, market_g, rule_g = get_group_key(chosen)
-                    signals_mtime_g = _get_signals_mtime(source_g, market_g, rule_g)
-                    df_group = load_signals_enriched(source=source_g, market=market_g, rule=rule_g, signals_mtime=signals_mtime_g)
+                    region_g, source_g, market_g, rule_g = get_group_key(chosen)
+                    signals_mtime_g = _get_signals_mtime(region_g, source_g, market_g, rule_g)
+                    df_group = load_signals_enriched(region=region_g, source=source_g, market=market_g, rule=rule_g, signals_mtime=signals_mtime_g)
                     mask_i = _build_mask_from_strategy(df_group, chosen)
                     df_i = df_group[mask_i].copy()
                     df_i["dedup_key"] = _make_dedup_key(df_i)
@@ -2734,8 +2780,7 @@ def main() -> None:
     min_total_volume = float(st.session_state.get(volume_key, 2000.0))
     volume_series = pd.to_numeric(filt.get("total_matched_volume", pd.Series(dtype=float)), errors="coerce")
     if not is_consolidated:
-        if rule != "forecast_odds":
-            filt = filt[volume_series.fillna(0.0) >= min_total_volume]
+        filt = filt[volume_series.fillna(0.0) >= min_total_volume]
 
     sel_traps = st.session_state.get("trap_ms", None)
     if not is_consolidated and sel_traps is not None:
@@ -2779,6 +2824,8 @@ def main() -> None:
         ts = pd.to_datetime(series, format=_RACE_TIME_ISO_FORMAT, errors="coerce")
         minutes = ts.dt.hour * 60 + ts.dt.minute
         bucket = pd.Series(index=series.index, dtype="object")
+        bucket[(minutes >= 0) & (minutes <= 4 * 60 - 1)] = "00:00-03:59"
+        bucket[(minutes >= 4 * 60) & (minutes <= 8 * 60 - 1)] = "04:00-07:59"
         bucket[(minutes >= 8 * 60) & (minutes <= 12 * 60)] = "08:00-12:00"
         bucket[(minutes >= 12 * 60 + 1) & (minutes <= 16 * 60)] = "12:01-16:00"
         bucket[(minutes >= 16 * 60 + 1) & (minutes <= 20 * 60)] = "16:01-20:00"
@@ -2834,7 +2881,7 @@ def main() -> None:
         if not df_filtered.empty and "race_time_iso" in df_filtered.columns:
             st.caption("Faixa de horário")
             hour_bucket = _compute_hour_bucket(df_filtered["race_time_iso"])
-            bucket_order = ["08:00-12:00", "12:01-16:00", "16:01-20:00", "20:01-23:59"]
+            bucket_order = ["00:00-03:59", "04:00-07:59", "08:00-12:00", "12:01-16:00", "16:01-20:00", "20:01-23:59"]
             bucket_options = [b for b in bucket_order if b in hour_bucket.dropna().unique().tolist()]
             if bucket_options:
                 hb1, hb2, _ = st.columns([1, 1, 2])
