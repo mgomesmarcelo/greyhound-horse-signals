@@ -286,7 +286,8 @@ def process_strategies_for_sport(sport: str, today_str: str):
                 "BetType": bet_type,
                 "MinPrice": min_p,
                 "MaxPrice": max_p,
-                "Provider": strategy_name
+                "Provider": strategy_name,
+                "BSP": "true"
             })
             
         if tips_for_strat:
