@@ -17,7 +17,8 @@ if __package__ in (None, ""):
 from src.core.config import ensure_data_dir
 from src.greyhounds.config import settings as gh_settings
 from src.horses.config import settings as ho_settings
-from scripts.greyhounds.streamlit_greyhounds_app import parse_strategies_csv, normalize_track_name
+from scripts.greyhounds.streamlit_app import parse_strategies_csv
+from src.greyhounds.utils.text import normalize_track_name
 
 def _build_daily_mask(df: pd.DataFrame, strategy: dict) -> pd.Series:
     """Cria a mascara de filtros para os dados de HOJE.
@@ -220,6 +221,37 @@ def process_strategies_for_sport(sport: str, today_str: str):
                     cols_to_merge.append(col)
             df_base = df_base.merge(df_cards_clean[cols_to_merge], on=["track_key", "race_iso"], how="left")
 
+            if "selection_id" in df_cards.columns:
+                if "trap_number" in df_base.columns:
+                    # Merge por trap: disponivel quando a fonte e top3 ou cards com trap
+                    df_cards_runners = df_cards[["track_key", "race_iso", "trap", "selection_id"]].copy()
+                    df_cards_runners = df_cards_runners.rename(columns={"trap": "_trap_merge"})
+                    df_cards_runners["_trap_merge"] = df_cards_runners["_trap_merge"].astype(str).str.replace(".0", "", regex=False)
+                    df_base["_trap_merge"] = df_base["trap_number"].astype(str).str.replace(".0", "", regex=False)
+                    df_base = df_base.merge(
+                        df_cards_runners.dropna(subset=["_trap_merge", "selection_id"]).drop_duplicates(subset=["track_key", "race_iso", "_trap_merge"]),
+                        on=["track_key", "race_iso", "_trap_merge"],
+                        how="left"
+                    )
+                    df_base = df_base.drop(columns=["_trap_merge"])
+                else:
+                    # Fallback: merge por nome do galgo (forecast nao tem trap_number)
+                    name_col = next(
+                        (c for c in ["forecast_name_clean", "name_clean", "forecast_name_raw"] if c in df_base.columns),
+                        None
+                    )
+                    if name_col and "greyhound_name" in df_cards.columns:
+                        df_cards_runners = df_cards[["track_key", "race_iso", "greyhound_name", "selection_id"]].copy()
+                        df_cards_runners["_name_merge"] = df_cards_runners["greyhound_name"].apply(clean_name)
+                        df_base["_name_merge"] = df_base[name_col].apply(
+                            lambda x: clean_name(str(x)) if pd.notna(x) else ""
+                        )
+                        df_base = df_base.merge(
+                            df_cards_runners.dropna(subset=["_name_merge", "selection_id"]).drop_duplicates(subset=["track_key", "race_iso", "_name_merge"]),
+                            on=["track_key", "race_iso", "_name_merge"],
+                            how="left"
+                        )
+                        df_base = df_base.drop(columns=["_name_merge", "greyhound_name"], errors="ignore")
         mask = _build_daily_mask(df_base, strat)
         df_filtered = df_base[mask].copy()
         
@@ -229,6 +261,8 @@ def process_strategies_for_sport(sport: str, today_str: str):
 
         # Construir o CSV
         # StartTime,MarketId,MarketType,EventName,SelectionName,BetType,MinPrice,MaxPrice,Provider
+        # Para alterar o valor da stake, mude apenas o numero abaixo:
+        STAKE_VALUE = 1
         tips_for_strat = []
         for _, row in df_filtered.iterrows():
             dog_name = row.get("forecast_name_raw", row.get("name_raw", row.get("selection_name", "")))
@@ -269,25 +303,29 @@ def process_strategies_for_sport(sport: str, today_str: str):
                 max_p = _format_bsp(high) if high is not None else ""
 
             tips_for_strat.append({
-                "StartTime": _format_start_time(row.get("race_iso", "")),
+                "Provider": strategy_name,
+                #"EventId": "",
                 "MarketId": lookup_links.get(
                     (normalize_track_name(str(row.get("track_name", ""))),
                      str(row.get("race_iso", ""))),
                     ""
                 ),
-                "RaceUrl": lookup_urls.get(
-                    (normalize_track_name(str(row.get("track_name", ""))),
-                     str(row.get("race_iso", ""))),
-                    ""
-                ),
+                "SelectionId": row.get("selection_id", ""),
                 "MarketType": market_type,
-                "EventName": row.get("track_name", ""),
-                "SelectionName": selection_name,
+                #"Handicap": "0",
                 "BetType": bet_type,
-                "MinPrice": min_p,
-                "MaxPrice": max_p,
-                "Provider": strategy_name,
-                "BSP": "true"
+                #"EventName": row.get("track_name", ""),
+                #"MarketName": "",
+                #"StartTime": _format_start_time(row.get("race_iso", "")),
+                "MaxPrice": int(round(float(max_p))) if max_p else "",
+                "MinPrice": int(round(float(min_p))) if min_p else "",
+                #"Price": "0",
+                #"BSP": "0",
+                #"SelectionName": selection_name,
+                #"Size": "0",
+                #"Points": "0",
+                #"BetId": "",
+                #"Chance": "0"
             })
             
         if tips_for_strat:

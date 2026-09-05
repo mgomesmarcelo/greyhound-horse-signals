@@ -1,7 +1,8 @@
 import datetime
 from pathlib import Path
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -17,6 +18,17 @@ app.add_middleware(
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# Mapeamento para futuras estratégias e seus respectivos blocos no BFB
+MAPA_PROVIDER_BLOCO = {
+    # "Nome_da_Estrategia": "Nome_do_Bloco",
+}
+
+# Bloco padrão para todas as estratégias atuais de galgos
+BLOCO_PADRAO_ATUAL_GALGOS = "layy"
+
+def mapear_provider_galgos(estrategia: str) -> str:
+    return MAPA_PROVIDER_BLOCO.get(str(estrategia), BLOCO_PADRAO_ATUAL_GALGOS)
 
 def get_daily_file(sport: str) -> Path:
     today_str = datetime.date.today().isoformat()
@@ -45,7 +57,20 @@ def get_sinais_galgos():
     file_path = get_daily_file("greyhounds")
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="O arquivo de sinais consolidados para Galgos de hoje ainda não foi gerado.")
-    return FileResponse(path=file_path, media_type="text/csv", filename="sinais_galgos.csv")
+    try:
+        df = pd.read_csv(file_path, dtype={"MarketId": str})
+        if "Provider" in df.columns:
+            df["Provider"] = df["Provider"].apply(mapear_provider_galgos)
+        else:
+            df["Provider"] = BLOCO_PADRAO_ATUAL_GALGOS
+        csv_content = df.to_csv(index=False)
+        return Response(
+            content=csv_content,
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=sinais_galgos.csv"}
+        )
+    except Exception:
+        return FileResponse(path=file_path, media_type="text/csv", filename="sinais_galgos.csv")
 
 @app.get("/sinais_cavalos.csv")
 def get_sinais_cavalos():
