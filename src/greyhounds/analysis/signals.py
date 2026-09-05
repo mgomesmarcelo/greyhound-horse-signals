@@ -18,8 +18,8 @@ from src.greyhounds.config import RULE_LABELS, settings
 from src.greyhounds.utils.text import clean_greyhound_name, normalize_track_name
 from src.greyhounds.utils.files import write_dataframe_snapshots
 
-_TRAP_PREFIX_RE = re.compile(r"^\s*\d+\.\s*")
-_TRAP_NUMBER_RE = re.compile(r"^\s*([1-6])[\.\s]+")
+_TRAP_PREFIX_RE = re.compile(r"^\s*\d+[\.\s]+")
+_TRAP_NUMBER_RE = re.compile(r"^\s*(\d+)[\.\s]+")
 
 
 def _ensure_dir(path: Path) -> None:
@@ -54,17 +54,23 @@ def _to_iso_yyyy_mm_dd_thh_mm(value: str) -> str:
         return ""
 
 
-def _extract_category_letter(event_name: str) -> str:
-    txt = str(event_name or "").strip()
-    m = re.match(r"^([A-Za-z]+)", txt)
-    token = m.group(1).upper() if m else ""
-    return token[:1] if token else ""
-
-
 def _extract_category_token(event_name: str) -> str:
     txt = str(event_name or "").strip()
-    m = re.match(r"^([A-Za-z]+\d*)", txt)
-    return m.group(1).upper() if m else ""
+    # Verifica padrao australiano: "R<numero> <distancia>m <categoria>" (ex: "R10 366m Gr5", "R1 350m Mdn", "R6 460m Gr6/7")
+    m_aus = re.search(r"^R\d+\s+\d+m\s+(.+)$", txt, re.IGNORECASE)
+    if m_aus:
+        return m_aus.group(1).strip().upper()
+    # Verifica padrao UK: "A1 500m" -> "A1"
+    m_uk = re.match(r"^([A-Za-z]+\d*)", txt)
+    return m_uk.group(1).upper() if m_uk else ""
+
+def _extract_category_letter(event_name: str) -> str:
+    token = _extract_category_token(event_name)
+    if not token:
+        return ""
+    # Pega apenas as letras no inicio da categoria para agrupar (ex: GR5 -> G, A1 -> A, MDN -> M)
+    m = re.match(r"^([A-Za-z]+)", token)
+    return m.group(1)[:1].upper() if m else ""
 
 
 _FORECAST_ITEM_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+(.+)$", re.IGNORECASE)
@@ -241,7 +247,7 @@ def load_betfair_win(region_filter: str | None = None) -> Dict[Tuple[str, str], 
             df["selection_name_raw"].map(_strip_trap_prefix).map(clean_greyhound_name)
         )
         df["trap_number"] = df["selection_name_raw"].apply(
-            lambda x: _extract_trap_number(x, max_trap=10 if region_filter in ("AUS", "NZL") else 6)
+            lambda x: _extract_trap_number(x, max_trap=10 if region_filter == "AUS" else 6)
         )
         df["pptradedvol"] = pd.to_numeric(df["pptradedvol"], errors="coerce").fillna(0.0)
         df["bsp"] = pd.to_numeric(df["bsp"], errors="coerce")
@@ -250,6 +256,12 @@ def load_betfair_win(region_filter: str | None = None) -> Dict[Tuple[str, str], 
         for (track_key, race_iso), group in df.groupby(["track_key", "race_iso"]):
             if not track_key or not race_iso:
                 continue
+            
+            if "event_id" in group.columns:
+                event_id_str = str(group["event_id"].iloc[0])
+                if event_id_str and event_id_str != "nan":
+                    index[event_id_str] = (track_key, race_iso)
+            
             runners: Dict[str, RunnerBF] = index.setdefault((track_key, race_iso), {})
             for _, row in group.iterrows():
                 name_clean = row["selection_name_clean"]
@@ -302,7 +314,7 @@ def load_betfair_place(region_filter: str | None = None) -> Dict[Tuple[str, str]
             df["selection_name_raw"].map(_strip_trap_prefix).map(clean_greyhound_name)
         )
         df["trap_number"] = df["selection_name_raw"].apply(
-            lambda x: _extract_trap_number(x, max_trap=10 if region_filter in ("AUS", "NZL") else 6)
+            lambda x: _extract_trap_number(x, max_trap=10 if region_filter == "AUS" else 6)
         )
         df["pptradedvol"] = pd.to_numeric(df["pptradedvol"], errors="coerce").fillna(0.0)
         df["bsp"] = pd.to_numeric(df["bsp"], errors="coerce")
@@ -311,6 +323,12 @@ def load_betfair_place(region_filter: str | None = None) -> Dict[Tuple[str, str]
         for (track_key, race_iso), group in df.groupby(["track_key", "race_iso"]):
             if not track_key or not race_iso:
                 continue
+            
+            if "event_id" in group.columns:
+                event_id_str = str(group["event_id"].iloc[0])
+                if event_id_str and event_id_str != "nan":
+                    index[event_id_str] = (track_key, race_iso)
+            
             runners: Dict[str, RunnerBF] = index.setdefault((track_key, race_iso), {})
             for _, row in group.iterrows():
                 name_clean = row["selection_name_clean"]
@@ -638,6 +656,78 @@ def load_timeform_forecast_top3() -> List[dict]:
     return rows
 
 
+def load_iggy_model() -> List[dict]:
+    iggy_dir = settings.IGGY_MODEL_DIR
+    csv_paths = sorted(iggy_dir.glob("Iggy_Model_V2_Results_*.csv"))
+    
+    rows: List[dict] = []
+    for path in csv_paths:
+        try:
+            df = pd.read_csv(
+                path,
+                encoding=settings.CSV_ENCODING,
+                engine="python",
+                on_bad_lines="skip",
+            )
+        except Exception as exc:
+            logger.error("Falha ao ler Iggy {}: {}", path.name, exc)
+            continue
+            
+        required_cols = ["MarketId", "Dog", "Rated Price"]
+        if not all(c in df.columns for c in required_cols):
+            continue
+            
+        for market_id, group in df.groupby("MarketId"):
+            if pd.isna(market_id):
+                continue
+            event_id = str(int(market_id)) if isinstance(market_id, float) else str(market_id)
+            
+            group = group.copy()
+            group["Rated Price"] = pd.to_numeric(group["Rated Price"], errors="coerce")
+            group = group.dropna(subset=["Rated Price"])
+            # The CSV might contain multiple evaluations for the same race/dog on different dates. Keep the latest (last).
+            group = group.drop_duplicates(subset=["Dog"], keep="last")
+            group = group.sort_values("Rated Price", ascending=True)
+            
+            if group.empty:
+                continue
+                
+            top_names = []
+            forecast_items = []
+            for i, (_, row) in enumerate(group.iterrows()):
+                dog_raw = str(row["Dog"])
+                dog_clean = clean_greyhound_name(dog_raw)
+                rated_price = float(row["Rated Price"])
+                
+                if i < 3:
+                    top_names.append(dog_clean)
+                    
+                forecast_items.append({
+                    "forecast_rank": i + 1,
+                    "forecast_odds": rated_price,
+                    "forecast_name_clean": dog_clean,
+                    "forecast_name_raw": dog_raw
+                })
+                
+            track_name = str(group["Track"].iloc[0]) if "Track" in group.columns else ""
+            raw_row = {
+                "track_name": track_name,
+                "TimeformTop1": top_names[0] if len(top_names) > 0 else "",
+                "TimeformTop2": top_names[1] if len(top_names) > 1 else "",
+                "TimeformTop3": top_names[2] if len(top_names) > 2 else "",
+            }
+                
+            rows.append({
+                "event_id": event_id,
+                "top_names": top_names,
+                "forecast_items": forecast_items,
+                "raw": raw_row,
+            })
+            
+    logger.info("Iggy Model carregado: {} corridas", len(rows))
+    return rows
+
+
 def load_timeform_forecast_all() -> pd.DataFrame:
     """Carrega TimeformForecast (parquet preferencial, csv fallback), parseia o campo textual
     TimeformForecast e retorna um DataFrame com track_key, race_iso e forecast_items (list de
@@ -785,6 +875,12 @@ def _calc_signals_forecast_odds_for_race(
     """
     track_key = tf_row.get("track_key", "")
     race_iso = tf_row.get("race_iso", "")
+    event_id = tf_row.get("event_id")
+
+    if event_id and event_id in bf_win_index:
+        resolved = bf_win_index[event_id]
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            track_key, race_iso = resolved
 
 
     forecast_items = tf_row.get("forecast_items") or []
@@ -812,6 +908,13 @@ def _calc_signals_forecast_odds_for_race(
     category = _cat.get("letter", "") or ""
     category_token = _cat.get("token", "") or ""
 
+    total_vol_race = 0.0
+    for runner in group.values():
+        try:
+            total_vol_race += max(0.0, float(runner.pptradedvol))
+        except (TypeError, ValueError):
+            continue
+
     base_neutral = {
         "date": race_iso.split("T")[0] if race_iso else "",
         "track_name": raw.get("track_name", track_key),
@@ -834,10 +937,10 @@ def _calc_signals_forecast_odds_for_race(
         "market": market,
         "rule": rule,
         "rule_label": RULE_LABELS.get(rule, rule),
-        "total_matched_volume": 0.0,
+        "total_matched_volume": round(total_vol_race, 2),
     }
 
-    result: List[dict] = []
+    valid_items = []
     for item in forecast_items:
         name_clean = item.get("forecast_name_clean")
         if not name_clean:
@@ -846,14 +949,23 @@ def _calc_signals_forecast_odds_for_race(
         if forecast_odds_val is None or (isinstance(forecast_odds_val, float) and (forecast_odds_val <= 0 or pd.isna(forecast_odds_val))):
             continue
         forecast_odds_val = float(forecast_odds_val)
-        forecast_rank = item.get("forecast_rank")
-        if forecast_rank is None:
-            continue
-        forecast_rank = int(forecast_rank)
-
         runner = group.get(name_clean) if isinstance(group, dict) else None
         if not runner or pd.isna(runner.bsp):
             continue
+        valid_items.append({
+            "forecast_odds_val": forecast_odds_val,
+            "name_clean": name_clean,
+            "runner": runner
+        })
+
+    valid_items.sort(key=lambda x: x["forecast_odds_val"])
+
+    result: List[dict] = []
+    for new_rank, v in enumerate(valid_items, start=1):
+        forecast_odds_val = v["forecast_odds_val"]
+        name_clean = v["name_clean"]
+        runner = v["runner"]
+        forecast_rank = new_rank
 
         odd = float(runner.bsp)
         target_win_lose = int(runner.win_lose)
@@ -985,7 +1097,10 @@ def _build_betfair_direct_rows(
     bf_win_index: Dict[Tuple[str, str], Dict[str, RunnerBF]]
 ) -> List[dict]:
     rows: List[dict] = []
-    for (track_key, race_iso), runners in bf_win_index.items():
+    for key, runners in bf_win_index.items():
+        if not isinstance(key, tuple) or len(key) != 2:
+            continue
+        track_key, race_iso = key
         if not runners:
             continue
         sorted_runners = sorted(
@@ -1291,6 +1406,9 @@ def generate_signals(
     elif source == "betfair_resultado":
         tf_rows = _build_betfair_direct_rows(bf_win_index)
         use_forecast_odds = False
+    elif source == "iggy":
+        tf_rows = load_iggy_model()
+        use_forecast_odds = (rule == "forecast_odds")
     else:
         tf_rows = load_timeform_top3()
         use_forecast_odds = False
@@ -1371,20 +1489,23 @@ def write_signals_csv(
     source: str = "top3",
     market: str = "win",
     rule: str = "terceiro_queda50",
+    region: str = "UK",
 ) -> Path:
     t0 = time.perf_counter()
     raw_dir = settings.RAW_SIGNALS_DIR
     processed_dir = settings.PROCESSED_SIGNALS_DIR
     _ensure_dir(raw_dir)
     _ensure_dir(processed_dir)
-    raw_path = raw_dir / f"signals_{source}_{market}_{rule}.csv"
-    parquet_path = processed_dir / f"signals_{source}_{market}_{rule}.parquet"
+    raw_path = raw_dir / f"signals_{region.lower()}_{source}_{market}_{rule}.csv"
+    parquet_path = processed_dir / f"signals_{region.lower()}_{source}_{market}_{rule}.parquet"
 
     df = df.copy()
     df["source"] = source
     df["market"] = market
     df["rule"] = rule
     df["rule_label"] = RULE_LABELS.get(rule, rule)
+    if not df.empty:
+        df["region"] = region
 
     if df.empty:
         df_sorted = pd.DataFrame(

@@ -1619,8 +1619,11 @@ def main() -> None:
                     else:
                         c_f1, c_f2 = st.columns(2)
                         with c_f1:
-                            tracks_s = sorted(df_s["EventName"].dropna().unique().tolist())
-                            sel_tracks_s = st.multiselect("🔍 Filtrar por Pista", tracks_s, placeholder="Todas as pistas...", key="ms_tracks_s")
+                            if "EventName" in df_s.columns:
+                                tracks_s = sorted(df_s["EventName"].dropna().unique().tolist())
+                                sel_tracks_s = st.multiselect("🔍 Filtrar por Pista", tracks_s, placeholder="Todas as pistas...", key="ms_tracks_s")
+                            else:
+                                sel_tracks_s = []
                         with c_f2:
                             if "BetType" in df_s.columns:
                                 bet_types_s = sorted(df_s["BetType"].dropna().unique().tolist())
@@ -1629,9 +1632,9 @@ def main() -> None:
                                 sel_bets_s = []
 
                         df_view = df_s.copy()
-                        if sel_tracks_s:
+                        if sel_tracks_s and "EventName" in df_view.columns:
                             df_view = df_view[df_view["EventName"].isin(sel_tracks_s)]
-                        if sel_bets_s:
+                        if sel_bets_s and "BetType" in df_view.columns:
                             df_view = df_view[df_view["BetType"].isin(sel_bets_s)]
 
                         cols_to_show = ["StartTime", "MarketId", "MarketType", "EventName", "SelectionName", "BetType", "MinPrice", "MaxPrice", "Provider"]

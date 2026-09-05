@@ -14,13 +14,14 @@ SOURCE_LABELS: dict[str, str] = {
     "betfair_resultado": "Betfair Resultado Direto",
     "xbtips": "XB Tips",
     "gemini": "Gemini Flash AI",
+    "iggy": "Iggy Model V2",
 }
 SOURCE_LABELS_INV: dict[str, str] = {v: k for k, v in SOURCE_LABELS.items()}
 
 RULE_LABELS: dict[str, str] = {
     "lider_volume_total": "líder volume total",
     "terceiro_queda50": "terceiro_queda50",
-    "forecast_odds": "Forecast Odds (Timeform)",
+    "forecast_odds": "Forecast Odds",
     "lay_recommendation": "XB Tips - Lay Recommendation",
     "back_recommendation": "XB Tips - Back Recommendation",
     "lay_gemini": "Gemini Flash - Lay Analyst",
@@ -38,6 +39,7 @@ GEMINI_RAW_DIR = ensure_data_dir("greyhounds", "gemini_raw")
 
 PROCESSED_DIR = ensure_data_dir("greyhounds", "processed")
 PROCESSED_SIGNALS_DIR = ensure_data_dir("greyhounds", "processed", "signals")
+IGGY_MODEL_DIR = ensure_data_dir("greyhounds", "iggy_model")
 PROCESSED_TIMEFORM_TOP3_DIR = ensure_data_dir("greyhounds", "processed", "timeform_top3")
 PROCESSED_TIMEFORM_FORECAST_DIR = ensure_data_dir("greyhounds", "processed", "TimeformForecast")
 PROCESSED_RESULT_DIR = ensure_data_dir("greyhounds", "processed", "Result")
@@ -52,6 +54,7 @@ class Settings:
     RAW_TIMEFORM_FORECAST_DIR: Path = TIMEFORM_FORECAST_DIR
     RAW_RESULT_DIR: Path = RESULT_DIR
     RAW_RACE_LINKS_DIR: Path = RACE_LINKS_DIR
+    IGGY_MODEL_DIR: Path = IGGY_MODEL_DIR
     PROCESSED_DIR: Path = PROCESSED_DIR
     PROCESSED_SIGNALS_DIR: Path = PROCESSED_SIGNALS_DIR
     PROCESSED_TIMEFORM_TOP3_DIR: Path = PROCESSED_TIMEFORM_TOP3_DIR

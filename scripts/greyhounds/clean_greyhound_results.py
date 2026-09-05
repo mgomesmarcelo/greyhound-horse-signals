@@ -30,22 +30,42 @@ TARGET_COLUMNS = [
     "region",
 ]
 
+_AUS_NZL_TRACKS = {
+    "addington", "albion park", "angle park", "ascot park", "ballarat",
+    "bathurst", "bendigo", "broken hill", "bulli", "bundaberg", "cambridge",
+    "canberra", "cannington", "capalaba", "casino", "coonabarabran",
+    "coonamble", "cowra", "cranbourne", "dapto", "darwin", "devonport",
+    "dubbo", "gawler", "geelong", "gosford", "goulburn", "grafton",
+    "gunnedah", "hatrick", "hatrick straight", "healesville", "hobart",
+    "horsham", "ipswich", "kempsey", "launceston", "lismore", "lithgow",
+    "maitland", "manawatu", "mandurah", "manukau", "moree", "mount gambier",
+    "murray bridge", "murray bridge straight", "muswellbrook", "northam",
+    "nowra", "potts park", "q straight", "q1 lakeside", "q2 parklands",
+    "richmond", "richmond straight", "rockhampton", "sale", "sandown park",
+    "shepparton", "tamworth", "taree", "temora", "the gardens", "the meadows",
+    "townsville", "traralgon", "wagga", "warragul", "warrnambool", "wauchope",
+    "wentworth park", "young"
+}
+
 def _detect_region(menu_hint: str) -> str:
     text = str(menu_hint or "").upper()
     if "(AUS)" in text:
         return "AUS"
-    if "(NZL)" in text:
-        return "NZL"
+    
+    lower_text = text.lower()
+    for track in _AUS_NZL_TRACKS:
+        if lower_text.startswith(track):
+            return "AUS"
+            
     return "UK"
 
+
 _BSP_TWO_DEC_REGEX = re.compile(r"^\d+\.\d{2}$")
-_BANNED_REGEX = re.compile(r"\((?:AUS|NZL)\)")
+_BANNED_REGEX = re.compile(r"\((?:AUS)\)")
 
 BANNED_TRACK_PREFIXES = (
     "aus ",
     "australia ",
-    "nz ",
-    "new zealand ",
 )
 BANNED_TRACK_NAMES = {
     "",
