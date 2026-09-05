@@ -148,15 +148,24 @@ def scrape_betfair_race(race_url: str, track_name: str, race_time_iso: str, driv
                     elif trap:
                         trap_val = trap
 
+                    selection_id = ""
+                    for child in node.find_all(True):
+                        if child.has_attr("bet-selection-id"):
+                            selection_id = child["bet-selection-id"]
+                            break
+
                     existing = next((r for r in runners_data if r['name'] == name), None)
                     if existing:
                         # Se ja existe mas estava sem trap e agora achou, atualiza
                         if existing['trap'] is None and trap_val is not None:
                             existing['trap'] = trap_val
+                        if not existing.get('selection_id') and selection_id:
+                            existing['selection_id'] = selection_id
                     else:
                         runners_data.append({
                             "trap": trap_val,
-                            "name": name
+                            "name": name,
+                            "selection_id": selection_id
                         })
 
             # 3. TIMEFORM TOP 3

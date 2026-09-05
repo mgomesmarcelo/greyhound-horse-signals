@@ -331,11 +331,12 @@ def _build_timeform_cards_df(rows: Iterable[Dict[str, object]]) -> pd.DataFrame:
                 "race_time_iso": time_iso,
                 "category": category,
                 "trap": runner.get("trap"),
-                "greyhound_name": runner.get("name")
+                "greyhound_name": runner.get("name"),
+                "selection_id": runner.get("selection_id")
             })
             
     if not data:
-        return pd.DataFrame([], columns=["track_name", "race_time_iso", "category", "trap", "greyhound_name"])
+        return pd.DataFrame([], columns=["track_name", "race_time_iso", "category", "trap", "greyhound_name", "selection_id"])
     return pd.DataFrame(data)
 
 def save_timeform_forecast(
