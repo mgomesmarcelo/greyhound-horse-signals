@@ -10,6 +10,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+import streamlit_authenticator as stauth
 import re
 from dateutil import parser as date_parser
 import altair as alt
@@ -17,6 +18,36 @@ import altair as alt
 st.set_page_config(page_title="Greyhounds", layout="wide")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(PROJECT_ROOT))
+
+# --- AUTENTICACAO ---
+_AUTH_CONFIG_PATH = PROJECT_ROOT / "config" / "auth.yaml"
+
+import yaml
+from yaml.loader import SafeLoader
+
+with open(_AUTH_CONFIG_PATH, encoding="utf-8") as _f:
+    _auth_config = yaml.load(_f, Loader=SafeLoader)
+
+_authenticator = stauth.Authenticate(
+    _auth_config["credentials"],
+    _auth_config["cookie"]["name"],
+    _auth_config["cookie"]["key"],
+    _auth_config["cookie"]["expiry_days"],
+)
+
+_authenticator.login()
+
+if st.session_state.get("authentication_status") is False:
+    st.error("Utilizador ou senha incorretos.")
+    st.stop()
+elif st.session_state.get("authentication_status") is None:
+    st.warning("Por favor, introduza as suas credenciais.")
+    st.stop()
+
+# Botao de logout na sidebar
+with st.sidebar:
+    _authenticator.logout("Sair", "sidebar")
+# --- FIM AUTENTICACAO ---
 
 from src.greyhounds.config import settings
 from src.greyhounds.config import RULE_LABELS, RULE_LABELS_INV, ENTRY_TYPE_LABELS, SOURCE_LABELS, SOURCE_LABELS_INV

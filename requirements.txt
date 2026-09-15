@@ -12,3 +12,5 @@ altair>=5.2
 google-genai>=1.0
 fastapi>=0.111.0
 uvicorn>=0.30.0
+streamlit-authenticator>=0.4.2
+bcrypt>=4.0

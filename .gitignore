@@ -12,6 +12,9 @@ data/greyhounds/
 venv/
 .venv/
 
+# auth config (contém hashes de senha — nunca commitar)
+config/auth.yaml
+
 # python caches
 __pycache__/
 *.pyc

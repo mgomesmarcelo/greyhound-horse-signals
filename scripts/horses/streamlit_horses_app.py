@@ -11,11 +11,42 @@ from typing import Any, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+import streamlit_authenticator as stauth
 import re
 import altair as alt
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(PROJECT_ROOT))
+
+# --- AUTENTICACAO ---
+import yaml
+from yaml.loader import SafeLoader
+
+_AUTH_CONFIG_PATH = PROJECT_ROOT / "config" / "auth.yaml"
+
+with open(_AUTH_CONFIG_PATH, encoding="utf-8") as _f:
+    _auth_config = yaml.load(_f, Loader=SafeLoader)
+
+_authenticator = stauth.Authenticate(
+    _auth_config["credentials"],
+    _auth_config["cookie"]["name"],
+    _auth_config["cookie"]["key"],
+    _auth_config["cookie"]["expiry_days"],
+)
+
+_authenticator.login()
+
+if st.session_state.get("authentication_status") is False:
+    st.error("Utilizador ou senha incorretos.")
+    st.stop()
+elif st.session_state.get("authentication_status") is None:
+    st.warning("Por favor, introduza as suas credenciais.")
+    st.stop()
+
+# Botao de logout na sidebar
+with st.sidebar:
+    _authenticator.logout("Sair", "sidebar")
+# --- FIM AUTENTICACAO ---
 
 from src.horses.config import settings
 from src.horses.utils.text import normalize_track_name
