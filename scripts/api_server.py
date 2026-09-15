@@ -1,10 +1,14 @@
 import datetime
+import os
 from pathlib import Path
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 import uvicorn
+
+load_dotenv()
 
 app = FastAPI(title="Sinais API")
 
@@ -18,6 +22,11 @@ app.add_middleware(
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# Token secreto lido do .env — nunca hardcoded no codigo
+_FEED_TOKEN = os.getenv("API_FEED_TOKEN", "")
+if not _FEED_TOKEN:
+    raise RuntimeError("API_FEED_TOKEN nao definido no .env. A API nao pode subir sem um token.")
 
 # Mapeamento para futuras estratégias e seus respectivos blocos no BFB
 MAPA_PROVIDER_BLOCO = {
@@ -44,16 +53,27 @@ def root_menu(request: Request):
         <body style="padding: 20px;">
 <pre>
 {{
-    <span style="color: #9cdcfe;">"sinais_galgos"</span>: <a href="/sinais_galgos.csv" style="color: #ce9178; text-decoration: underline;">"{base_url}sinais_galgos.csv"</a>,
-    <span style="color: #9cdcfe;">"sinais_cavalos"</span>: <a href="/sinais_cavalos.csv" style="color: #ce9178; text-decoration: underline;">"{base_url}sinais_cavalos.csv"</a>
+    <span style="color: #9cdcfe;">"sinais_galgos"</span>: <a href="/feed/{_FEED_TOKEN}/galgos.csv" style="color: #ce9178; text-decoration: underline;">"{base_url}feed/{_FEED_TOKEN}/galgos.csv"</a>,
+    <span style="color: #9cdcfe;">"sinais_cavalos"</span>: <a href="/feed/{_FEED_TOKEN}/cavalos.csv" style="color: #ce9178; text-decoration: underline;">"{base_url}feed/{_FEED_TOKEN}/cavalos.csv"</a>
 }}
 </pre>
         </body>
     </html>
     """
 
+# Rotas antigas — retornam 404 para não revelar que existiram
 @app.get("/sinais_galgos.csv")
-def get_sinais_galgos():
+def get_sinais_galgos_legacy():
+    raise HTTPException(status_code=404, detail="Not found")
+
+@app.get("/sinais_cavalos.csv")
+def get_sinais_cavalos_legacy():
+    raise HTTPException(status_code=404, detail="Not found")
+
+@app.get("/feed/{token}/galgos.csv")
+def get_sinais_galgos(token: str):
+    if token != _FEED_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
     file_path = get_daily_file("greyhounds")
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="O arquivo de sinais consolidados para Galgos de hoje ainda não foi gerado.")
@@ -72,8 +92,10 @@ def get_sinais_galgos():
     except Exception:
         return FileResponse(path=file_path, media_type="text/csv", filename="sinais_galgos.csv")
 
-@app.get("/sinais_cavalos.csv")
-def get_sinais_cavalos():
+@app.get("/feed/{token}/cavalos.csv")
+def get_sinais_cavalos(token: str):
+    if token != _FEED_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
     file_path = get_daily_file("horses")
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="O arquivo de sinais consolidados para Cavalos de hoje ainda não foi gerado.")
@@ -81,3 +103,4 @@ def get_sinais_cavalos():
 
 if __name__ == "__main__":
     uvicorn.run("api_server:app", host="0.0.0.0", port=8000, reload=True)
+
