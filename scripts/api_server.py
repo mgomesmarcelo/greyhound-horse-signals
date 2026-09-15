@@ -2,7 +2,7 @@ import datetime
 import os
 from pathlib import Path
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -45,18 +45,12 @@ def get_daily_file(sport: str) -> Path:
     return file_path
 
 @app.get("/", response_class=HTMLResponse)
-def root_menu(request: Request):
-    base_url = str(request.base_url)
-    return f"""
+def root_menu():
+    return """
     <html style="background-color: #202124; color: #e8eaed; font-family: monospace; font-size: 15px;">
         <head><title>Sinais API</title></head>
         <body style="padding: 20px;">
-<pre>
-{{
-    <span style="color: #9cdcfe;">"sinais_galgos"</span>: <a href="/feed/{_FEED_TOKEN}/galgos.csv" style="color: #ce9178; text-decoration: underline;">"{base_url}feed/{_FEED_TOKEN}/galgos.csv"</a>,
-    <span style="color: #9cdcfe;">"sinais_cavalos"</span>: <a href="/feed/{_FEED_TOKEN}/cavalos.csv" style="color: #ce9178; text-decoration: underline;">"{base_url}feed/{_FEED_TOKEN}/cavalos.csv"</a>
-}}
-</pre>
+            <pre>API online.</pre>
         </body>
     </html>
     """
