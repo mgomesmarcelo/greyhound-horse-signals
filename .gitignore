@@ -6,6 +6,10 @@ data/greyhounds/
 *.parquet
 *.csv
 
+# track record — CSVs da Betfair (dados pessoais) e dependencias node
+track_record/data/
+track_record/node_modules/
+
 # environments
 .env
 *.env.*
