@@ -10,6 +10,10 @@ data/greyhounds/
 track_record/data/
 track_record/node_modules/
 
+# dashboard do cliente — resultados e indice de sinais (gerado localmente)
+data/client_results/
+data/signal_index.parquet
+
 # environments
 .env
 *.env.*
